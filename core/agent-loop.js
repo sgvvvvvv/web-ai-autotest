@@ -30,7 +30,7 @@
   ];
   var MAX_TC_ROUNDS = 30; // 单个测试用例最大执行轮数，超限自动标记失败
   // 借鉴 OpenCode 的 DOOM_LOOP_THRESHOLD：连续 N 次完全相同的工具调用触发 doom loop
-  var DOOM_LOOP_THRESHOLD = 2;
+  var DOOM_LOOP_THRESHOLD = 5;
   // 借鉴 OpenCode 的 maxSteps：agent 最大步数上限（动态计算，见 run() 中 maxSteps）
   var MAX_STEPS_BASE = 50; // 基础步数
   var MAX_STEPS_PER_TC = 30; // 每个测试用例额外步数
