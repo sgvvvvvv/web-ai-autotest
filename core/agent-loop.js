@@ -28,7 +28,7 @@
     "click_button", "close_dialog", "table_action", "switch_tab",
     "confirm_dialog", "toggle_switch",
   ];
-  var MAX_TC_ROUNDS = 20; // 单个测试用例最大执行轮数，超限自动标记失败
+  var MAX_TC_ROUNDS = 30; // 单个测试用例最大执行轮数，超限自动标记失败
   // 借鉴 OpenCode 的 DOOM_LOOP_THRESHOLD：连续 N 次完全相同的工具调用触发 doom loop
   var DOOM_LOOP_THRESHOLD = 2;
   // 借鉴 OpenCode 的 maxSteps：agent 最大步数上限（动态计算，见 run() 中 maxSteps）
