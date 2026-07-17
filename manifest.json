@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "AI 前端自动化测试",
+  "version": "0.2.0",
+  "description": "让 AI 同时读取项目源码并操作浏览器，自动完成前端自动化测试。",
+  "background": { "service_worker": "background/service-worker.js" },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "permissions": ["scripting", "activeTab", "storage", "debugger", "sidePanel", "tabs"],
+  "icons": {
+    "16": "devtools/icon-16.png",
+    "48": "devtools/icon-48.png",
+    "128": "devtools/icon-128.png"
+  },
+  "host_permissions": ["<all_urls>"]
+}

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 自动化测试</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="header">
+      <h1>AI 前端自动化测试</h1>
+      <span class="badge badge-stage3">Vision + CDP</span>
+    </header>
+
+    <!-- 目标标签页选择 -->
+    <section class="card">
+      <h2>目标标签页</h2>
+      <div class="row">
+        <select id="tabSelector" class="tab-selector"></select>
+        <button id="refreshTabBtn" class="btn btn-secondary btn-sm">刷新</button>
+        <span id="tabInfo" class="status">未选择</span>
+      </div>
+    </section>
+
+    <!-- AI 配置 -->
+    <section class="card">
+      <h2>AI 配置</h2>
+      <div class="field">
+        <label for="apiUrl">API URL</label>
+        <input id="apiUrl" type="text" placeholder="https://api.openai.com/v1" />
+      </div>
+      <div class="field">
+        <label for="apiKey">API Key</label>
+        <input id="apiKey" type="password" placeholder="sk-..." />
+      </div>
+      <div class="field">
+        <label for="model">模型</label>
+        <input id="model" type="text" placeholder="gpt-4o" />
+      </div>
+      <div class="field">
+        <label for="contextSize">上下文大小 (K)</label>
+        <input id="contextSize" type="number" min="32" step="1" placeholder="128" value="128" />
+        <span class="field-hint">模型上下文窗口大小，以 K 为单位。如 128K = 128000 tokens，1024K = 1M tokens</span>
+      </div>
+      <div class="field field-inline">
+        <label>
+          <input id="visionSupported" type="checkbox" />
+          <span>模型支持图片（视觉能力）</span>
+        </label>
+        <span class="field-hint">勾选后启用截图理解与视觉验证；基础操作仍优先使用 CDP 真实鼠标键盘</span>
+      </div>
+      <div class="field field-inline">
+        <label>
+          <input id="enableThinking" type="checkbox" />
+          <span>启用深度思考模式</span>
+        </label>
+        <span class="field-hint">勾选后启用模型的 thinking 能力，AI 会进行更深入的推理分析（需要模型支持）</span>
+      </div>
+      <button id="saveConfig" class="btn btn-secondary">保存配置</button>
+    </section>
+
+    <!-- 步骤 1：原始需求 -->
+    <section class="card" id="card-step1">
+      <h2>① 原始需求</h2>
+      <div class="field">
+        <label for="requirement">描述要测试的功能需求</label>
+        <textarea id="requirement" rows="4" placeholder="描述本页面的功能需求..."></textarea>
+      </div>
+    </section>
+
+    <!-- 步骤 2：上传源码 -->
+    <section class="card" id="card-step2">
+      <h2>② 上传项目源码（一般仅上传 src 目录即可）</h2>
+      <div class="field">
+        <label for="sourceUpload">选择项目根目录（支持 .js .vue .ts .jsx .tsx .css .json）</label>
+        <input id="sourceUpload" type="file" multiple accept=".js,.vue,.ts,.jsx,.tsx,.css,.json" webkitdirectory />
+        <span id="sourceUploadInfo" class="status">尚未上传</span>
+      </div>
+    </section>
+
+    <!-- 步骤 3：架构分析 -->
+    <section class="card" id="card-step3">
+      <h2>③ 项目架构分析</h2>
+      <div class="row">
+        <span class="btn-tooltip-wrap">
+          <button id="analyzeBtn" class="btn btn-primary" disabled>分析架构</button>
+          <span class="btn-tooltip">请先上传项目源码</span>
+        </span>
+        <button id="importArchBtn" class="btn btn-secondary">导入架构文档</button>
+        <button id="clearCacheBtn" class="btn btn-secondary">清除缓存</button>
+        <button id="exportArchBtn" class="btn btn-secondary" disabled>导出架构</button>
+        <span id="archCacheInfo" class="status">未分析</span>
+      </div>
+      <input id="archFileInput" type="file" accept=".md,.txt,.json" style="display:none;" />
+      <div id="archResult" class="arch-result">
+        <div class="arch-empty">上传源码后点击「分析架构」，或点击「导入架构文档」导入已有的分析结果。</div>
+      </div>
+    </section>
+
+    <!-- 步骤 4：测试用例 -->
+    <section class="card" id="card-step4">
+      <h2>④ 测试用例</h2>
+      <div class="field">
+        <label for="testCases">测试用例</label>
+        <div class="row" style="margin-bottom: 6px;">
+          <span class="btn-tooltip-wrap">
+            <button id="genTestCasesBtn" class="btn btn-primary btn-sm" disabled>AI 生成（基于需求+架构）</button>
+            <span class="btn-tooltip">请先上传源码并完成架构分析</span>
+          </span>
+          <button id="exportTestCasesBtn" class="btn btn-secondary btn-sm" disabled>导出用例</button>
+        </div>
+        <textarea id="testCases" rows="6" placeholder="点击「AI 生成」自动生成，或手动输入测试用例..."></textarea>
+      </div>
+    </section>
+
+    <!-- 步骤 5：执行测试 -->
+    <section class="card" id="card-step5">
+      <h2>⑤ 执行测试</h2>
+      <div class="row">
+        <span class="btn-tooltip-wrap">
+          <button id="runAgentBtn" class="btn btn-primary" disabled>运行 AI 测试</button>
+          <span class="btn-tooltip">请先生成或输入测试用例</span>
+        </span>
+        <span class="btn-tooltip-wrap">
+          <button id="planBtn" class="btn btn-secondary" disabled>测试策略分析</button>
+          <span class="btn-tooltip">请先上传项目源码</span>
+        </span>
+        <span id="status" class="status">就绪</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="stream-header">
+        <h2>AI 思考与响应</h2>
+        <div class="stream-actions">
+          <button id="abortBtn" class="btn btn-danger btn-abort" disabled>中止</button>
+          <button id="continueBtn" class="btn btn-primary btn-abort" disabled style="display:none;">继续</button>
+        </div>
+      </div>
+      <div id="streamLog" class="stream-log"></div>
+      <!-- 用户干预输入（全阶段可用，注入当前对话上下文） -->
+      <div class="chat-input-row" id="chatInputRow">
+        <input id="chatInput" type="text" placeholder="输入内容接续当前对话（如：跳过当前用例、检查弹窗、换一种方式...）" />
+        <button id="chatSendBtn" class="btn btn-warning btn-sm">发送</button>
+      </div>
+    </section>
+
+    <!-- AI 截图展示区域 -->
+    <section class="card" id="screenshotCard" style="display:none;">
+      <div class="stream-header">
+        <h2>AI 视觉截图 <span id="screenshotInfo" class="screenshot-info"></span></h2>
+        <div class="stream-actions">
+          <button id="screenshotToggleBtn" class="btn btn-secondary btn-sm">收起</button>
+        </div>
+      </div>
+      <div id="screenshotContainer" class="screenshot-container">
+        <div class="screenshot-empty">测试启动后，AI 每次接收到的截图会在此展示</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>测试结果 <span id="testProgress" class="test-progress"></span></h2>
+      <div id="resultArea" class="result-area">尚未运行</div>
+    </section>
+
+    <section class="card">
+      <h2>日志</h2>
+      <pre id="log" class="output log"></pre>
+    </section>
+
+    <!-- 提示词输入弹框 -->
+    <div id="promptModal" class="modal-overlay" style="display:none;">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3 id="promptModalTitle">额外提示词</h3>
+        </div>
+        <div class="modal-body">
+          <p id="promptModalDesc" class="modal-desc">可输入额外的提示词来引导 AI（可选）：</p>
+          <textarea id="promptModalInput" rows="4" placeholder="输入额外提示词（可选，留空则直接执行）..."></textarea>
+        </div>
+        <div class="modal-footer">
+          <button id="promptModalCancel" class="btn btn-secondary">取消</button>
+          <button id="promptModalConfirm" class="btn btn-primary">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 导出格式选择弹框 -->
+    <div id="exportModal" class="modal-overlay" style="display:none;">
+      <div class="modal-box modal-box-sm">
+        <div class="modal-header">
+          <h3 id="exportModalTitle">导出</h3>
+        </div>
+        <div class="modal-body">
+          <p class="modal-desc">请选择导出格式：</p>
+          <div id="exportFormatList" class="export-format-list"></div>
+        </div>
+        <div class="modal-footer">
+          <button id="exportModalCancel" class="btn btn-secondary">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 核心模块 -->
+    <script src="../core/source-reader.js"></script>
+    <script src="../core/source-analyzer.js"></script>
+    <script src="../core/network-recorder.js"></script>
+    <script src="../core/test-summary-cache.js"></script>
+    <script src="../core/ai-client.js"></script>
+    <script src="../core/project-analyzer.js"></script>
+    <script src="../core/visual-controller.js"></script>
+    <script src="../core/action-templates.js"></script>
+    <script src="../core/prompt-builder.js"></script>
+    <script src="../core/agent-loop.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
