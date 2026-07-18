@@ -345,6 +345,18 @@ body {
 }
 .output.log { max-height: 180px; }
 
+.error-record-list {
+  font-size: 12px; color: #4e5969; max-height: 180px; overflow: auto;
+}
+.error-record-item {
+  display: flex; flex-direction: column; gap: 3px; padding: 7px 9px;
+  margin-bottom: 5px; border-left: 3px solid #e74c3c; background: #fef0f0;
+  border-radius: 4px;
+}
+.error-record-title { font-weight: 600; color: #b42318; }
+.error-record-detail { line-height: 1.45; overflow-wrap: anywhere; }
+.error-record-more { color: #86909c; padding: 4px 0; }
+
 /* ---- AI 思考流 ---- */
 .stream-header {
   display: flex; align-items: center; justify-content: space-between;

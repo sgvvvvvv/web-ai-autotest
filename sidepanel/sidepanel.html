@@ -163,6 +163,17 @@
     </section>
 
     <section class="card">
+      <div class="stream-header">
+        <h2>错误记录 <span id="errorRecordCount" class="test-progress"></span></h2>
+        <div class="stream-actions">
+          <button id="exportErrorsBtn" class="btn btn-secondary btn-sm" disabled>导出 JSON</button>
+          <button id="clearErrorsBtn" class="btn btn-secondary btn-sm" disabled>清除</button>
+        </div>
+      </div>
+      <div id="errorRecordList" class="error-record-list">暂无已保存的错误记录</div>
+    </section>
+
+    <section class="card">
       <h2>日志</h2>
       <pre id="log" class="output log"></pre>
     </section>

@@ -23,10 +23,15 @@
       bindings: [],   // [{ element, prop, variable }]
       forms: [],       // [{ fields, submitButton }]
       tables: [],      // [{ columns, actions }]
+      interactions: [], // 源码推导的交互契约，供动作模板直接执行
     };
 
-    // 提取 el-select / a-select / 通用 select 组件
+    // 提取 el-select / el-cascader / a-select / 通用 select 组件
     extractSelects(content, info);
+
+    // 提取未知组件库和项目自定义组件的选择交互。此路径只产出标准语义，
+    // 不依赖 Element/Ant 等具体 class，运行时由 DOM 角色和状态验证完成实际点击。
+    extractGenericSelectionInteractions(content, info);
 
     // 提取 el-table / a-table 表格列和操作
     extractTables(content, info);
@@ -42,7 +47,7 @@
 
     // 如果没有提取到任何信息，返回 null
     if (info.selectors.length === 0 && info.options.length === 0 &&
-        info.forms.length === 0 && info.tables.length === 0) {
+        info.forms.length === 0 && info.tables.length === 0 && info.interactions.length === 0) {
       return null;
     }
 
@@ -99,6 +104,45 @@
       }
     }
 
+    // Element UI: <el-cascader v-model="xxx" multiple placeholder="...">。
+    // 多选 cascader 的可点击目标是节点内部 checkbox，而非节点文字；该信息必须直接提供给 Agent。
+    var cascaderRegex = /<el-cascader\b([\s\S]*?)>/g;
+    while ((match = cascaderRegex.exec(content)) !== null) {
+      var attrs = match[1] || '';
+      var modelMatch = attrs.match(/v-model="([^"]+)"/);
+      var optionMatch2 = attrs.match(/:options="([^"]+)"/);
+      var placeholderMatch = attrs.match(/placeholder="([^"]+)"/);
+      var propsMatch = attrs.match(/:props="([^"]+)"/);
+      var componentTail = content.substring(match.index, match.index + 6000);
+      var propsBody = propsMatch ? (content.match(new RegExp(propsMatch[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + "[\\s\\S]{0,500}?multiple\\s*:\\s*true")) || []) [0] : '';
+      var isMultiple = /\bmultiple\b/.test(attrs) || /multiple\s*:\s*true/.test(componentTail) || !!propsBody;
+      var isHoverExpand = /expandTrigger\s*:\s*['"]hover['"]/.test(componentTail);
+      var placeholder = placeholderMatch ? placeholderMatch[1] : '';
+      var triggerSelector = placeholder ? 'input[placeholder="' + placeholder + '"]' : '.el-cascader .el-input__inner';
+      info.selectors.push({
+        selector: triggerSelector,
+        type: 'el-cascader',
+        vModel: modelMatch ? modelMatch[1] : '',
+        dataSource: optionMatch2 ? optionMatch2[1] : null,
+        props: propsMatch ? propsMatch[1] : '',
+        placeholder: placeholder,
+        multiple: isMultiple,
+        expandTrigger: isHoverExpand ? 'hover' : '',
+        optionSelector: '.el-cascader-node .el-checkbox__inner',
+        applySelector: /@click="onSearch"/.test(content) ? '.search-btn' : '',
+      });
+      info.interactions.push({
+        kind: isMultiple ? 'hierarchical-multi-select' : 'hierarchical-select',
+        triggerSelector: triggerSelector,
+        reveal: isHoverExpand ? 'hover' : 'click',
+        nodeSelector: '.el-cascader-node',
+        expandableSelector: '.el-cascader-node__post',
+        activationSelector: '.el-checkbox__inner',
+        applySelector: /@click="onSearch"/.test(content) ? '.search-btn' : '',
+        source: 'component-analysis',
+      });
+    }
+
     // 策略2: 从 data()/setup() 中提取 options 数组定义
     // 匹配: searchTypeOptions: [{ label: "脚本名称", value: "scriptName" }, ...]
     var arrayDefRegex = /(\w+Options)\s*:\s*\[([\s\S]*?)\]/g;
@@ -134,6 +178,42 @@
         type: 'native-select',
         vModel: match[1],
         optionSelector: 'option',
+      });
+    }
+  }
+
+  function extractGenericSelectionInteractions(content, info) {
+    var tagRegex = /<([A-Za-z][\w.-]*)\b([^>]*?)>/g;
+    var match;
+    while ((match = tagRegex.exec(content)) !== null) {
+      var tag = match[1];
+      var attrs = match[2] || '';
+      // 已由专用适配器提供更精确契约的组件不重复登记。
+      if (/^(el-cascader|el-select|a-select|select)$/i.test(tag)) continue;
+      var model = attrs.match(/(?:v-model|value|modelValue|selected(?:Value)?)\s*=\s*["{]([^"}\s]+)/i);
+      var placeholderMatch = attrs.match(/placeholder\s*=\s*["']([^"']+)["']/i);
+      var hasChoices = /(?:options|items|choices|data|tree-data|treeData|menu-items)\s*=/i.test(attrs);
+      var isMultiple = /\bmultiple\b|multi(?:ple)?\s*=\s*(?:"?true|{true})/i.test(attrs);
+      var isHierarchical = /(?:tree|cascade|hierarch|nested|expandTrigger)/i.test(tag + ' ' + attrs);
+      if (!model || !hasChoices) continue;
+
+      var placeholder = placeholderMatch ? placeholderMatch[1] : '';
+      var triggerSelector = placeholder ? 'input[placeholder="' + placeholder + '"]' : '';
+      // 没有稳定触发器时仍保留语义，但不让模板误匹配到错误控件。
+      if (!triggerSelector) continue;
+      var duplicate = info.interactions.some(function(item) { return item.triggerSelector === triggerSelector; });
+      if (duplicate) continue;
+
+      info.interactions.push({
+        kind: isHierarchical ? (isMultiple ? 'hierarchical-multi-select' : 'hierarchical-select') : (isMultiple ? 'multi-select' : 'select'),
+        triggerSelector: triggerSelector,
+        reveal: /expandTrigger\s*[:=]\s*['"]hover['"]/i.test(attrs) ? 'hover' : 'click',
+        // 仅用标准 ARIA / 原生语义；项目可通过组件源码提供更具体的契约。
+        nodeSelector: isHierarchical ? '[role="treeitem"],[role="option"]' : '[role="option"],[role="menuitem"]',
+        expandableSelector: '[aria-expanded="false"],[aria-expanded="true"]',
+        activationSelector: isMultiple ? 'input[type="checkbox"],[role="checkbox"]' : 'input[type="radio"],[role="option"],[role="menuitem"]',
+        applySelector: '',
+        source: 'generic-component-analysis',
       });
     }
   }
@@ -335,6 +415,13 @@
           }
           lines.push("    选项选择器: " + s.optionSelector);
           lines.push("    → 使用 select_option(trigger:{findBy:'selector', value:'" + s.selector + "'}, option:{findBy:'text', value:'选项文本'})");
+        } else if (s.type === 'el-cascader') {
+          lines.push("  选择器: " + s.selector);
+          lines.push("    类型: el-cascader, v-model: " + s.vModel + (s.dataSource ? ", 数据源: " + s.dataSource : ""));
+          lines.push("    模式: " + (s.multiple ? "多选" : "单选") + (s.expandTrigger ? ", 父节点通过 " + s.expandTrigger + " 展开" : ""));
+          lines.push("    真正触发元素: " + s.optionSelector + "（不要点击节点文字或 label）");
+          lines.push("    → 使用 " + (s.multiple ? "select_multi" : "select_option") + "；模板会先 hover 父节点、再点击叶子 checkbox 并验证选择结果。");
+          if (s.applySelector) lines.push("    → 选择完成后必须 click(" + s.applySelector + ") 提交筛选；v-model 本身不会触发查询。");
         }
       }
     }
@@ -427,9 +514,23 @@
     return parts.join("\n\n");
   }
 
+  function getInteractionContracts(files) {
+    var contracts = [];
+    for (var path in files) {
+      if (!files.hasOwnProperty(path)) continue;
+      var info = analyzeSource(path, files[path]);
+      if (!info || !info.interactions) continue;
+      for (var i = 0; i < info.interactions.length; i++) {
+        contracts.push(Object.assign({ path: path }, info.interactions[i]));
+      }
+    }
+    return contracts;
+  }
+
   global.AIFT_SourceAnalyzer = {
     analyzeSource: analyzeSource,
     formatComponentInfo: formatComponentInfo,
     analyzeFiles: analyzeFiles,
+    getInteractionContracts: getInteractionContracts,
   };
 })(window);

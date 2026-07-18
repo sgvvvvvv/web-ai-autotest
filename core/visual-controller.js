@@ -198,6 +198,15 @@
     }
   }
 
+  async function mouseHover(x, y) {
+    await sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: x,
+      y: y,
+      button: "none",
+    });
+  }
+
   /**
    * 通过 CDP 在指定坐标处双击鼠标
    * @param {number} x
@@ -571,19 +580,20 @@
   }
 
   /**
-   * 通过 evalInPage 获取元素坐标并滚动到可视区域
+   * 通过 evalInPage 获取元素坐标；仅在元素不在视口内时滚动。
+   * 对浮层、菜单等已可见元素滚动会触发失焦并销毁目标，因此不能无条件滚动。
    * @param {function} evalInPage - 在页面执行 JS 的函数 (code) => Promise<{ok, result}>
    * @param {string} selector - CSS 选择器
    * @returns {Promise<{ok, x, y, width, height, error?}>}
    */
   async function locateElement(evalInPage, selector) {
     if (!selector) return { ok: false, error: "缺少 selector 参数" };
-    // 先滚动到元素，再获取坐标
     var code = "(function() {" +
       "var el = document.querySelector(" + JSON.stringify(selector) + ");" +
       "if (!el) return { found: false };" +
-      "el.scrollIntoView({ behavior: 'instant', block: 'center' });" +
       "var r = el.getBoundingClientRect();" +
+      "var inView=r.width>0&&r.height>0&&r.x+r.width/2>=0&&r.x+r.width/2<=window.innerWidth&&r.y+r.height/2>=0&&r.y+r.height/2<=window.innerHeight;" +
+      "if(!inView){el.scrollIntoView({behavior:'instant',block:'center'});r=el.getBoundingClientRect();}" +
       "var st=getComputedStyle(el);" +
       "return { found: true, x: r.x + r.width/2, y: r.y + r.height/2, width: r.width, height: r.height, visible: st.display!=='none'&&st.visibility!=='hidden'&&r.width>0&&r.height>0, disabled: !!el.disabled||el.getAttribute('aria-disabled')==='true' };" +
       "})()";
@@ -602,18 +612,121 @@
     }
   }
 
+  // 读取可观察的点击状态，并确认坐标没有被遮罩或重渲染后的元素占用。
+  async function inspectClickState(evalInPage, selector, x, y) {
+    var code = "(function(){" +
+      "var el=document.querySelector(" + JSON.stringify(selector) + ");" +
+      "if(!el)return {found:false};" +
+      "var hit=document.elementFromPoint(" + Number(x) + "," + Number(y) + ");" +
+      "var hitTarget=!!hit&&(el===hit||el.contains(hit));" +
+      "var fields=Array.prototype.slice.call(el.querySelectorAll('input,button,select,textarea,[role=checkbox],[role=radio],[role=option],[role=menuitem],[contenteditable=true]')).slice(0,8);" +
+      "var states=fields.map(function(n){return [n.tagName,n.type||'',n.checked,n.value||'',n.getAttribute('aria-checked')||'',n.getAttribute('aria-selected')||'',n.getAttribute('aria-expanded')||'',n.className||''].join('|');});" +
+      "var retry=el.querySelector('input:not([type=hidden]):not([disabled]),button:not([disabled]),[role=checkbox],[role=radio],[role=option],[role=menuitem],.el-checkbox,[contenteditable=true],label');" +
+      "var rr=retry&&retry.getBoundingClientRect();" +
+      "var focused=document.activeElement===el||el.contains(document.activeElement);" +
+      "var text=(document.body.innerText||'').slice(0,12000),hash=0;for(var i=0;i<text.length;i++)hash=(hash*31+text.charCodeAt(i))|0;" +
+      "return {found:true,hitTarget:hitTarget,signature:[location.href,document.body.getElementsByTagName('*').length,hash,focused,el.getAttribute('aria-checked')||'',el.getAttribute('aria-selected')||'',el.getAttribute('aria-expanded')||'',el.value||'',el.className||'',states.join('~')].join('^'),retry:rr&&rr.width>0&&rr.height>0?{x:rr.x+rr.width/2,y:rr.y+rr.height/2}:null};" +
+      "})()";
+    var resp = await evalInPage(code);
+    if (!resp || !resp.ok) return { ok: false, error: (resp && resp.error) || "无法读取点击状态" };
+    try { return { ok: true, state: JSON.parse(resp.result) }; }
+    catch (e) { return { ok: false, error: "解析点击状态失败: " + (e.message || e) }; }
+  }
+
   /**
    * 通过 CSS 选择器点击元素（CDP 真实鼠标操作）
-   * 流程：定位元素 → 滚动到可视区 → 获取坐标 → CDP 鼠标点击
+   * 流程：定位元素 → 确认命中 → CDP 鼠标点击 → 校验可观察状态。
    * @param {function} evalInPage - 在页面执行 JS 的函数
    * @param {string} selector - CSS 选择器
    * @returns {Promise<{ok, error?}>}
    */
   async function clickBySelector(evalInPage, selector) {
+    // 当 selector 指向文本 label 时，直接点击标签不一定会改变状态（自定义复选框常见）。
+    // 先解析关联或内部的真实控件，再执行后续命中和状态校验。
+    var resolveCode = "(function(){var el=document.querySelector(" + JSON.stringify(selector) + ");if(!el)return 'null';" +
+      "var target=el;if(el.tagName==='LABEL'){target=(el.htmlFor&&document.getElementById(el.htmlFor))||el.querySelector('input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch],button')||el;}" +
+      "if(target===el)return 'null';if(target.id)return '#'+CSS.escape(target.id);var p=[],c=target;while(c&&c!==document.body){var s=Array.prototype.slice.call(c.parentElement.children),i=s.indexOf(c)+1;p.unshift(c.tagName.toLowerCase()+':nth-child('+i+')');var q=p.join(' > ');try{if(document.querySelectorAll(q).length===1)return q;}catch(e){}c=c.parentElement;}return 'null';})()";
+    var resolvedResp = await evalInPage(resolveCode);
+    if (resolvedResp && resolvedResp.ok && resolvedResp.result && resolvedResp.result !== "null") selector = resolvedResp.result;
     var loc = await locateElement(evalInPage, selector);
     if (!loc.ok) return { ok: false, error: loc.error };
+    var before = await inspectClickState(evalInPage, selector, loc.x, loc.y);
+    if (!before.ok) return { ok: false, error: before.error };
+    if (!before.state.hitTarget) return { ok: false, error: "点击位置被其他元素遮挡: " + selector };
     await mouseClick(loc.x, loc.y);
-    return { ok: true };
+    await new Promise(function (r) { setTimeout(r, 120); });
+    var after = await inspectClickState(evalInPage, selector, loc.x, loc.y);
+    if (!after.ok || !after.state.found || after.state.signature !== before.state.signature) {
+      return { ok: true, verified: true };
+    }
+
+    // 对容器节点，优先尝试一次内部标准交互控件；适用于复选框、单选项和菜单项。
+    if (before.state.retry) {
+      await mouseClick(before.state.retry.x, before.state.retry.y);
+      await new Promise(function (r) { setTimeout(r, 120); });
+      after = await inspectClickState(evalInPage, selector, loc.x, loc.y);
+      if (!after.ok || !after.state.found || after.state.signature !== before.state.signature) {
+        return { ok: true, verified: true, retriedChild: true };
+      }
+    }
+    return { ok: false, error: "点击事件已发送，但页面状态未变化: " + selector };
+  }
+
+  // 将坐标点击绑定到点击瞬间实际命中的元素，避免浮层重渲染后复用旧截图坐标。
+  async function clickAtPoint(evalInPage, x, y, interaction) {
+    interaction = interaction || {};
+    var code = "(function(){" +
+      "var el=document.elementFromPoint(" + Number(x) + "," + Number(y) + ");if(!el)return {found:false};" +
+      "var nodeSelector=" + JSON.stringify(interaction.nodeSelector || "") + ",activationSelector=" + JSON.stringify(interaction.activationSelector || "") + ";" +
+      "function esc(v){return CSS.escape(String(v));}" +
+      "function path(n){if(n.id)return '#'+esc(n.id);var a=n.getAttribute('data-testid')||n.getAttribute('data-test')||n.getAttribute('data-qa');if(a){var k=n.getAttribute('data-testid')?'data-testid':(n.getAttribute('data-test')?'data-test':'data-qa');return '['+k+'=\"'+String(a).replace(/\\\\/g,'\\\\\\\\').replace(/\"/g,'\\\\\"')+'\"]';}var p=[],c=n;while(c&&c!==document.body){var s=Array.prototype.slice.call(c.parentElement.children),i=s.indexOf(c)+1;p.unshift(c.tagName.toLowerCase()+':nth-child('+i+')');var q=p.join(' > ');try{if(document.querySelectorAll(q).length===1)return q;}catch(e){}c=c.parentElement;}return n.tagName.toLowerCase();}" +
+      // 文本节点/label 往往只是展示层。优先解析真正承载状态变化的控件，尤其是 checkbox/radio。
+      "function usable(n){if(!n)return false;var r=n.getBoundingClientRect(),s=getComputedStyle(n);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&!n.disabled&&n.getAttribute('aria-disabled')!=='true';}" +
+      "function control(n){if(!n)return null;if(nodeSelector&&activationSelector){var node=n.closest(nodeSelector),activation=node&&node.querySelector(activationSelector);if(usable(activation))return activation;}var direct=n.closest('input[type=checkbox],input[type=radio],button,[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(direct))return direct;var label=n.closest('label');if(label){var linked=label.htmlFor?document.getElementById(label.htmlFor):null;if(usable(linked))return linked;var inside=label.querySelector('input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch],button');if(usable(inside))return inside;}var parent=n.closest('[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(parent))return parent;return n;}" +
+      "var target=control(el);return {found:true,selector:path(target),resolved:target!==el,tag:target.tagName,type:target.type||'',role:target.getAttribute('role')||''};" +
+      "})()";
+    var resp = await evalInPage(code);
+    if (!resp || !resp.ok) return { ok: false, error: (resp && resp.error) || "无法识别点击位置" };
+    try {
+      var parsed = JSON.parse(resp.result);
+      if (!parsed || !parsed.found || !parsed.selector) return { ok: false, error: "点击位置没有可操作元素" };
+      return await clickBySelector(evalInPage, parsed.selector);
+    } catch (e) {
+      return { ok: false, error: "解析点击位置失败: " + (e.message || e) };
+    }
+  }
+
+  // 关闭浮层时避免直接发送 Escape：在模态框内，Escape 往往会连同父弹框一起关闭。
+  async function dismissFloatingLayer(evalInPage) {
+    var code = "(function(){" +
+      "function visible(n){if(!n)return false;var s=getComputedStyle(n),r=n.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&s.pointerEvents!=='none'&&r.width>0&&r.height>0;}" +
+      "var fs='[role=menu],[role=listbox],[role=tree],[class*=popper],[class*=popover],[class*=dropdown],[class*=popup],[class*=listbox]';" +
+      "var dialogs=Array.prototype.slice.call(document.querySelectorAll('[role=dialog],[aria-modal=true],[class*=dialog],[class*=modal],[class*=drawer]')).filter(visible);" +
+      "var floating=Array.prototype.slice.call(document.querySelectorAll(fs)).filter(function(n){return visible(n)&&!/(dialog|modal|drawer)/i.test(typeof n.className==='string'?n.className:'');});" +
+      "if(!floating.length)return {hasFloating:false,hasDialog:dialogs.length>0};" +
+      "var dialog=dialogs.sort(function(a,b){return Number(getComputedStyle(b).zIndex||0)-Number(getComputedStyle(a).zIndex||0);})[0];" +
+      "if(!dialog)return {hasFloating:true,hasDialog:false};" +
+      "var safe=dialog.querySelector('header,[class*=header],[class*=title]');" +
+      "if(!safe||floating.some(function(f){return f.contains(safe);})||!visible(safe))return {hasFloating:true,hasDialog:true,error:'未找到弹框内安全空白区'};" +
+      "var sr=safe.getBoundingClientRect(),x=sr.left+Math.min(16,sr.width/2),y=sr.top+sr.height/2,hit=document.elementFromPoint(x,y);" +
+      "if(!hit||hit.closest('button,a,input,select,textarea,[role=button],[onclick]'))return {hasFloating:true,hasDialog:true,error:'弹框标题区不是安全空白区'};" +
+      "return {hasFloating:true,hasDialog:true,x:x,y:y};" +
+      "})()";
+    var resp = await evalInPage(code);
+    if (!resp || !resp.ok) return { ok: false, error: (resp && resp.error) || "无法识别浮层状态" };
+    var state;
+    try { state = JSON.parse(resp.result); }
+    catch (e) { return { ok: false, error: "解析浮层状态失败: " + (e.message || e) }; }
+    if (!state.hasFloating) return { ok: false, hasFloating: false, hasDialog: !!state.hasDialog, error: state.hasDialog ? "弹框打开时已阻止 Escape" : "当前无可关闭浮层" };
+    if (!state.hasDialog) return { ok: false, hasFloating: true };
+    if (typeof state.x !== "number" || typeof state.y !== "number") {
+      return { ok: false, hasFloating: true, hasDialog: true, error: state.error || "未找到安全关闭位置，已阻止 Escape" };
+    }
+    await mouseClick(state.x, state.y);
+    await new Promise(function (r) { setTimeout(r, 120); });
+    var check = await evalInPage("(function(){var s='[role=menu],[role=listbox],[role=tree],[class*=popper],[class*=popover],[class*=dropdown],[class*=popup],[class*=listbox]';var a=Array.prototype.slice.call(document.querySelectorAll(s));for(var i=0;i<a.length;i++){var n=a[i],c=typeof n.className==='string'?n.className:'';var st=getComputedStyle(n),r=n.getBoundingClientRect();if(!/(dialog|modal|drawer)/i.test(c)&&st.display!=='none'&&st.visibility!=='hidden'&&r.width>0&&r.height>0)return 'open';}return 'closed';})()");
+    if (check && check.ok && check.result === "closed") return { ok: true, verified: true };
+    return { ok: false, hasFloating: true, error: "浮层未关闭，已阻止 Escape 关闭父弹框" };
   }
 
   /**
@@ -912,6 +1025,7 @@
     captureAnnotatedForAI: captureAnnotatedForAI,
     getLayoutMetrics: getLayoutMetrics,
     mouseClick: mouseClick,
+    mouseHover: mouseHover,
     mouseDoubleClick: mouseDoubleClick,
     mouseRightClick: mouseRightClick,
     mouseDrag: mouseDrag,
@@ -927,6 +1041,8 @@
     // 基于 CSS 选择器的 CDP 动作（模拟真实用户操作）
     locateElement: locateElement,
     clickBySelector: clickBySelector,
+    clickAtPoint: clickAtPoint,
+    dismissFloatingLayer: dismissFloatingLayer,
     typeBySelector: typeBySelector,
     scrollToElement: scrollToElement,
     hoverBySelector: hoverBySelector,

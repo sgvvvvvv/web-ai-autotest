@@ -22,15 +22,16 @@
       "",
       "# 核心原则",
       "1. 每轮返回一个工具调用，不要只分析不行动",
-      "2. 操作优先使用预设模板（select_option/fill_input/click_button 等），简单直接",
+      "2. 操作优先使用预设模板（select_option/select_multi/fill_input/click_button 等），简单直接；下拉或级联选择都使用 select_option，不要拆成多轮点击",
+      "3. 若上下文给出「源码交互契约」，必须按契约使用对应模板；截图标注编号只能传给 smart_click(label)，绝不能拼成 click 的 CSS selector。",
       visionSupported
-        ? "3. 找不到元素时用 find_element 或 screenshot 标注获取准确坐标/selector"
-        : "3. 找不到元素时用 find_element 获取准确坐标和 selector，不要请求或依赖截图",
+        ? "4. 找不到元素时用 find_element 或 screenshot 标注获取准确坐标/selector"
+        : "4. 找不到元素时用 find_element 获取准确坐标和 selector，不要请求或依赖截图",
     ];
     if (visionSupported) {
       lines.push("4. 需要验证页面展示时用 verify_ui 截图");
       lines.push("5. 需要验证 API 数据时用 get_network_responses");
-      lines.push("6. 断言描述以 TC 编号开头，如「TC5: PASS - ...」或「TC5: FAIL - ...」");
+      lines.push("6. 断言描述以 TC 编号开头并带状态图标，如「TC5: ✅ 通过 - ...」或「TC5: ❌ 失败 - ...」；失败必须说明具体证据。");
       lines.push("7. 用例改变了页面状态时，assert 前恢复（关闭弹窗、清空输入等）");
       lines.push("8. 连续 3 次相同操作未成功，换策略或标记失败");
       lines.push("9. 所有文本使用简体中文");
@@ -38,7 +39,7 @@
       lines.push("4. 当前模型不支持图片：严禁调用或建议 screenshot、verify_ui、visual_click、smart_click 等视觉工具");
       lines.push("5. 需要验证 API 数据时用 get_network_responses");
       lines.push("6. 用 eval_in_page 检查元素文本、属性、class、可见性和尺寸，验证 UI 状态");
-      lines.push("7. 断言描述以 TC 编号开头，如「TC5: PASS - ...」或「TC5: FAIL - ...」");
+      lines.push("7. 断言描述以 TC 编号开头并带状态图标，如「TC5: ✅ 通过 - ...」或「TC5: ❌ 失败 - ...」；失败必须说明具体证据。");
       lines.push("8. 用例改变了页面状态时，assert 前恢复（关闭弹窗、清空输入等）");
       lines.push("9. 连续 3 次相同操作未成功，换策略或标记失败");
       lines.push("10. 所有文本使用简体中文");
@@ -46,8 +47,8 @@
     lines.push(
       "",
       "# 工具使用",
-      "- 预设模板：select_option/fill_input/click_button/fill_form/table_action/switch_tab/close_dialog/confirm_dialog/toggle_switch",
-      "- 基础操作：click(selector)/type(selector,text)/press(key)/scroll(selector?)/hover(selector) — 默认通过 CDP 真实鼠标/键盘执行",
+      "- 预设模板：select_option（含普通下拉与级联选择）/select_multi/fill_input/click_button/fill_form/table_action/switch_tab/close_dialog/confirm_dialog/toggle_switch",
+      "- 基础操作：click(selector)/type(selector,text)/press(key)/scroll(selector?)/hover(selector) — 默认通过 CDP 真实鼠标/键盘执行。弹框内关闭下拉浮层时不要主动使用 Escape，应点击浮层外的弹框安全区域。",
       "- 查找元素：find_element(findBy,value) — 找不到元素时用这个获取准确坐标和 selector",
       "- 页面 JS：eval_in_page(code) — 读取页面状态（不要用来模拟操作）",
     );
@@ -186,6 +187,10 @@
         testCases: params.testCasesState,
         networkSummary: params.networkSummary,
         history: params.history,
+        currentTcId: params.currentTcId,
+        currentTcRounds: params.currentTcRounds,
+        maxTcRounds: params.maxTcRounds,
+        recoveryReserveRounds: params.recoveryReserveRounds,
       });
       if (visionSupported && params.screenshot && params.screenshot.dataUrl) {
         // 视觉模式：多模态观察消息（文本 + 截图）
@@ -225,6 +230,19 @@
         parts.push(archText);
         parts.push("");
       }
+    }
+
+    if (params.sourceInteractions && params.sourceInteractions.length > 0) {
+      parts.push("## 源码交互契约（优先执行）");
+      for (var si = 0; si < params.sourceInteractions.length; si++) {
+        var interaction = params.sourceInteractions[si];
+        parts.push("- " + interaction.kind + ": trigger=" + interaction.triggerSelector +
+          "; reveal=" + (interaction.reveal || "click") +
+          "; activation=" + interaction.activationSelector +
+          (interaction.applySelector ? "; apply=" + interaction.applySelector : "") +
+          "。使用 select_multi/select_option，不要直接点击文字。");
+      }
+      parts.push("");
     }
 
     var srcText = formatSourceFiles(params.sourceFiles);
@@ -297,6 +315,7 @@
       parts.push("## 测试用例进度");
       var currentTC = null;
       var nextTC = null;
+      var currentScenarioPending = 0;
       for (var i = 0; i < params.testCases.length; i++) {
         var tc = params.testCases[i];
         var statusIcon = tc.status === "passed" ? "✓" : (tc.status === "failed" ? "✗" : (tc.status === "testing" ? "→" : (tc.status === "skipped" ? "⊘" : "○")));
@@ -314,6 +333,27 @@
       parts.push("");
       if (currentTC) {
         parts.push("当前用例：" + (currentTC.id || "") + " - " + (currentTC.title || currentTC.text));
+        if (currentTC.scenarioId) {
+          for (var spi = 0; spi < params.testCases.length; spi++) {
+            var peer = params.testCases[spi];
+            if (peer.scenarioId === currentTC.scenarioId && peer.status === "pending") currentScenarioPending++;
+          }
+          if (currentScenarioPending > 0) {
+            parts.push("共享执行场景：" + (currentTC.scenarioTitle || currentTC.scenarioId) + "。本场景还有 " + currentScenarioPending + " 个待执行用例；保留当前页面/弹框/模块状态，不要重复打开或导航。恢复步骤延后到场景最后一个用例。");
+          }
+        }
+        var currentTcRounds = params.currentTcRounds || 0;
+        var maxTcRounds = params.maxTcRounds || 30;
+        var reserveRounds = params.recoveryReserveRounds || 2;
+        var roundsLeft = Math.max(0, maxTcRounds - currentTcRounds);
+        if (roundsLeft <= reserveRounds + 1) {
+          parts.push("🚨 收尾预算：当前用例已执行 " + currentTcRounds + "/" + maxTcRounds + " 轮，剩余 " + roundsLeft + " 轮。");
+          if (roundsLeft > reserveRounds) {
+            parts.push("本轮仅用于完成必要的恢复步骤（如关闭弹窗、清空筛选）；不得继续探索、重试或收集非必要数据。下一轮必须 assert。");
+          } else {
+            parts.push("立即停止所有测试操作。基于已获得证据调用 assert；即使恢复未完成，也要在断言中如实说明。不得开始下一个 TC，也不得再尝试页面交互。");
+          }
+        }
         if (currentTC.page) parts.push("测试页面：" + currentTC.page);
         if (currentTC.preconditions) parts.push("前置条件：" + currentTC.preconditions);
         if (currentTC.steps) {
@@ -361,6 +401,14 @@
         }
       } else if (nextTC) {
         parts.push("建议下一个用例：" + (nextTC.id || "") + " - " + (nextTC.title || nextTC.text) + "（也可选择其他待执行用例）");
+        if (nextTC.scenarioId) {
+          var scenarioAlreadyPrepared = params.testCases.some(function(tc) {
+            return tc.scenarioId === nextTC.scenarioId && (tc.status === "passed" || tc.status === "failed");
+          });
+          if (scenarioAlreadyPrepared) {
+            parts.push("共享执行场景仍有效：复用当前页面/弹框/模块状态；不要重复执行打开弹框、导航等已完成 setup，只验证本用例并单独 assert。");
+          }
+        }
         if (nextTC.page) parts.push("测试页面：" + nextTC.page);
         if (nextTC.preconditions) parts.push("前置条件：" + nextTC.preconditions);
         if (nextTC.steps) parts.push("操作步骤：" + nextTC.steps);
@@ -407,7 +455,14 @@
       var hasRecoveryStep = currentTC.steps && currentTC.steps.indexOf("恢复：") !== -1;
       var recentActions = (params.history || []).slice(-3).map(function(h) { return h.action; }).join(" ");
       var hasAsserted = recentActions.indexOf("assert") !== -1;
-      if (hasRecoveryStep && !hasAsserted) {
+      var currentRounds = params.currentTcRounds || 0;
+      var maxRounds = params.maxTcRounds || 30;
+      var reserve = params.recoveryReserveRounds || 2;
+      if (maxRounds - currentRounds <= reserve) {
+        parts.push("→ 收尾轮次已到：现在必须调用 assert，不再执行恢复或其他页面操作。");
+      } else if (hasRecoveryStep && currentScenarioPending > 0) {
+        parts.push("→ 当前场景还有共享用例待执行：先 assert 当前用例，保留状态；不要执行恢复步骤。");
+      } else if (hasRecoveryStep && !hasAsserted) {
         parts.push("→ 请继续执行当前用例操作，包括最后的「恢复：」步骤。恢复步骤执行完毕后再 assert。");
       } else {
         parts.push("→ 请继续执行当前用例操作或调用 assert 断言。");
@@ -474,6 +529,7 @@
       line += ">";
       if (n.text) line += " " + n.text;
       if (n.value) line += ' value="' + n.value + '"';
+      if (n.inFloatingLayer) line += "  [浮层元素]";
       // 展示坐标信息（让 AI 无需截图即可获得精确坐标）
       if (n.x !== undefined && n.y !== undefined) {
         line += '  [xy:' + n.x + ',' + n.y;
@@ -596,7 +652,7 @@
         type: "function",
         function: {
           name: "press",
-          description: "模拟键盘按键，如 Enter / Tab / Escape。默认通过 CDP 真实键盘事件执行。",
+          description: "模拟键盘按键，如 Enter / Tab / Escape。弹框内存在浮层时，Escape 会被安全拦截以避免关闭父弹框。",
           parameters: {
             type: "object",
             properties: {
@@ -709,11 +765,11 @@
         type: "function",
         function: {
           name: "assert",
-          description: "记录一条断言结果。只有所有功能正常且所有数据准确时才标记 passed:true。API 字段为空/null、页面展示与 API 不一致、数据缺失等情况必须标记 passed:false。断言描述需列出具体验证的数据字段和值。",
+          description: "记录一条断言结果。只有所有功能正常且所有数据准确时才标记 passed:true。API 字段为空/null、页面展示与 API 不一致、数据缺失等情况必须标记 passed:false。description 必须采用「TC编号: ✅ 通过 - 证据」或「TC编号: ❌ 失败 - 证据」格式。",
           parameters: {
             type: "object",
             properties: {
-              description: { type: "string", description: "断言描述，如「API 返回 username=admin，页面展示 admin，一致」" },
+              description: { type: "string", description: "断言描述，如「TC5: ❌ 失败 - API 返回 username 为空」" },
               passed: { type: "boolean", description: "断言是否通过" },
             },
             required: ["description", "passed"],
@@ -743,7 +799,7 @@
       type: "function",
       function: {
         name: "select_option",
-        description: "【预设模板】下拉框选择单个选项。自动完成：DOM 定位下拉框和选项坐标→CDP 真实点击展开→CDP 真实点击选项→验证。表单控件优先用 trigger.findBy='label'。适用于原生 select / el-select / ant-select / MUI 等。",
+          description: "【预设模板】下拉框或级联控件选择单个选项。自动完成：按 label/ARIA/可见浮层定位触发器和选项坐标→CDP 真实点击展开→CDP 真实点击选项→验证；不需要识别 UI 框架。表单控件优先用 trigger.findBy='label'。",
         parameters: {
           type: "object",
           properties: {
@@ -758,13 +814,14 @@
       type: "function",
       function: {
         name: "select_multi",
-        description: "【预设模板】多选。自动完成：DOM 定位触发器和选项坐标→CDP 真实点击展开→逐个 CDP 真实点击选项→关闭。表单控件优先用 trigger.findBy='label'。",
+        description: "【预设模板】多选。若上传源码已提供交互契约，模板会按契约 hover/展开并点击真实激活控件，避免点击文字。applyAfterSelection=true 时会执行源码声明的提交动作。",
         parameters: {
           type: "object",
           properties: {
             trigger: { type: "object", description: "下拉框触发元素定位", properties: { findBy: findByDesc, value: { type: "string" } }, required: ["findBy", "value"] },
             options: { type: "array", description: "要选择的选项列表", items: { type: "object", properties: { findBy: findByDesc, value: { type: "string" } }, required: ["findBy", "value"] } },
             closeOnDone: { type: "boolean", description: "选完后是否关闭下拉，默认 true" },
+            applyAfterSelection: { type: "boolean", description: "按源码交互契约执行提交/搜索动作，默认 false" },
           },
           required: ["trigger", "options"],
         },

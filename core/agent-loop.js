@@ -29,6 +29,8 @@
     "confirm_dialog", "toggle_switch",
   ];
   var MAX_TC_ROUNDS = 30; // 单个测试用例最大执行轮数，超限自动标记失败
+  // 为恢复页面状态和提交断言预留轮次，避免到达上限后才要求收尾。
+  var TC_RECOVERY_RESERVE_ROUNDS = 2;
   // 借鉴 OpenCode 的 DOOM_LOOP_THRESHOLD：连续 N 次完全相同的工具调用触发 doom loop
   var DOOM_LOOP_THRESHOLD = 5;
   // 借鉴 OpenCode 的 maxSteps：agent 最大步数上限（动态计算，见 run() 中 maxSteps）
@@ -366,6 +368,41 @@
         }
       }
       return cases;
+    }
+
+    // 用例是独立验收项，但相邻、同页面且共享前置条件/模块的用例可复用一次 setup。
+    // 没有明确共同信号时宁可不合并，避免跨用例状态污染。
+    function assignExecutionScenarios(testCases) {
+      var scenarioByKey = {};
+      var scenarioCount = 0;
+      for (var i = 0; i < testCases.length; i++) {
+        var tc = testCases[i];
+        var title = String(tc.title || tc.text || "").trim();
+        var prefixMatch = title.match(/^([^\-—:：|]{2,24})[\-—:：|]/);
+        var moduleHint = prefixMatch ? prefixMatch[1].trim() : "";
+        var page = String(tc.page || "").trim();
+        var precondition = String(tc.preconditions || "").replace(/\s+/g, " ").trim();
+        var mutatesState = /筛选|搜索|新增|创建|编辑|删除|保存|提交|拖拽|上传|下载|重置|清空|开关|切换|排序|分页/.test(title + " " + (tc.steps || ""));
+        var key = "";
+        if (!mutatesState && page && precondition) key = "page:" + page + "|pre:" + precondition;
+        else if (!mutatesState && page && moduleHint) key = "page:" + page + "|module:" + moduleHint;
+        else if (!mutatesState && precondition && moduleHint) key = "pre:" + precondition + "|module:" + moduleHint;
+        // 只让相邻用例共享无前置条件的模块，降低不同区域标题碰巧相同的风险。
+        if (key && i > 0) {
+          if (testCases[i - 1].scenarioBaseKey === key) key = testCases[i - 1].scenarioKey;
+          else key = key + "|segment:" + i;
+        }
+        if (!key) key = "single:" + i;
+        if (!scenarioByKey[key]) {
+          scenarioCount++;
+          scenarioByKey[key] = { id: "SC" + scenarioCount, title: moduleHint || page || "独立场景" };
+        }
+        tc.scenarioKey = key;
+        tc.scenarioBaseKey = key.replace(/\|segment:\d+$/, "");
+        tc.scenarioId = scenarioByKey[key].id;
+        tc.scenarioTitle = scenarioByKey[key].title;
+      }
+      return testCases;
     }
 
     /**
@@ -758,6 +795,10 @@
       resumeResolver: null,
       round: 0,
       sourceFiles: {},   // 源码索引
+      sourceInteractions: [], // 上传源码推导的可执行交互契约
+      errorRecords: [], // 结构化错误记录，供面板持久化和导出
+      decisionTrace: [], // AI 推理、计划与工具结果的可导出轨迹
+      lastReasoning: "",
       snapshot: null,     // 当前快照
       screenshot: null,   // 当前截图（视觉模式）
       history: [],       // 动作历史
@@ -794,7 +835,40 @@
     function setStatus(s) {
       if (deps.onStatus) deps.onStatus(s);
     }
+    function shortenTraceText(value, limit) {
+      value = String(value || "");
+      limit = limit || 1200;
+      return value.length > limit ? value.substring(0, limit) + "…" : value;
+    }
+    function recordTrace(entry) {
+      state.decisionTrace.push(Object.assign({
+        timestamp: new Date().toISOString(),
+        round: state.round,
+        testCaseId: state.currentTcId || "",
+      }, entry));
+      if (state.decisionTrace.length > 120) state.decisionTrace.shift();
+    }
+    function recordError(category, detail) {
+      var snapshot = state.snapshot || {};
+      var record = Object.assign({
+        id: "err_" + Date.now() + "_" + (state.errorRecords.length + 1),
+        timestamp: new Date().toISOString(),
+        category: category,
+        round: state.round,
+        testCaseId: state.currentTcId || "",
+        page: { url: snapshot.url || "", title: snapshot.title || "" },
+        sourceInteractions: (state.sourceInteractions || []).map(function(item) {
+          return { kind: item.kind, triggerSelector: item.triggerSelector, source: item.source };
+        }),
+        reasoning: shortenTraceText(state.lastReasoning, 6000),
+        recentTrace: state.decisionTrace.slice(-20),
+      }, detail || {});
+      state.errorRecords.push(record);
+      if (deps.onErrorRecord) deps.onErrorRecord(record);
+      return record;
+    }
     function notifyAutoPause(reason) {
+      if (reason !== "finish") recordError("agent_pause", { reason: reason });
       if (deps.onAutoPause) deps.onAutoPause(reason);
     }
     function stream(type, content) {
@@ -835,7 +909,8 @@
             await global.AIFT_VisualController.ensureAttached(deps.tabId);
             var cdpResult = await cdpFn();
             if (cdpResult.ok) {
-              return { ok: true, result: "CDP " + desc + ": " + (actionParams.selector || ""), via: "cdp" };
+              var verifyLabel = cdpResult.verified ? "（已验证" + (cdpResult.retriedChild ? "，子控件重试" : "") + "）" : "";
+              return { ok: true, result: "CDP " + desc + verifyLabel + ": " + (actionParams.selector || ""), via: "cdp" };
             }
             return { ok: false, result: cdpResult.error || desc + " 失败" };
           } catch (e) {
@@ -845,12 +920,42 @@
         return { ok: false, result: "CDP 视觉控制器不可用，无法执行真实" + desc };
       }
 
+      async function interactionAtPoint(x, y) {
+        var contracts = state.sourceInteractions || [];
+        if (!deps.evalInPage || contracts.length === 0) return null;
+        for (var i = 0; i < contracts.length; i++) {
+          var contract = contracts[i];
+          if (!contract.nodeSelector) continue;
+          var code = "(function(){var el=document.elementFromPoint(" + Number(x) + "," + Number(y) + ");return !!(el&&el.closest(" + JSON.stringify(contract.nodeSelector) + "));})()";
+          var resp = await deps.evalInPage(code);
+          if (resp && resp.ok && resp.result === "true") return contract;
+        }
+        return null;
+      }
+
       log("执行动作: " + name + " " + JSON.stringify(args));
 
       var result = { action: name, args: args, result: "", ok: true };
 
       switch (name) {
         case "click":
+          var annotationMatch = String(args.selector || "").match(/^\[sel-id\s*=\s*["']?(\d+)["']?\]$/i);
+          if (annotationMatch) {
+            var annotationLabel = Number(annotationMatch[1]);
+            var annotation = state.annotatedElements.filter(function(item) { return Number(item.label) === annotationLabel; })[0];
+            if (!annotation) {
+              result.ok = false;
+              result.result = "截图标注 #" + annotationLabel + " 不是 CSS selector，且当前标注列表中不存在；请重新截图后使用 smart_click(label=" + annotationLabel + ")。";
+              break;
+            }
+            var pointInteraction = await interactionAtPoint(annotation.x, annotation.y);
+            var annotationClick = await global.AIFT_VisualController.clickAtPoint(deps.evalInPage, annotation.x, annotation.y, pointInteraction || undefined);
+            result.ok = annotationClick.ok;
+            result.result = annotationClick.ok
+              ? "已将截图标注 #" + annotationLabel + " 映射为真实点击" + (pointInteraction ? "（按源码交互契约）" : "")
+              : (annotationClick.error || "标注对应元素点击未生效");
+            break;
+          }
           var clickRet = await tryCdpOnly({ selector: args.selector },
             async function () {
               return await global.AIFT_VisualController.clickBySelector(deps.evalInPage, args.selector);
@@ -872,6 +977,18 @@
           if (global.AIFT_VisualController) {
             try {
               await global.AIFT_VisualController.ensureAttached(deps.tabId);
+              if (String(args.key || "").toLowerCase() === "escape" && deps.evalInPage) {
+                var dismissRet = await global.AIFT_VisualController.dismissFloatingLayer(deps.evalInPage);
+                if (dismissRet.ok) {
+                  result.result = "已安全关闭浮层（未发送 Escape）";
+                  break;
+                }
+                if (dismissRet.hasFloating || dismissRet.hasDialog) {
+                  result.ok = false;
+                  result.result = dismissRet.error || "弹框或浮层仍打开，已阻止 Escape 关闭父弹框";
+                  break;
+                }
+              }
               await global.AIFT_VisualController.keyboardPress(args.key);
               result.result = "CDP 按键: " + args.key;
               break;
@@ -972,7 +1089,7 @@
               "  function buildSel(el){if(el.id&&!/^\\d+$/.test(el.id))return '#'+CSS.escape(el.id);var tid=el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa');if(tid)return cssAttr(el.getAttribute('data-testid')?'data-testid':(el.getAttribute('data-test')?'data-test':'data-qa'),tid);var path=[],cur=el;while(cur&&cur!==document.body){var sib=Array.prototype.slice.call(cur.parentElement?cur.parentElement.children:[]);var idx=sib.indexOf(cur)+1;var part=cur.tagName.toLowerCase()+':nth-child('+idx+')';path.unshift(part);var s=path.join(' > ');try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}cur=cur.parentElement;}return el.tagName.toLowerCase();}" +
               "  function interactiveScore(el){var tag=el.tagName.toLowerCase();var score=0;if(tag==='button'||tag==='a')score+=50;if(tag==='input'||tag==='textarea'||tag==='select')score+=45;if(el.getAttribute('role'))score+=25;if(el.onclick||el.hasAttribute('onclick'))score+=20;if(getComputedStyle(el).cursor==='pointer')score+=15;if(el.disabled||el.getAttribute('aria-disabled')==='true')score-=100;return score;}" +
               "  if (findBy === 'text') {" +
-              "    // 性能优化：用 TreeWalker 替代 querySelectorAll('*')，避免扫描几万个元素" +
+              "    /* 使用 TreeWalker 避免扫描过多元素。 */" +
               "    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {" +
               "      acceptNode: function(node) {" +
               "        if (node.children.length > 2) return NodeFilter.FILTER_REJECT;" +
@@ -1023,7 +1140,7 @@
               "  els.sort(function(a,b){return interactiveScore(b)-interactiveScore(a);});" +
               "  var results = els.slice(0, 5).map(function(el) {" +
               "    var r = el.getBoundingClientRect();" +
-              "    // 不再调用 scrollIntoView，因为它会导致下拉框关闭" +
+              "    /* 保持浮层状态，不在此处滚动。 */" +
               "    var sel = buildSel(el);" +
               "    return {tag: el.tagName, id: el.id, class: (typeof el.className==='string'?el.className:'').substring(0,80)," +
               "      text: (el.textContent||'').substring(0,60).trim()," +
@@ -1099,6 +1216,7 @@
           var tplResult = await global.AIFT_ActionTemplates.execute(name, {
             tabId: deps.tabId,
             evalInPage: deps.evalInPage,
+            sourceInteractions: state.sourceInteractions,
           }, args);
           result.ok = tplResult.ok;
           result.result = tplResult.result || (tplResult.ok ? "模板执行成功" : "模板执行失败");
@@ -1174,13 +1292,28 @@
           break;
 
         case "assert":
+          var assertionDescription = String(args.description || "").trim();
+          var assertionIcon = args.passed ? "✅" : "❌";
+          if (assertionDescription.indexOf("✅") === -1 && assertionDescription.indexOf("❌") === -1) {
+            var tcPrefix = assertionDescription.match(/^(TC\d+\s*:\s*)/i);
+            assertionDescription = tcPrefix
+              ? tcPrefix[1] + assertionIcon + " " + assertionDescription.substring(tcPrefix[1].length)
+              : assertionIcon + " " + assertionDescription;
+          }
           var assertion = {
-            description: args.description || "",
+            description: assertionDescription,
             passed: !!args.passed,
           };
           state.assertions.push(assertion);
-          result.result = args.passed ? "PASS" : "FAIL";
-          log("断言: " + (args.description || "") + " → " + (args.passed ? "PASS ✓" : "FAIL ✗"));
+          if (!assertion.passed) {
+            recordError("failed_assertion", {
+              description: assertion.description,
+              action: "assert",
+              args: { passed: false },
+            });
+          }
+          result.result = args.passed ? "✅ PASS" : "❌ FAIL";
+          log("断言: " + assertion.description + " → " + (args.passed ? "✅ PASS" : "❌ FAIL"));
           if (deps.onAssertion) {
             // 尝试匹配到测试用例
             var matchedIdx = matchAssertionToTestCase(assertion, state.testCases);
@@ -1274,6 +1407,10 @@
                 // 注入下一轮警告
                 state.loopWarning = warnParts.join("\n") +
                   "\n\n请重新审视当前用例的测试结果，确保断言内容正确。";
+              } else if ((matchedTC.id || "").toUpperCase() === (state.currentTcId || "").toUpperCase()) {
+                // 已接受的断言必须立即结束当前用例的轮次归属，避免后续 TC 的操作或
+                // 收尾检查继续计入已完成用例。
+                state.currentTcId = null;
               }
             }
             deps.onAssertion(assertion, state.assertions, state.testCases);
@@ -1650,6 +1787,18 @@
               result.result = "组合键成功: " + args.combo.join("+");
               log("⌨️ 视觉组合键: " + args.combo.join("+"));
             } else {
+              if (String(args.key || "").toLowerCase() === "escape" && deps.evalInPage) {
+                var visualDismissRet = await global.AIFT_VisualController.dismissFloatingLayer(deps.evalInPage);
+                if (visualDismissRet.ok) {
+                  result.result = "已安全关闭浮层（未发送 Escape）";
+                  break;
+                }
+                if (visualDismissRet.hasFloating || visualDismissRet.hasDialog) {
+                  result.ok = false;
+                  result.result = visualDismissRet.error || "弹框或浮层仍打开，已阻止 Escape 关闭父弹框";
+                  break;
+                }
+              }
               await global.AIFT_VisualController.keyboardPress(args.key);
               result.result = "按键成功: " + args.key;
               log("⌨️ 视觉按键: " + args.key);
@@ -1754,8 +1903,9 @@
               "  }" +
               "  var dropdownEls = visible.filter(function(el) { return isInDropdown(el); });" +
               "  var el = dropdownEls.length > 0 ? dropdownEls[0] : visible[0];" +
-              "  el.scrollIntoView({ behavior: 'instant', block: 'center' });" +
               "  var r = el.getBoundingClientRect();" +
+              "  var inView=r.width>0&&r.height>0&&r.x+r.width/2>=0&&r.x+r.width/2<=window.innerWidth&&r.y+r.height/2>=0&&r.y+r.height/2<=window.innerHeight;" +
+              "  if(!inView){el.scrollIntoView({behavior:'instant',block:'center'});r=el.getBoundingClientRect();}" +
               "  return JSON.stringify({found: true, x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)," +
               "    tag: el.tagName.toLowerCase(), text: (el.textContent||'').substring(0,40).trim()," +
               "    selector: el.id ? '#'+el.id : (el.className && typeof el.className==='string' ? el.tagName.toLowerCase()+'.'+el.className.trim().split(/\\s+/)[0] : el.tagName.toLowerCase())});" +
@@ -1786,11 +1936,14 @@
             break;
           }
           try {
-            await global.AIFT_VisualController.mouseClick(smartX, smartY, {
-              button: args.button || "left",
-              clickCount: args.clickCount || 1,
-            });
-            result.result = "智能点击成功: (" + smartX + ", " + smartY + ") " + smartInfo;
+            var smartInteraction = await interactionAtPoint(smartX, smartY);
+            var smartRet = await global.AIFT_VisualController.clickAtPoint(deps.evalInPage, smartX, smartY, smartInteraction || undefined);
+            if (!smartRet.ok) {
+              result.ok = false;
+              result.result = smartRet.error || "智能点击未确认生效";
+              break;
+            }
+            result.result = "智能点击已验证" + (smartRet.retriedChild ? "（子控件重试）" : "") + ": (" + smartX + ", " + smartY + ") " + smartInfo;
             log("🎯 smart_click: (" + smartX + ", " + smartY + ") " + smartInfo);
           } catch(e) {
             result.ok = false;
@@ -2123,6 +2276,7 @@
 
       // 解析测试用例
       state.testCases = parseTestCases(params.testCases || "");
+      assignExecutionScenarios(state.testCases);
       if (deps.onTestCasesParsed) deps.onTestCasesParsed(state.testCases);
 
       // 动态计算步数上限：基础 + 每个用例额外步数
@@ -2143,7 +2297,10 @@
         // 1. 加载用户上传的源码
         state.sourceFiles = global.AIFT_SourceReader.getSourceFiles();
         var srcCount = global.AIFT_SourceReader.getFileCount();
+        state.sourceInteractions = global.AIFT_SourceAnalyzer && global.AIFT_SourceAnalyzer.getInteractionContracts
+          ? global.AIFT_SourceAnalyzer.getInteractionContracts(state.sourceFiles) : [];
         log("已加载用户上传源码: " + srcCount + " 个文件");
+        if (state.sourceInteractions.length > 0) log("已生成源码交互契约: " + state.sourceInteractions.length + " 条");
         if (srcCount === 0) {
           log("⚠️ 未上传源码，AI 将无法使用 read_source 工具。请在面板中上传项目源码目录。");
         }
@@ -2334,6 +2491,7 @@
             testCases: params.testCases,
             testCasesState: state.testCases,
             sourceFiles: sourceFilesArr,
+            sourceInteractions: state.sourceInteractions,
             snapshot: state.snapshot,
             screenshot: state.screenshot,
             history: state.history,
@@ -2343,6 +2501,10 @@
             extraPrompt: params.extraPrompt || "",
             visionSupported: deps.config.visionSupported,
             summary: state.cachedSummary || "",
+            currentTcId: state.currentTcId,
+            currentTcRounds: state.currentTcId ? (state.tcRoundCount[state.currentTcId] || 0) : 0,
+            maxTcRounds: MAX_TC_ROUNDS,
+            recoveryReserveRounds: TC_RECOVERY_RESERVE_ROUNDS,
           });
          // 注入干预消息（用户干预优先于自动警告）
          if (state.userIntervention) {
@@ -2474,6 +2636,11 @@
             }
             // AI 调用失败（网络/超时等），暂停等待用户介入而非直接终止
             var aiFailMsg = e.message || String(e);
+            if (e.partialReasoning) state.lastReasoning = e.partialReasoning;
+            recordError("ai_call_error", {
+              message: aiFailMsg,
+              partialReasoning: shortenTraceText(e.partialReasoning || "", 6000),
+            });
             log("AI 调用失败: " + aiFailMsg + "，暂停等待用户介入");
             stream("error", "⚠️ AI 调用失败: " + aiFailMsg + "，已暂停");
             setStatus("AI 调用失败（已暂停）");
@@ -2501,6 +2668,14 @@
 
           // 从 tool_calls 推断当前测试用例
           var toolCalls = global.AIFT_AIClient.extractToolCalls(message);
+          state.lastReasoning = message.reasoning_content || message.content || "";
+          recordTrace({
+            type: "ai_decision",
+            reasoning: shortenTraceText(state.lastReasoning, 3000),
+            plannedTools: toolCalls.map(function(call) {
+              return { name: call.function.name, arguments: shortenTraceText(call.function.arguments || "{}", 1000) };
+            }),
+          });
 
           // 使用状态机更新测试用例状态
           updateTestCaseState(message, toolCalls);
@@ -2589,6 +2764,21 @@
               action: execResult.action + " " + JSON.stringify(execResult.args),
               result: execResult.result || (execResult.ok ? "ok" : "error"),
             });
+            recordTrace({
+              type: "tool_result",
+              action: execResult.action,
+              args: execResult.args,
+              ok: !!execResult.ok,
+              result: shortenTraceText(execResult.result || (execResult.ok ? "ok" : "error"), 2000),
+            });
+            if (!execResult.ok) {
+              recordError("tool_failure", {
+                action: execResult.action,
+                args: execResult.args,
+                message: execResult.result || "工具执行失败",
+                pageState: execResult.pageState || null,
+              });
+            }
             if (!execResult.ok && ACTION_WAIT_MAP[tc.function.name] !== undefined) {
               needDiagnosticScreenshot = true;
             }
@@ -2754,6 +2944,7 @@
             var tcOverReason = tcId + " 已执行 " + state.tcRoundCount[tcId] + " 轮，超过上限 " + MAX_TC_ROUNDS + "，自动标记失败";
             log("⛔ " + tcOverReason);
             stream("warning", "⛔ " + tcOverReason);
+            recordError("agent_limit", { reason: tcOverReason, action: "round_limit" });
 
             // 标记当前用例为失败
             for (var tci = 0; tci < state.testCases.length; tci++) {

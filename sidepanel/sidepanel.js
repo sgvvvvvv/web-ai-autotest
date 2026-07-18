@@ -69,6 +69,10 @@ const els = {
   sourceUpload: document.getElementById("sourceUpload"),
   sourceUploadInfo: document.getElementById("sourceUploadInfo"),
   testProgress: document.getElementById("testProgress"),
+  errorRecordCount: document.getElementById("errorRecordCount"),
+  errorRecordList: document.getElementById("errorRecordList"),
+  exportErrorsBtn: document.getElementById("exportErrorsBtn"),
+  clearErrorsBtn: document.getElementById("clearErrorsBtn"),
   chatInputRow: document.getElementById("chatInputRow"),
   chatInput: document.getElementById("chatInput"),
   chatSendBtn: document.getElementById("chatSendBtn"),
@@ -98,6 +102,8 @@ const els = {
   runAgentBtnTooltip: document.querySelector("#runAgentBtn").parentElement.querySelector(".btn-tooltip"),
   planBtnTooltip: document.querySelector("#planBtn").parentElement.querySelector(".btn-tooltip"),
 };
+
+loadErrorRecords().catch(function () {});
 
 // ---- 在页面主世界执行 JS（替代 inspectedWindow.eval）----
 // 注意：chrome.scripting.executeScript 使用结构化克隆传输返回值，
@@ -576,6 +582,48 @@ var expandedReportCases = new Set(); // 测试报告中已展开的用例 key
 var currentAssertions = []; // 当前断言列表（供折叠/展开重渲染时使用）
 var lastReportResult = null; // 上次测试报告结果
 var lastReportSummary = ""; // 上次测试报告总结
+var errorRecords = [];
+var ERROR_RECORDS_KEY = "aift_error_records_v1";
+var activeErrorRunId = "";
+
+function renderErrorRecords() {
+  var total = errorRecords.length;
+  els.errorRecordCount.textContent = total > 0 ? total + " 条" : "";
+  els.exportErrorsBtn.disabled = total === 0;
+  els.clearErrorsBtn.disabled = total === 0;
+  if (total === 0) {
+    els.errorRecordList.textContent = "暂无已保存的错误记录";
+    return;
+  }
+  var recent = errorRecords.slice(-5).reverse();
+  var html = recent.map(function(record) {
+    var label = record.category === "failed_assertion" ? "❌ 断言失败" :
+      (record.category === "agent_pause" || record.category === "agent_limit" ? "⚠️ Agent 陷入停滞" : "⚠️ 工具失败");
+    var detail = record.message || record.description || record.reason || "未知错误";
+    var traceHint = record.recentTrace && record.recentTrace.length ? " · 已保存 " + record.recentTrace.length + " 步轨迹" : "";
+    return '<div class="error-record-item"><span class="error-record-title">' + label +
+      (record.testCaseId ? " · " + escapeHtml(record.testCaseId) : "") +
+      '</span><span class="error-record-detail">第 ' + (record.round || 0) + " 轮 · " + escapeHtml(detail) + escapeHtml(traceHint) + '</span></div>';
+  }).join("");
+  if (total > recent.length) html += '<div class="error-record-more">另有 ' + (total - recent.length) + ' 条，请导出查看</div>';
+  els.errorRecordList.innerHTML = html;
+}
+
+function persistErrorRecords() {
+  chrome.storage.local.set({ [ERROR_RECORDS_KEY]: errorRecords.slice(-500) });
+}
+
+function addErrorRecord(record) {
+  errorRecords.push(record);
+  persistErrorRecords();
+  renderErrorRecords();
+}
+
+async function loadErrorRecords() {
+  var stored = await chrome.storage.local.get(ERROR_RECORDS_KEY);
+  errorRecords = Array.isArray(stored[ERROR_RECORDS_KEY]) ? stored[ERROR_RECORDS_KEY] : [];
+  renderErrorRecords();
+}
 
 function renderTestResults(testCases, assertions) {
   testCases = testCases || testCasesState;
@@ -622,7 +670,7 @@ function renderTestResults(testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedCases.has(tcKey);
       var cls = "test-case test-" + tc.status + (isExpanded ? "" : " collapsed");
-      var icon = tc.status === "passed" ? "✓" : (tc.status === "failed" ? "✗" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
+      var icon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
       html += '<div class="' + cls + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="test-case-header">';
       html += '<span class="test-toggle">' + (isExpanded ? "▼" : "▶") + '</span>';
@@ -669,7 +717,7 @@ function renderTestResults(testCases, assertions) {
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
         var ucls = u.passed ? "test-case test-case-simple test-passed" : "test-case test-case-simple test-failed";
-        var uicon = u.passed ? "✓" : "✗";
+        var uicon = u.passed ? "✅" : "❌";
         html += '<div class="' + ucls + '">';
         html += '<span class="test-icon">' + uicon + '</span>';
         html += '<span class="test-text">' + escapeHtml(u.description) + '</span>';
@@ -791,7 +839,7 @@ function renderTestReport(result, summary, testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedReportCases.has(tcKey);
       var tcClass = "report-case report-case-" + tc.status + (isExpanded ? "" : " collapsed");
-      var tcIcon = tc.status === "passed" ? "✓" : (tc.status === "failed" ? "✗" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
+      var tcIcon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
 
       html += '<div class="' + tcClass + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="case-header">';
@@ -829,7 +877,7 @@ function renderTestReport(result, summary, testCases, assertions) {
       html += '<div class="report-extra-title">额外断言 (' + unmatched.length + ')</div>';
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
-        var uIcon = u.passed ? "✓" : "✗";
+        var uIcon = u.passed ? "✅" : "❌";
         var uClass = u.passed ? "extra-passed" : "extra-failed";
         html += '<div class="report-extra-item ' + uClass + '"><span>' + uIcon + '</span> ' + escapeHtml(u.description) + '</div>';
       }
@@ -1083,6 +1131,7 @@ async function runAgent() {
   els.resultArea.innerHTML = "运行中...";
   els.log.textContent = "";
   streamClear();
+  activeErrorRunId = "run_" + Date.now();
 
   log("启动 AI Agent Loop");
   setStatus("启动中...");
@@ -1097,6 +1146,10 @@ async function runAgent() {
     onStatus: function (s) { setStatus(s); },
     onStream: function (type, content) {
       streamAppend(type, content);
+    },
+    onErrorRecord: function (record) {
+      record.runId = activeErrorRunId;
+      addErrorRecord(record);
     },
     onTestCasesParsed: function (testCases) {
       testCasesState = testCases;
@@ -1670,6 +1723,30 @@ function formatTimestamp(ts) {
   var d = new Date(ts || Date.now());
   var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
   return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + "_" + pad(d.getHours()) + pad(d.getMinutes());
+}
+
+function exportErrorRecords() {
+  if (errorRecords.length === 0) {
+    setStatus("无错误记录可导出");
+    return;
+  }
+  var filename = "ai_test_error_records_" + formatTimestamp() + ".json";
+  var content = JSON.stringify({
+    schemaVersion: 2,
+    exportedAt: new Date().toISOString(),
+    recordCount: errorRecords.length,
+    records: errorRecords,
+  }, null, 2);
+  downloadFile(filename, content, "application/json");
+  log("错误记录已导出: " + filename);
+  setStatus("已导出错误记录");
+}
+
+function clearErrorRecords() {
+  errorRecords = [];
+  chrome.storage.local.remove(ERROR_RECORDS_KEY);
+  renderErrorRecords();
+  setStatus("错误记录已清除");
 }
 
 function exportArchitecture() {
@@ -3186,6 +3263,8 @@ els.archFileInput.addEventListener("change", handleArchFileImport);
 els.clearCacheBtn.addEventListener("click", clearArchCache);
 els.exportArchBtn.addEventListener("click", exportArchitecture);
 els.exportTestCasesBtn.addEventListener("click", exportTestCases);
+els.exportErrorsBtn.addEventListener("click", exportErrorRecords);
+els.clearErrorsBtn.addEventListener("click", clearErrorRecords);
 els.testCases.addEventListener("input", function () {
   els.exportTestCasesBtn.disabled = !els.testCases.value.trim();
   updateButtonStates();

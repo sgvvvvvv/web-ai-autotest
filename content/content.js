@@ -19,11 +19,14 @@
     "[role=menuitem]",
     "[role=tab]",
     "[role=option]",
+    "[role=treeitem]",
     "[contenteditable=true]",
     "[onclick]",
     "[tabindex]",
     // 下拉框选项（框架无关）— 让 AI 能在快照中看到可选项
     ".el-select-dropdown__item",
+    ".el-cascader",
+    ".el-cascader-node",
     ".ant-select-item",
     ".ant-select-item-option",
     ".v-list-item",
@@ -31,6 +34,19 @@
     ".dropdown-item",
     ".MuiMenuItem-root",
     ".MuiAutocomplete-option",
+  ].join(",");
+
+  // 很多组件将选项挂到 body 下的浮层中，且没有 button/role 等语义。
+  // 仅在浮层容器内采集这些常见候选，避免将页面中的普通布局节点误报为可点击元素。
+  const FLOATING_ITEM_SELECTOR = [
+    "[class*='option']",
+    "[class*='item']",
+    "[class*='menu']",
+    "[class*='node']",
+    "[class*='checkbox']",
+    "[class*='radio']",
+    "li",
+    "label",
   ].join(",");
 
   function isVisible(el) {
@@ -135,10 +151,30 @@
     return path.join(" > ");
   }
 
+  function isInFloatingLayer(el) {
+    var current = el;
+    for (var depth = 0; current && current !== document.body && depth < 12; depth++, current = current.parentElement) {
+      var cls = typeof current.className === "string" ? current.className.toLowerCase() : "";
+      var role = current.getAttribute("role") || "";
+      if (role === "menu" || role === "listbox" || role === "dialog" || role === "tree") return true;
+      if (/popper|popover|dropdown|overlay|popup|menu|listbox|tooltip/.test(cls)) return true;
+    }
+    return false;
+  }
+
   function captureSnapshot() {
     const nodes = [];
-    const elements = document.querySelectorAll(INTERACTIVE_SELECTOR);
+    var elements = [];
+    var floatingCandidates = document.querySelectorAll(FLOATING_ITEM_SELECTOR);
+    floatingCandidates.forEach(function (el) {
+      if (isInFloatingLayer(el)) elements.push(el);
+    });
+    // 浮层候选优先放入快照，避免长页面的常规控件耗尽模型上下文窗口。
+    elements = elements.concat(Array.prototype.slice.call(document.querySelectorAll(INTERACTIVE_SELECTOR)));
+    var seen = new Set();
     elements.forEach(function (el) {
+      if (seen.has(el)) return;
+      seen.add(el);
       if (!isVisible(el)) return;
       const rect = el.getBoundingClientRect();
       var selector = buildSelector(el);
@@ -157,6 +193,7 @@
         ariaChecked: el.getAttribute("aria-checked") || "",
         placeholder: el.getAttribute("placeholder") || "",
         href: el.getAttribute("href") || "",
+        inFloatingLayer: isInFloatingLayer(el),
         selector: selector,
         visible: true,
         x: Math.round(rect.left),

@@ -14,10 +14,32 @@
     return new Promise(function (r) { setTimeout(r, ms); });
   }
 
+  async function dismissFloatingOrEscape(evalInPage, vc) {
+    if (vc.dismissFloatingLayer) {
+      var dismissed = await vc.dismissFloatingLayer(evalInPage);
+      // 关闭下拉的调用方绝不能以 Escape 作为兜底：在许多弹框库中它会冒泡到父弹框。
+      // 找不到可安全关闭的位置时返回失败，让 Agent 保留当前页面状态并换策略。
+      return dismissed;
+    }
+    return { ok: false, error: "浮层安全关闭能力不可用，已阻止 Escape 关闭父弹框" };
+  }
+
   async function readJson(evalInPage, code, fallback) {
     var resp = await evalInPage(code);
     if (!resp || !resp.ok || !resp.result || resp.result === "undefined") return fallback || null;
     try { return JSON.parse(resp.result); } catch (e) { return fallback || null; }
+  }
+
+  function findSourceInteraction(deps, trigger) {
+    var contracts = deps.sourceInteractions || [];
+    var value = trigger && trigger.value || "";
+    for (var i = 0; i < contracts.length; i++) {
+      if (contracts[i].triggerSelector === value ||
+          (trigger && trigger.findBy === "placeholder" && contracts[i].triggerSelector.indexOf(value) !== -1)) {
+        return contracts[i];
+      }
+    }
+    return null;
   }
 
   async function getPointDiagnostics(evalInPage, x, y) {
@@ -243,10 +265,18 @@
     // ARIA 标准（所有无障碍组件库通用）
     '[role="listbox"]:not([hidden])',
     '[role="combobox"]:not([hidden])',
+    '[role="menu"]:not([hidden])',
+    '[role="tree"]:not([hidden])',
+    '[aria-modal="false"][class*="overlay"]:not([hidden])',
+    '[class*="menu"]:not([style*="display: none"]):not(.hidden)',
+    '[class*="listbox"]:not([style*="display: none"]):not(.hidden)',
     // Element UI
     '.el-select-dropdown:not(.hidden):not([style*="display: none"])',
     '.el-select__popper:not([style*="display: none"])',
     '.el-popper:not([style*="display: none"])',
+    // Element UI cascader（浮层通常挂在 body，不属于触发器 DOM 子树）
+    '.el-cascader__dropdown:not([style*="display: none"])',
+    '.el-cascader__panel:not([style*="display: none"])',
     // Ant Design
     '.ant-select-dropdown:not(.hidden):not([style*="display: none"])',
     // Vuetify
@@ -268,8 +298,11 @@
   var OPTION_SELECTORS = [
     // ARIA 标准
     '[role="option"]',
+    '[role="menuitem"]',
+    '[role="treeitem"]',
     // Element UI
     '.el-select-dropdown__item',
+    '.el-cascader-node',
     // Ant Design
     '.ant-select-item',
     '.ant-select-item-option',
@@ -291,9 +324,14 @@
     // ARIA
     '[role="combobox"]',
     '[role="listbox"]',
+    '[aria-haspopup="listbox"]',
+    '[aria-haspopup="menu"]',
+    '[aria-haspopup="tree"]',
     // Element UI
     '.el-select',
     '.el-select .el-input__inner',
+    '.el-cascader',
+    '.el-cascader .el-input__inner',
     // Ant Design
     '.ant-select',
     '.ant-select-selection',
@@ -311,7 +349,7 @@
     // 通用
     'input[readonly]',
     'input[role="combobox"]',
-    '[aria-haspopup="listbox"]',
+    '[data-state][aria-expanded]',
     '[class*="select"]:not([class*="selected"])'
   ];
 
@@ -365,6 +403,7 @@
     var triggerValue = params.trigger && params.trigger.value;
     var optionFindBy = (params.option && params.option.findBy) || "text";
     var optionValue = params.option && params.option.value;
+    var sourceInteraction = findSourceInteraction(deps, params.trigger);
     var trigger = null;
 
     // ===== 步骤1: 定位下拉框触发器 =====
@@ -454,7 +493,7 @@
     // 之前的 alreadyOpen 优化有缺陷：它检测到任意下拉框已展开就跳过点击触发器，
     // 但那个已展开的下拉框可能属于另一个 el-select 组件（页面上有多个下拉框），
     // 导致在错误的下拉框中搜索选项，永远找不到目标选项。
-    await vc.keyboardPress("Escape");
+    await dismissFloatingOrEscape(evalInPage, vc);
     await sleep(150);
 
     // 点击触发器打开正确的下拉框
@@ -535,6 +574,10 @@
       "  return JSON.stringify({tag:el.tagName,text:(el.textContent||'').trim().substring(0,80),x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),ordinal:true});" +
       "})()";
 
+    // 层级选项可能需要父节点 hover 后才渲染子节点。选择器来自源码契约，
+    // 这里不依赖任何组件库的实现 class。
+    var findExpandableParents = sourceInteraction ? "(function(){var nodeSel=" + JSON.stringify(sourceInteraction.nodeSelector) + ",expandSel=" + JSON.stringify(sourceInteraction.expandableSelector) + ";function v(el){var r=el.getBoundingClientRect(),s=getComputedStyle(el);return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}var a=Array.from(document.querySelectorAll(nodeSel)).filter(function(n){return v(n)&&(n.matches(expandSel)||n.querySelector(expandSel));}).map(function(n){var r=n.getBoundingClientRect();return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),text:(n.textContent||'').trim().substring(0,80)};});return JSON.stringify(a.slice(0,20));})()" : null;
+
     // 策略B: 通用查找（排除表格/表头等非浮层元素），只返回坐标。
     var genericCode = "(function() {" +
       "  var val = " + JSON.stringify(optionValue) + ";" +
@@ -575,7 +618,7 @@
     for (var retry = 0; retry < 3 && !optionEl; retry++) {
       if (retry > 0) {
         // 重试前重新点击触发器（下拉框可能已关闭）
-        await vc.keyboardPress("Escape");
+        await dismissFloatingOrEscape(evalInPage, vc);
         await sleep(100);
         // P3: 第2次重试时先滚动到触发器，确保不在视口外
         if (retry === 1) {
@@ -595,6 +638,20 @@
       var optResp = await evalInPage(findAndClickOption);
       if (optResp && optResp.ok && optResp.result && optResp.result !== "null") {
         try { optionEl = JSON.parse(optResp.result); } catch(e) {}
+      }
+
+      if (!optionEl && sourceInteraction && sourceInteraction.reveal === "hover" && vc.mouseHover) {
+        var parentResp = await evalInPage(findExpandableParents);
+        var parents = [];
+        if (parentResp && parentResp.ok && parentResp.result) { try { parents = JSON.parse(parentResp.result) || []; } catch(e) {} }
+        for (var pi = 0; pi < parents.length && !optionEl; pi++) {
+          await vc.mouseHover(parents[pi].x, parents[pi].y);
+          await sleep(120);
+          var revealedResp = await evalInPage(findAndClickOption);
+          if (revealedResp && revealedResp.ok && revealedResp.result && revealedResp.result !== "null") {
+            try { optionEl = JSON.parse(revealedResp.result); } catch(e) {}
+          }
+        }
       }
 
       // 策略A2: “第二个选项”等自然语言索引
@@ -642,13 +699,16 @@
         "})()";
       var diagResp = await evalInPage(diagCode);
       var diagInfo = (diagResp && diagResp.ok && diagResp.result) ? diagResp.result : '诊断失败';
-      await vc.keyboardPress("Escape");
+      await dismissFloatingOrEscape(evalInPage, vc);
       return { ok: false, result: "下拉已展开但未找到选项: " + optionValue + "（重试3次）。可见下拉框内容: " + diagInfo };
     }
 
     // 页面内只负责定位，实际选择用 CDP 真实鼠标点击。
     if (optionEl.x && optionEl.y) {
-      await vc.mouseClick(optionEl.x, optionEl.y);
+      var optionClick = await vc.clickAtPoint(evalInPage, optionEl.x, optionEl.y, sourceInteraction || undefined);
+      if (!optionClick.ok) {
+        return { ok: false, result: "选项点击未生效: " + (optionClick.error || "未命中可操作控件"), pageState: await getPageState(evalInPage) };
+      }
     }
     await sleep(STEP_DELAY);
     var expectedOptionText = (optionOrdinal(optionValue) !== null && optionEl && optionEl.text) ? optionEl.text : optionValue;
@@ -673,12 +733,13 @@
       "    }" +
       "  }" +
       "  // 检查已知框架 select 组件" +
-      "  var fwSels = document.querySelectorAll('.el-select, .ant-select, .v-select, .q-select, .MuiSelect-root');" +
+      "  var fwSels = document.querySelectorAll('.el-select, .el-cascader, .ant-select, .v-select, .q-select, .MuiSelect-root');" +
       "  for (var k = 0; k < fwSels.length; k++) {" +
       "    var fr = fwSels[k].getBoundingClientRect();" +
       "    if (Math.abs(fr.x + fr.width/2 - tx) < 100 && Math.abs(fr.y + fr.height/2 - ty) < 100) {" +
       "      var input = fwSels[k].querySelector('input, .ant-select-selection-item, .v-select__selection, .q-field__native');" +
-      "      return JSON.stringify({value: (input ? (input.value || input.textContent || '').trim() : ''), type:'framework'});" +
+      "      var tags = Array.from(fwSels[k].querySelectorAll('.el-cascader__tags .el-tag, .el-cascader__tags .el-tag__content')).map(function(n){return (n.textContent||'').trim();}).filter(Boolean);" +
+      "      return JSON.stringify({value: tags.length ? tags.join(' / ') : (input ? (input.value || input.textContent || '').trim() : ''), type:'framework'});" +
       "    }" +
       "  }" +
       "  return 'null';" +
@@ -696,12 +757,15 @@
     if (verifyValue && verifyValue.value && verifyValue.value.indexOf(expectedOptionText) === -1) {
       if (optionEl.x && optionEl.y) {
         // 重新打开下拉框
-        await vc.keyboardPress("Escape");
+        await dismissFloatingOrEscape(evalInPage, vc);
         await sleep(100);
         await vc.mouseClick(trigger.x, trigger.y);
         await sleep(STEP_DELAY + 200);
         // 用 CDP 真实鼠标点击选项坐标
-        await vc.mouseClick(optionEl.x, optionEl.y);
+        var retryOptionClick = await vc.clickAtPoint(evalInPage, optionEl.x, optionEl.y, sourceInteraction || undefined);
+        if (!retryOptionClick.ok) {
+          return { ok: false, result: "选项重试点击未生效: " + (retryOptionClick.error || "未命中可操作控件"), pageState: await getPageState(evalInPage) };
+        }
         await sleep(STEP_DELAY);
         // 重新验证
         var verifyResp2 = await evalInPage(verifyCode);
@@ -728,6 +792,7 @@
 
     var triggerValue = params.trigger && params.trigger.value;
     var wantedValues = (params.options || []).map(function(o){ return o.value; });
+    var sourceInteraction = findSourceInteraction(deps, params.trigger);
     var trigger = null;
 
     // 定位触发器
@@ -770,7 +835,7 @@
 
     // 关键修复：always close existing dropdowns first, then click trigger.
     // 与 select_option 相同的修复：不检查 alreadyOpen，直接关闭已有下拉再重新点击触发器。
-    await vc.keyboardPress("Escape");
+    await dismissFloatingOrEscape(evalInPage, vc);
     await sleep(150);
 
     await vc.mouseClick(trigger.x, trigger.y);
@@ -778,6 +843,7 @@
 
     // 在浮层内逐个点击选项
     var selected = [], failed = [], selectedLabels = [];
+    var findExpandableParentsForMulti = sourceInteraction ? "(function(){var nodeSel=" + JSON.stringify(sourceInteraction.nodeSelector) + ",expandSel=" + JSON.stringify(sourceInteraction.expandableSelector) + ";function v(el){var r=el.getBoundingClientRect(),s=getComputedStyle(el);return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}var a=Array.from(document.querySelectorAll(nodeSel)).filter(function(n){return v(n)&&(n.matches(expandSel)||n.querySelector(expandSel));}).map(function(n){var r=n.getBoundingClientRect();return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};});return JSON.stringify(a.slice(0,20));})()" : null;
     for (var i = 0; i < params.options.length; i++) {
       var opt = params.options[i];
       var findCode = "(function(){var val=" + JSON.stringify(opt.value) + ";" +
@@ -802,8 +868,24 @@
       var fr = await evalInPage(findCode);
       var ok = false, foundOpt = null;
       if (fr && fr.ok && fr.result) { try { foundOpt = JSON.parse(fr.result); ok = !!foundOpt.ok; } catch(e) {} }
+      if (!ok && sourceInteraction && sourceInteraction.reveal === "hover" && vc.mouseHover) {
+        var multiParentsResp = await evalInPage(findExpandableParentsForMulti);
+        var multiParents = [];
+        if (multiParentsResp && multiParentsResp.ok && multiParentsResp.result) { try { multiParents = JSON.parse(multiParentsResp.result) || []; } catch(e) {} }
+        for (var mpi = 0; mpi < multiParents.length && !ok; mpi++) {
+          await vc.mouseHover(multiParents[mpi].x, multiParents[mpi].y);
+          await sleep(120);
+          var revealedMultiResp = await evalInPage(findCode);
+          if (revealedMultiResp && revealedMultiResp.ok && revealedMultiResp.result) {
+            try { foundOpt = JSON.parse(revealedMultiResp.result); ok = !!foundOpt.ok; } catch(e) {}
+          }
+        }
+      }
       if (ok && foundOpt && typeof foundOpt.x === "number" && typeof foundOpt.y === "number") {
-        await vc.mouseClick(foundOpt.x, foundOpt.y);
+        var multiOptionClick = await vc.clickAtPoint(evalInPage, foundOpt.x, foundOpt.y, sourceInteraction || undefined);
+        if (!multiOptionClick.ok) {
+          ok = false;
+        }
       }
       if (ok) {
         selected.push(opt.value);
@@ -815,8 +897,19 @@
     }
 
     if (params.closeOnDone !== false) {
-      await vc.keyboardPress("Escape");
+      await dismissFloatingOrEscape(evalInPage, vc);
       await sleep(STEP_DELAY);
+    }
+
+    if (params.applyAfterSelection) {
+      if (!sourceInteraction || !sourceInteraction.applySelector) {
+        return { ok: false, result: "源码交互契约未声明提交动作，不能自动提交筛选", pageState: await getPageState(evalInPage) };
+      }
+      var applyResult = await vc.clickBySelector(evalInPage, sourceInteraction.applySelector);
+      if (!applyResult.ok) {
+        return { ok: false, result: "已选择标签，但提交筛选失败: " + (applyResult.error || sourceInteraction.applySelector), pageState: await getPageState(evalInPage) };
+      }
+      await waitForLoading(evalInPage);
     }
 
     var state = await getPageState(evalInPage);
@@ -824,7 +917,7 @@
     if (failed.length === 0 && selectedLabels.length > 0 && verifyMulti && !verifyMulti.ok) {
       failed = verifyMulti.missing || selectedLabels;
     }
-    var result = "多选完成: 成功 " + selected.length + " 个";
+    var result = "多选完成: 成功 " + selected.length + " 个" + (params.applyAfterSelection ? "，已提交筛选" : "");
     if (failed.length > 0) result += "，失败: " + failed.join(", ");
     if (verifyMulti && verifyMulti.text) result += "；当前选中/控件文本: " + verifyMulti.text.substring(0, 160);
     return { ok: failed.length === 0, result: result, pageState: state };
