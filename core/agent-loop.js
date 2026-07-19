@@ -8,7 +8,7 @@
   var LOOP_GUARD = 4; // 连续 LOOP_GUARD 轮执行相同动作且无进展时自动收尾，防死循环
   // 按动作类型区分等待时间（替代统一 500ms）
   var ACTION_WAIT_MAP = {
-    click: 300, visual_click: 300,
+    click: 300, visual_click: 300, surface_interact: 300,
     type: 200, visual_type: 200,
     press: 150, visual_press: 150,
     scroll: 150, visual_scroll: 150,
@@ -373,6 +373,9 @@
     // 用例是独立验收项，但相邻、同页面且共享前置条件/模块的用例可复用一次 setup。
     // 没有明确共同信号时宁可不合并，避免跨用例状态污染。
     function assignExecutionScenarios(testCases) {
+      if (global.AIFT_TestScheduler && global.AIFT_TestScheduler.assignScenarios) {
+        return global.AIFT_TestScheduler.assignScenarios(testCases);
+      }
       var scenarioByKey = {};
       var scenarioCount = 0;
       for (var i = 0; i < testCases.length; i++) {
@@ -670,21 +673,8 @@
     function updateTestCaseState(message, toolCalls) {
       if (!state.testCases || state.testCases.length === 0) return;
 
-      // 1. 检查是否有 assert 工具调用
-      var assertTcId = extractTcIdFromToolCalls(toolCalls);
-      if (assertTcId) {
-        // 找到对应的用例，标记为 testing（如果还不是的话）
-        // 实际的 passed/failed 状态由 executeAction 中的 assert case 设置
-        for (var i = 0; i < state.testCases.length; i++) {
-          if ((state.testCases[i].id || "").toUpperCase() === assertTcId) {
-            if (state.testCases[i].status !== "passed" && state.testCases[i].status !== "failed") {
-              state.testCases[i].status = "testing";
-            }
-            break;
-          }
-        }
-        return;
-      }
+      // assert 的归属只能在 executeAction 中由 currentTcId 决定。不能根据模型的
+      // 自由文本提前切换用例，否则一条编号写错的断言会污染后续操作和错误诊断。
 
       // 2. 检查是否有跳过指令
       var combined = ((message && message.content) || "") + " " + JSON.stringify(toolCalls || []).toLowerCase();
@@ -753,6 +743,7 @@
       state.actionSigHistory = [];
       state.loopWarning = null;
       state.visualClickAttempts = [];
+      state.failureAttempts = state.failureAttempts.filter(function(attempt) { return attempt.tcId !== state.currentTcId; });
 
       log("🔄 用例 " + state.currentTcId + " 开始测试");
     }
@@ -796,6 +787,9 @@
       round: 0,
       sourceFiles: {},   // 源码索引
       sourceInteractions: [], // 上传源码推导的可执行交互契约
+      activeSourceInteractions: [], // 当前页面和 TC 相关的交互契约
+      observedSelectors: [], // 仅本次快照或 find_element 明确返回的 selector，可用于基础动作
+      scenarioPlan: [], // 用例共享 setup 的执行场景计划
       errorRecords: [], // 结构化错误记录，供面板持久化和导出
       decisionTrace: [], // AI 推理、计划与工具结果的可导出轨迹
       lastReasoning: "",
@@ -821,6 +815,7 @@
       cachedSummary: "",   // 缓存的上下文摘要（跨用例传递）
       needReadSummary: false,  // 标记需要在下一轮循环前读取摘要
       failedStrategies: [], // 已失败的策略摘要：[{ tcId, strategy, reason }]
+      failureAttempts: [], // 交互失败轨迹：基于页面进展尽早熔断无效重试
       visualClickAttempts: [], // visual_click 尝试记录：[{x, y, round}]，用于检测同一区域反复点击
       annotatedElements: [],   // 标注截图中的元素列表：[{label, x, y, selector, ...}]
       noToolCallCount: 0,    // 连续无 tool_calls 的轮数，超过阈值才真正结束
@@ -840,6 +835,21 @@
       limit = limit || 1200;
       return value.length > limit ? value.substring(0, limit) + "…" : value;
     }
+    function summarizeSnapshot(snapshot) {
+      if (!snapshot) return null;
+      var nodes = (snapshot.nodes || []).slice(0, 30).map(function(node) {
+        return {
+          ref: node.ref || "",
+          tag: node.tag || "", text: shortenTraceText(node.text || "", 120),
+          value: shortenTraceText(node.value || "", 120), selector: node.selector || "",
+          role: node.role || "", placeholder: node.placeholder || "",
+        };
+      });
+      return {
+        url: snapshot.url || "", title: snapshot.title || "",
+        pageText: shortenTraceText(snapshot.pageText || "", 1500), nodes: nodes,
+      };
+    }
     function recordTrace(entry) {
       state.decisionTrace.push(Object.assign({
         timestamp: new Date().toISOString(),
@@ -857,12 +867,15 @@
         round: state.round,
         testCaseId: state.currentTcId || "",
         page: { url: snapshot.url || "", title: snapshot.title || "" },
-        sourceInteractions: (state.sourceInteractions || []).map(function(item) {
+        sourceInteractions: (state.activeSourceInteractions || []).map(function(item) {
           return { kind: item.kind, triggerSelector: item.triggerSelector, source: item.source };
         }),
         reasoning: shortenTraceText(state.lastReasoning, 6000),
         recentTrace: state.decisionTrace.slice(-20),
+        domSnapshot: summarizeSnapshot(state.snapshot),
+        previousDomSnapshot: summarizeSnapshot(state.previousSnapshot),
       }, detail || {});
+      if (global.AIFT_Redaction && global.AIFT_Redaction.redact) record = global.AIFT_Redaction.redact(record);
       state.errorRecords.push(record);
       if (deps.onErrorRecord) deps.onErrorRecord(record);
       return record;
@@ -884,7 +897,9 @@
       if (!resp || !resp.ok) {
         throw new Error(resp ? resp.error : "无响应");
       }
+      state.previousSnapshot = state.snapshot;
       state.snapshot = resp.snapshot;
+      state.observedSelectors = (state.snapshot.nodes || []).map(function(node) { return node.selector; }).filter(Boolean);
       return resp.snapshot;
     }
 
@@ -921,7 +936,7 @@
       }
 
       async function interactionAtPoint(x, y) {
-        var contracts = state.sourceInteractions || [];
+        var contracts = state.activeSourceInteractions || [];
         if (!deps.evalInPage || contracts.length === 0) return null;
         for (var i = 0; i < contracts.length; i++) {
           var contract = contracts[i];
@@ -931,6 +946,18 @@
           if (resp && resp.ok && resp.result === "true") return contract;
         }
         return null;
+      }
+
+      function resolveObservedTarget(actionArgs) {
+        if (!global.AIFT_AgentGuard || !global.AIFT_AgentGuard.resolveObservedTarget) {
+          return { ok: false, error: "定位守卫不可用，无法安全执行基础元素操作。" };
+        }
+        return global.AIFT_AgentGuard.resolveObservedTarget(
+          state.snapshot,
+          state.observedSelectors,
+          state.activeSourceInteractions,
+          actionArgs
+        );
       }
 
       log("执行动作: " + name + " " + JSON.stringify(args));
@@ -956,18 +983,32 @@
               : (annotationClick.error || "标注对应元素点击未生效");
             break;
           }
-          var clickRet = await tryCdpOnly({ selector: args.selector },
+          var clickTarget = resolveObservedTarget(args);
+          if (!clickTarget.ok) {
+            result.ok = false;
+            result.result = clickTarget.error;
+            break;
+          }
+          result.args = Object.assign({}, args, { selector: clickTarget.selector });
+          var clickRet = await tryCdpOnly({ selector: clickTarget.selector },
             async function () {
-              return await global.AIFT_VisualController.clickBySelector(deps.evalInPage, args.selector);
+              return await global.AIFT_VisualController.clickBySelector(deps.evalInPage, clickTarget.selector);
             }, "点击");
           result.ok = clickRet.ok;
           result.result = clickRet.result;
           break;
 
         case "type":
-          var typeRet = await tryCdpOnly({ selector: args.selector, text: args.text },
+          var typeTarget = resolveObservedTarget(args);
+          if (!typeTarget.ok) {
+            result.ok = false;
+            result.result = typeTarget.error;
+            break;
+          }
+          result.args = Object.assign({}, args, { selector: typeTarget.selector });
+          var typeRet = await tryCdpOnly({ selector: typeTarget.selector, text: args.text },
             async function () {
-              return await global.AIFT_VisualController.typeBySelector(deps.evalInPage, args.selector, args.text);
+              return await global.AIFT_VisualController.typeBySelector(deps.evalInPage, typeTarget.selector, args.text);
             }, "输入");
           result.ok = typeRet.ok;
           result.result = typeRet.result + (typeRet.ok ? " → \"" + (args.text || "").substring(0, 30) + "\"" : "");
@@ -1006,10 +1047,17 @@
           if (global.AIFT_VisualController && deps.evalInPage) {
             try {
               await global.AIFT_VisualController.ensureAttached(deps.tabId);
-              if (args.selector) {
-                var scrollResult = await global.AIFT_VisualController.scrollToElement(deps.evalInPage, args.selector);
+              if (args.selector || args.elementRef) {
+                var scrollTarget = resolveObservedTarget(args);
+                if (!scrollTarget.ok) {
+                  result.ok = false;
+                  result.result = scrollTarget.error;
+                  break;
+                }
+                result.args = Object.assign({}, args, { selector: scrollTarget.selector });
+                var scrollResult = await global.AIFT_VisualController.scrollToElement(deps.evalInPage, scrollTarget.selector);
                 if (scrollResult.ok) {
-                  result.result = "CDP 滚动到: " + args.selector;
+                  result.result = "CDP 滚动到: " + scrollTarget.selector;
                   break;
                 }
                 result.ok = false;
@@ -1036,9 +1084,16 @@
           if (global.AIFT_VisualController && deps.evalInPage) {
             try {
               await global.AIFT_VisualController.ensureAttached(deps.tabId);
-              var hoverResult = await global.AIFT_VisualController.hoverBySelector(deps.evalInPage, args.selector);
+              var hoverTarget = resolveObservedTarget(args);
+              if (!hoverTarget.ok) {
+                result.ok = false;
+                result.result = hoverTarget.error;
+                break;
+              }
+              result.args = Object.assign({}, args, { selector: hoverTarget.selector });
+              var hoverResult = await global.AIFT_VisualController.hoverBySelector(deps.evalInPage, hoverTarget.selector);
               if (hoverResult.ok) {
-                result.result = "CDP 悬停: " + args.selector;
+                result.result = "CDP 悬停: " + hoverTarget.selector;
                 break;
               } else {
                 result.ok = false;
@@ -1053,6 +1108,35 @@
           }
           result.ok = false;
           result.result = "CDP 视觉控制器不可用，无法执行真实悬停";
+          break;
+
+        case "surface_interact":
+          var surfaceTarget = resolveObservedTarget(args);
+          if (!surfaceTarget.ok) {
+            result.ok = false;
+            result.result = surfaceTarget.error;
+            break;
+          }
+          if (!global.AIFT_VisualController || !deps.evalInPage) {
+            result.ok = false;
+            result.result = "CDP 视觉控制器不可用，无法执行交互面操作";
+            break;
+          }
+          try {
+            await global.AIFT_VisualController.ensureAttached(deps.tabId);
+            var surfaceResult = await global.AIFT_VisualController.interactWithSurface(
+              deps.evalInPage, surfaceTarget.selector, args.action, args.start, args.end
+            );
+            result.ok = !!surfaceResult.ok;
+            result.args = Object.assign({}, args, { selector: surfaceTarget.selector });
+            result.result = surfaceResult.ok
+              ? "CDP 交互面" + (args.action === "drag" ? "拖拽" : "点击") + "已发送: " + surfaceTarget.selector +
+                " 起点(" + Math.round(surfaceResult.from.x) + "," + Math.round(surfaceResult.from.y) + ")"
+              : (surfaceResult.error || "交互面操作失败");
+          } catch (e) {
+            result.ok = false;
+            result.result = "CDP 交互面操作异常: " + (e.message || e);
+          }
           break;
 
         case "eval_in_page":
@@ -1078,7 +1162,7 @@
           try {
             var findBy = args.findBy || "text";
             var findValue = args.value || "";
-            // 性能优化：'text' 模式不再遍历 '*'（几万个元素），改用更精确的选择器
+            // 文本定位先检查标准语义交互元素，避免菜单/Tab 因为内部子节点较多被漏掉。
             // 同时支持 'css' 作为 'selector' 的别名（AI 经常用 css）
             if (findBy === 'css') findBy = 'selector';
             var findCode = "(function() {" +
@@ -1088,18 +1172,11 @@
               "  function cssAttr(name,value){return '['+name+'=\"'+String(value).replace(/\\\\/g,'\\\\\\\\').replace(/\"/g,'\\\\\"')+'\"]';}" +
               "  function buildSel(el){if(el.id&&!/^\\d+$/.test(el.id))return '#'+CSS.escape(el.id);var tid=el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa');if(tid)return cssAttr(el.getAttribute('data-testid')?'data-testid':(el.getAttribute('data-test')?'data-test':'data-qa'),tid);var path=[],cur=el;while(cur&&cur!==document.body){var sib=Array.prototype.slice.call(cur.parentElement?cur.parentElement.children:[]);var idx=sib.indexOf(cur)+1;var part=cur.tagName.toLowerCase()+':nth-child('+idx+')';path.unshift(part);var s=path.join(' > ');try{if(document.querySelectorAll(s).length===1)return s;}catch(e){}cur=cur.parentElement;}return el.tagName.toLowerCase();}" +
               "  function interactiveScore(el){var tag=el.tagName.toLowerCase();var score=0;if(tag==='button'||tag==='a')score+=50;if(tag==='input'||tag==='textarea'||tag==='select')score+=45;if(el.getAttribute('role'))score+=25;if(el.onclick||el.hasAttribute('onclick'))score+=20;if(getComputedStyle(el).cursor==='pointer')score+=15;if(el.disabled||el.getAttribute('aria-disabled')==='true')score-=100;return score;}" +
+              "  function visible(el){for(var p=el;p&&p!==document.documentElement;p=p.parentElement){var st=getComputedStyle(p);if(p.hidden||p.getAttribute('aria-hidden')==='true'||st.display==='none'||st.visibility==='hidden'||st.contentVisibility==='hidden')return false;}var r=el.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.top<window.innerHeight;}" +
               "  if (findBy === 'text') {" +
-              "    /* 使用 TreeWalker 避免扫描过多元素。 */" +
-              "    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {" +
-              "      acceptNode: function(node) {" +
-              "        if (node.children.length > 2) return NodeFilter.FILTER_REJECT;" +
-              "        var t = (node.textContent || '').trim();" +
-              "        if (!t || t.length > 80 || t.indexOf(val) === -1) return NodeFilter.FILTER_REJECT;" +
-              "        return NodeFilter.FILTER_ACCEPT;" +
-              "      }" +
-              "    });" +
-              "    var node;" +
-              "    while ((node = walker.nextNode()) && els.length < 10) { els.push(node); }" +
+              "    var semantic='a,button,input,select,textarea,label,li,[role=button],[role=link],[role=menuitem],[role=tab],[role=option],[role=treeitem],[tabindex],[onclick]';" +
+              "    els=Array.prototype.slice.call(document.querySelectorAll(semantic)).filter(function(node){var t=(node.textContent||node.value||'').replace(/\\s+/g,' ').trim();return t&&t.length<=160&&(t===val||t.indexOf(val)!==-1);});" +
+              "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node;while((node=walker.nextNode())&&els.length<10){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=2&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
               "  } else if (findBy === 'text_contains') {" +
               "    var walker2 = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {" +
               "      acceptNode: function(node) {" +
@@ -1136,7 +1213,7 @@
               "      return !attrVal || el.getAttribute(attrName) === attrVal;" +
               "    });" +
               "  }" +
-              "  els = els.filter(function(el){var r=el.getBoundingClientRect();var st=getComputedStyle(el);return st.display!=='none'&&st.visibility!=='hidden'&&r.width>0&&r.height>0&&r.bottom>0&&r.top<window.innerHeight;});" +
+              "  els = els.filter(visible);" +
               "  els.sort(function(a,b){return interactiveScore(b)-interactiveScore(a);});" +
               "  var results = els.slice(0, 5).map(function(el) {" +
               "    var r = el.getBoundingClientRect();" +
@@ -1162,8 +1239,13 @@
               if (foundEls.length === 0) {
                 result.ok = false;
                 result.result = "未找到匹配元素: findBy=" + findBy + ", value=" + findValue +
-                  "\n建议：1) 检查拼写 2) 用 eval_in_page 执行 document.querySelectorAll('*') 搜索 3) 用 read_source 查源码中的 class/id";
+                  "\n建议：1) 检查当前 DOM 快照中的文本、label、placeholder 和 elementRef 2) 改用 text_contains 或 label 查找 3) 需要源码语义时用 read_source。";
               } else {
+                foundEls.forEach(function(found) {
+                  if (found.selector && state.observedSelectors.indexOf(found.selector) === -1) {
+                    state.observedSelectors.push(found.selector);
+                  }
+                });
                 var findParts = ["找到 " + foundEls.length + " 个匹配元素:"];
                 for (var fi = 0; fi < foundEls.length; fi++) {
                   var fe = foundEls[fi];
@@ -1216,7 +1298,7 @@
           var tplResult = await global.AIFT_ActionTemplates.execute(name, {
             tabId: deps.tabId,
             evalInPage: deps.evalInPage,
-            sourceInteractions: state.sourceInteractions,
+            sourceInteractions: state.activeSourceInteractions,
           }, args);
           result.ok = tplResult.ok;
           result.result = tplResult.result || (tplResult.ok ? "模板执行成功" : "模板执行失败");
@@ -1300,23 +1382,40 @@
               ? tcPrefix[1] + assertionIcon + " " + assertionDescription.substring(tcPrefix[1].length)
               : assertionIcon + " " + assertionDescription;
           }
+          var assertionCheck = global.AIFT_AgentGuard && global.AIFT_AgentGuard.validateAssertionForCurrent
+            ? global.AIFT_AgentGuard.validateAssertionForCurrent(assertionDescription, state.currentTcId)
+            : { ok: false, error: "断言守卫不可用，无法安全提交断言。" };
+          if (!assertionCheck.ok) {
+            result.ok = false;
+            result.result = assertionCheck.error;
+            log("⚠️ 已拒绝断言: " + assertionCheck.error);
+            state.loopWarning = assertionCheck.error + " 请只为当前正在执行的用例提交一次对应断言。";
+            break;
+          }
+          var currentAssertionIdx = -1;
+          for (var aci = 0; aci < state.testCases.length; aci++) {
+            if ((state.testCases[aci].id || "").toUpperCase() === assertionCheck.testCaseId && state.testCases[aci].status === "testing") {
+              currentAssertionIdx = aci;
+              break;
+            }
+          }
+          if (currentAssertionIdx < 0) {
+            result.ok = false;
+            result.result = "当前用例 " + assertionCheck.testCaseId + " 未处于 testing 状态，断言未写入。";
+            log("⚠️ 已拒绝断言: " + result.result);
+            break;
+          }
           var assertion = {
             description: assertionDescription,
             passed: !!args.passed,
           };
           state.assertions.push(assertion);
-          if (!assertion.passed) {
-            recordError("failed_assertion", {
-              description: assertion.description,
-              action: "assert",
-              args: { passed: false },
-            });
-          }
           result.result = args.passed ? "✅ PASS" : "❌ FAIL";
           log("断言: " + assertion.description + " → " + (args.passed ? "✅ PASS" : "❌ FAIL"));
+          var assertionAccepted = true;
           if (deps.onAssertion) {
-            // 尝试匹配到测试用例
-            var matchedIdx = matchAssertionToTestCase(assertion, state.testCases);
+            // 断言只会归属当前执行中的用例，绝不按模型描述重新匹配。
+            var matchedIdx = currentAssertionIdx;
             if (matchedIdx >= 0) {
               var matchedTC = state.testCases[matchedIdx];
               // 保存原始状态，以便断言异常时回退
@@ -1384,25 +1483,11 @@
                 // 保持原状态（testing 或 pending），让 AI 可以重新断言
                 matchedTC.status = previousStatus;
                 matchedTC.assertionDesc = null;
+                assertionAccepted = false;
+                state.assertions.pop();
+                result.ok = false;
+                result.result = "断言未写入。\n\n" + warnParts.join("\n");
                 log("🔄 断言异常，已回退 " + matchedTC.id + " 状态为 " + previousStatus);
-
-                // 如果 TC 编号不匹配，说明 AI 想断言的是另一个 TC
-                // 将该 TC 重置为 testing，允许 AI 重新断言
-                if (tcMismatch && assertTcMatch) {
-                  var mentionedTcId = "TC" + assertTcMatch[1];
-                  for (var mi = 0; mi < state.testCases.length; mi++) {
-                    if ((state.testCases[mi].id || "").toUpperCase() === mentionedTcId) {
-                      if (state.testCases[mi].status === "passed" || state.testCases[mi].status === "failed") {
-                        state.testCases[mi].status = "testing";
-                        state.testCases[mi].assertionDesc = null;
-                        state.currentTcId = mentionedTcId;
-                        if (!state.tcRoundCount[mentionedTcId]) state.tcRoundCount[mentionedTcId] = 0;
-                        log("🔄 " + mentionedTcId + " 已重置为 testing，允许重新断言");
-                      }
-                      break;
-                    }
-                  }
-                }
 
                 // 注入下一轮警告
                 state.loopWarning = warnParts.join("\n") +
@@ -1413,10 +1498,17 @@
                 state.currentTcId = null;
               }
             }
-            deps.onAssertion(assertion, state.assertions, state.testCases);
+          }
+          if (assertionAccepted && deps.onAssertion) deps.onAssertion(assertion, state.assertions, state.testCases);
+          if (assertionAccepted && !assertion.passed) {
+            recordError("failed_assertion", {
+              description: assertion.description,
+              action: "assert",
+              args: { passed: false },
+            });
           }
           // 用例断言完成后，生成上下文摘要并缓存
-          if (global.AIFT_SummaryCache && matchedIdx >= 0) {
+          if (assertionAccepted && global.AIFT_SummaryCache && matchedIdx >= 0) {
             try {
               var summarySnapshot = state.snapshot;
               var summaryParts = [];
@@ -2258,6 +2350,8 @@
       state.finished = false;
       state.turnPaused = false;
       state.screenshot = null;
+      state.snapshot = null;
+      state.previousSnapshot = null;
       state.lastActionSig = null;
       state.repeatCount = 0;
       state.consecutiveWaitCount = 0;
@@ -2273,10 +2367,14 @@
       state.needReadSummary = false;
       state.failedStrategies = [];
       state.visualClickAttempts = [];
+      state.activeSourceInteractions = [];
+      state.failureAttempts = [];
 
       // 解析测试用例
       state.testCases = parseTestCases(params.testCases || "");
       assignExecutionScenarios(state.testCases);
+      state.scenarioPlan = global.AIFT_TestScheduler && global.AIFT_TestScheduler.buildPlan
+        ? global.AIFT_TestScheduler.buildPlan(state.testCases) : [];
       if (deps.onTestCasesParsed) deps.onTestCasesParsed(state.testCases);
 
       // 动态计算步数上限：基础 + 每个用例额外步数
@@ -2460,15 +2558,31 @@
             log("📋 上下文压缩：历史过长（" + Math.round(historyChars / 1000) + "K 字符 > " + Math.round(maxContextChars / 1000) + "K 上限），已压缩 " + middleMsgs.length + " 条中间消息");
           }
 
-          // 准备源码片段（最多取 5 个最相关的）
+          // 按当前页面、DOM 和测试用例召回源码，不能依赖上传目录的文件顺序。
           var sourceFilesArr = [];
-          var allFiles = Object.keys(state.sourceFiles);
-          for (var i = 0; i < Math.min(5, allFiles.length); i++) {
-            sourceFilesArr.push({
-              path: allFiles[i],
-              content: state.sourceFiles[allFiles[i]],
-            });
+          var currentCase = null;
+          for (var sci = 0; sci < state.testCases.length; sci++) {
+            if ((state.testCases[sci].id || "") === state.currentTcId) { currentCase = state.testCases[sci]; break; }
           }
+          var sourceContext = {
+            url: state.snapshot && state.snapshot.url || "",
+            title: state.snapshot && state.snapshot.title || "",
+            domText: state.snapshot && state.snapshot.pageText || "",
+            testCase: currentCase ? [currentCase.title, currentCase.page, currentCase.preconditions, currentCase.steps, currentCase.expected].join(" ") : params.testCases || "",
+          };
+          if (global.AIFT_SourceReader && global.AIFT_SourceReader.rankRelevantFiles) {
+            sourceFilesArr = global.AIFT_SourceReader.rankRelevantFiles(state.sourceFiles, sourceContext, 5);
+          } else {
+            var allFiles = Object.keys(state.sourceFiles);
+            for (var i = 0; i < Math.min(5, allFiles.length); i++) {
+              sourceFilesArr.push({ path: allFiles[i], content: state.sourceFiles[allFiles[i]] });
+            }
+          }
+          var relevantPaths = {};
+          sourceFilesArr.forEach(function(file) { relevantPaths[file.path] = true; });
+          state.activeSourceInteractions = (state.sourceInteractions || []).filter(function(interaction) {
+            return !interaction.path || relevantPaths[interaction.path];
+          });
 
           // 如果需要读取摘要（用例切换时标记），在构建消息前异步读取
           if (state.needReadSummary) {
@@ -2491,7 +2605,8 @@
             testCases: params.testCases,
             testCasesState: state.testCases,
             sourceFiles: sourceFilesArr,
-            sourceInteractions: state.sourceInteractions,
+            sourceInteractions: state.activeSourceInteractions,
+            scenarioPlan: state.scenarioPlan,
             snapshot: state.snapshot,
             screenshot: state.screenshot,
             history: state.history,
@@ -2754,6 +2869,7 @@
 
           // 逐个执行 tool_calls
           var needDiagnosticScreenshot = false; // 动作失败时补一张标注截图，避免每步截图拖慢执行
+          var roundFailureReasons = [];
           for (var t = 0; t < toolCalls.length; t++) {
             var tc = toolCalls[t];
             stream("action", "执行: " + tc.function.name);
@@ -2772,12 +2888,28 @@
               result: shortenTraceText(execResult.result || (execResult.ok ? "ok" : "error"), 2000),
             });
             if (!execResult.ok) {
+              roundFailureReasons.push(execResult.action + ": " + shortenTraceText(execResult.result || "工具执行失败", 180));
+              if (global.AIFT_ProgressGuard && global.AIFT_ProgressGuard.createFailureAttempt && state.currentTcId) {
+                var failureAttempt = global.AIFT_ProgressGuard.createFailureAttempt(execResult.action, execResult.args, state.snapshot);
+                if (failureAttempt) {
+                  failureAttempt.tcId = state.currentTcId;
+                  failureAttempt.round = state.round;
+                  state.failureAttempts.push(failureAttempt);
+                  if (state.failureAttempts.length > 40) state.failureAttempts.shift();
+                }
+              }
               recordError("tool_failure", {
                 action: execResult.action,
                 args: execResult.args,
                 message: execResult.result || "工具执行失败",
                 pageState: execResult.pageState || null,
               });
+            } else if (global.AIFT_ProgressGuard && global.AIFT_ProgressGuard.createFailureAttempt && state.currentTcId) {
+              // 成功交互已验证或返回了有效状态，旧失败不能继续触发熔断。
+              var successfulInteraction = global.AIFT_ProgressGuard.createFailureAttempt(execResult.action, execResult.args, state.snapshot);
+              if (successfulInteraction) {
+                state.failureAttempts = state.failureAttempts.filter(function(attempt) { return attempt.tcId !== state.currentTcId; });
+              }
             }
             if (!execResult.ok && ACTION_WAIT_MAP[tc.function.name] !== undefined) {
               needDiagnosticScreenshot = true;
@@ -2894,6 +3026,44 @@
             continue;
           }
 
+          var stalledFailure = global.AIFT_ProgressGuard && global.AIFT_ProgressGuard.detectStall
+            ? global.AIFT_ProgressGuard.detectStall(state.failureAttempts, state.currentTcId) : null;
+          if (stalledFailure && state.currentTcId) {
+            var stalledReason = stalledFailure.kind === "same_action"
+              ? "相同交互动作在未变化页面上连续失败 " + stalledFailure.count + " 次"
+              : (stalledFailure.kind === "same_target"
+                ? "不同操作在同一交互目标上连续失败 " + stalledFailure.count + " 次"
+                : "交互失败正在重复");
+            if (stalledFailure.kind === "warning") {
+              state.loopWarning = "⚠️ 当前用例的交互未产生页面变化：" + stalledReason + "（" + stalledFailure.target + "）。请先读取源码或定位真实状态控件，禁止继续重复点击。";
+              log("⚠️ " + stalledReason + "，已注入策略切换提示");
+            } else {
+              var stalledTcId = state.currentTcId;
+              var stalledDetail = stalledReason + "，已自动标记失败以避免无效循环";
+              log("⛔ " + stalledTcId + " " + stalledDetail);
+              stream("warning", "⛔ " + stalledTcId + " " + stalledDetail);
+              recordError("interaction_stall", {
+                reason: stalledDetail,
+                action: stalledFailure.action,
+                target: stalledFailure.target,
+                failureCount: stalledFailure.count,
+              });
+              for (var stci = 0; stci < state.testCases.length; stci++) {
+                if (state.testCases[stci].status === "testing") {
+                  state.testCases[stci].status = "failed";
+                  state.testCases[stci].assertionDesc = stalledDetail;
+                  break;
+                }
+              }
+              if (deps.onAssertion) deps.onAssertion(null, state.assertions, state.testCases);
+              state.loopWarning = "⛔ " + stalledTcId + " 已因重复交互失败自动标记失败。请立即开始下一个未完成用例；不要继续操作当前用例。";
+              state.currentTcId = null;
+              state.repeatCount = 0;
+              state.consecutiveWaitCount = 0;
+              state.lastActionSig = null;
+            }
+          }
+
           // ===== 记忆增强 + 死循环检测 =====
           // 借鉴 OpenCode 的 doom loop 检测（processor.ts 行 356-380）
           // 检查最近 N 次工具调用是否完全相同（工具名 + 参数 JSON 精确匹配）
@@ -2928,7 +3098,7 @@
             tcId: state.currentTcId || "unknown",
             round: state.round,
             action: roundActionsSummary,
-            reason: "",
+            reason: roundFailureReasons.join("；"),
             toolCalls: toolCalls, // 保存原始 toolCalls 用于 doom loop 检测
           });
           if (state.attemptHistory.length > 30) state.attemptHistory.shift();

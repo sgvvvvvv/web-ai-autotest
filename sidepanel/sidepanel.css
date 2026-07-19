@@ -349,13 +349,27 @@ body {
   font-size: 12px; color: #4e5969; max-height: 180px; overflow: auto;
 }
 .error-record-item {
-  display: flex; flex-direction: column; gap: 3px; padding: 7px 9px;
+  display: flex; align-items: flex-start; gap: 8px; padding: 7px 9px;
   margin-bottom: 5px; border-left: 3px solid #e74c3c; background: #fef0f0;
   border-radius: 4px;
 }
+.error-record-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; }
 .error-record-title { font-weight: 600; color: #b42318; }
 .error-record-detail { line-height: 1.45; overflow-wrap: anywhere; }
 .error-record-more { color: #86909c; padding: 4px 0; }
+.error-detail-btn { flex-shrink: 0; }
+.run-history-list { font-size: 12px; color: #4e5969; max-height: 220px; overflow: auto; }
+.run-history-item {
+  display: flex; align-items: center; gap: 8px; padding: 7px 0;
+  border-bottom: 1px solid #f0f1f3;
+}
+.run-history-item:last-child { border-bottom: none; }
+.run-history-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.run-history-title { font-weight: 600; color: #1f2329; }
+.run-history-meta { font-size: 11px; color: #86909c; overflow-wrap: anywhere; }
+.run-history-pass { color: #0a7c3e; }
+.run-history-fail { color: #b42318; }
+.run-history-unknown { color: #d97706; }
 
 /* ---- AI 思考流 ---- */
 .stream-header {
@@ -506,6 +520,13 @@ body {
 .modal-footer {
   padding: 12px 16px; border-top: 1px solid #e5e6eb;
   display: flex; justify-content: flex-end; gap: 8px;
+}
+.diagnostic-modal { width: 680px; }
+.diagnostic-meta { font-size: 12px; color: #4e5969; margin-bottom: 10px; overflow-wrap: anywhere; }
+.diagnostic-content {
+  margin: 0; max-height: min(60vh, 560px); overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; font: 11px/1.55 "SF Mono", Menlo, Consolas, monospace;
+  color: #1f2937; background: #f7f8fa; border: 1px solid #e5e6eb; border-radius: 4px; padding: 10px;
 }
 
 /* ---- 导出格式选择器 ---- */

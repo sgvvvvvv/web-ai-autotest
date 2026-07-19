@@ -682,7 +682,10 @@
       "function path(n){if(n.id)return '#'+esc(n.id);var a=n.getAttribute('data-testid')||n.getAttribute('data-test')||n.getAttribute('data-qa');if(a){var k=n.getAttribute('data-testid')?'data-testid':(n.getAttribute('data-test')?'data-test':'data-qa');return '['+k+'=\"'+String(a).replace(/\\\\/g,'\\\\\\\\').replace(/\"/g,'\\\\\"')+'\"]';}var p=[],c=n;while(c&&c!==document.body){var s=Array.prototype.slice.call(c.parentElement.children),i=s.indexOf(c)+1;p.unshift(c.tagName.toLowerCase()+':nth-child('+i+')');var q=p.join(' > ');try{if(document.querySelectorAll(q).length===1)return q;}catch(e){}c=c.parentElement;}return n.tagName.toLowerCase();}" +
       // 文本节点/label 往往只是展示层。优先解析真正承载状态变化的控件，尤其是 checkbox/radio。
       "function usable(n){if(!n)return false;var r=n.getBoundingClientRect(),s=getComputedStyle(n);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&!n.disabled&&n.getAttribute('aria-disabled')!=='true';}" +
-      "function control(n){if(!n)return null;if(nodeSelector&&activationSelector){var node=n.closest(nodeSelector),activation=node&&node.querySelector(activationSelector);if(usable(activation))return activation;}var direct=n.closest('input[type=checkbox],input[type=radio],button,[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(direct))return direct;var label=n.closest('label');if(label){var linked=label.htmlFor?document.getElementById(label.htmlFor):null;if(usable(linked))return linked;var inside=label.querySelector('input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch],button');if(usable(inside))return inside;}var parent=n.closest('[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(parent))return parent;return n;}" +
+      // 有些组件会隐藏原生 input，并把实际命中区放在相邻 span/div。这个探测只按语义和可见性选择代理元素。
+      "function visualProxy(control){if(!control)return null;var roots=[control.parentElement,control.parentElement&&control.parentElement.parentElement];for(var ri=0;ri<roots.length;ri++){var root=roots[ri];if(!root)continue;var all=[root].concat(Array.prototype.slice.call(root.querySelectorAll('button,span,div,label,[role=checkbox],[role=radio],[role=switch],[aria-checked]')));var best=null,bestScore=-1;for(var ai=0;ai<all.length;ai++){var c=all[ai];if(c===control||!usable(c))continue;var r=c.getBoundingClientRect();if(r.width>180||r.height>80)continue;var hint=((c.className||'')+' '+(c.getAttribute('role')||'')+' '+(c.getAttribute('aria-checked')||'')).toLowerCase();var score=(c===control.nextElementSibling?100:0)+(c.tagName==='BUTTON'?30:0)+(/check|radio|switch|toggle|select|control|indicator|inner|mark/.test(hint)?50:0)+(r.width*r.height<2500?10:0);if(score>bestScore){best=c;bestScore=score;}}if(best)return best;}return null;}" +
+      "function usableControl(root,selector){if(!root)return null;var all=[];try{if(root.matches&&root.matches(selector))all.push(root);all=all.concat(Array.prototype.slice.call(root.querySelectorAll(selector)));}catch(e){return null;}for(var i=0;i<all.length;i++){if(usable(all[i]))return all[i];var proxy=visualProxy(all[i]);if(proxy)return proxy;}return null;}" +
+      "function control(n){if(!n)return null;var node=nodeSelector?n.closest(nodeSelector):null;if(node&&activationSelector){var resolved=usableControl(node,activationSelector);if(resolved)return resolved;}if(node){var nested=usableControl(node,'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch],[aria-checked]');if(nested)return nested;}var direct=n.closest('input[type=checkbox],input[type=radio],button,[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(direct))return direct;var directProxy=visualProxy(direct);if(directProxy)return directProxy;var label=n.closest('label');if(label){var linked=label.htmlFor?document.getElementById(label.htmlFor):null;if(usable(linked))return linked;var linkedProxy=visualProxy(linked);if(linkedProxy)return linkedProxy;var inside=usableControl(label,'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch],button');if(inside)return inside;}var parent=n.closest('[role=checkbox],[role=radio],[role=switch],[role=option],[role=menuitem],[role=treeitem]');if(usable(parent))return parent;return n;}" +
       "var target=control(el);return {found:true,selector:path(target),resolved:target!==el,tag:target.tagName,type:target.type||'',role:target.getAttribute('role')||''};" +
       "})()";
     var resp = await evalInPage(code);
@@ -785,6 +788,49 @@
       button: "none",
     });
     return { ok: true };
+  }
+
+  // Operate on any rendered surface using coordinates relative to its live bounds.
+  // This intentionally has no dependency on a charting, canvas, or component library.
+  async function interactWithSurface(evalInPage, selector, action, start, end) {
+    if (!evalInPage || !selector) return { ok: false, error: "缺少 evalInPage 或交互面 selector" };
+    start = start || {};
+    end = end || null;
+    var validPoint = function(point) {
+      return point && typeof point.x === "number" && typeof point.y === "number" &&
+        point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1;
+    };
+    if (!validPoint(start) || (action === "drag" && !validPoint(end))) {
+      return { ok: false, error: "交互面的相对坐标必须在 0 到 1 之间" };
+    }
+    if (action !== "click" && action !== "drag") return { ok: false, error: "不支持的交互面操作: " + action };
+
+    var inspectCode = "(function(){var el=document.querySelector(" + JSON.stringify(selector) + ");" +
+      "if(!el)return JSON.stringify({ok:false,error:'元素不存在'});" +
+      "function visible(n){for(var p=n;p&&p!==document.documentElement;p=p.parentElement){var s=getComputedStyle(p);if(s.display==='none'||s.visibility==='hidden'||s.contentVisibility==='hidden'||p.hidden||p.getAttribute('aria-hidden')==='true')return false;}var r=n.getBoundingClientRect();return r.width>0&&r.height>0;}" +
+      "var r=el.getBoundingClientRect();if(!visible(el))return JSON.stringify({ok:false,error:'交互面不可见'});" +
+      "return JSON.stringify({ok:true,rect:{x:r.left,y:r.top,w:r.width,h:r.height},tag:el.tagName});})()";
+    var resp = await evalInPage(inspectCode);
+    if (!resp || !resp.ok) return { ok: false, error: (resp && resp.error) || "无法读取交互面位置" };
+    var meta;
+    try { meta = JSON.parse(resp.result || "{}"); } catch (e) { return { ok: false, error: "交互面信息解析失败" }; }
+    if (!meta.ok || !meta.rect) return { ok: false, error: meta.error || "交互面不可用" };
+
+    var point = function(relative) {
+      return {
+        x: meta.rect.x + meta.rect.w * relative.x,
+        y: meta.rect.y + meta.rect.h * relative.y,
+      };
+    };
+    var from = point(start);
+    var to = end ? point(end) : null;
+    var hitCode = "(function(){var root=document.querySelector(" + JSON.stringify(selector) + ");var hit=document.elementFromPoint(" + from.x + "," + from.y + ");return String(!!root&&!!hit&&(root===hit||root.contains(hit)));})()";
+    var hit = await evalInPage(hitCode);
+    if (!hit || !hit.ok || hit.result !== "true") return { ok: false, error: "交互起点被其他元素遮挡或不在目标内: " + selector };
+
+    if (action === "drag") await mouseDrag(from.x, from.y, to.x, to.y);
+    else await mouseClick(from.x, from.y);
+    return { ok: true, action: action, from: from, to: to, tag: meta.tag };
   }
 
   /**
@@ -1046,5 +1092,6 @@
     typeBySelector: typeBySelector,
     scrollToElement: scrollToElement,
     hoverBySelector: hoverBySelector,
+    interactWithSurface: interactWithSurface,
   };
 })(window);

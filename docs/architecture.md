@@ -43,6 +43,15 @@ aututest/
 │   ├── ai-client.js             # OpenAI 兼容 API 调用
 │   ├── source-reader.js         # 用户上传源码索引和检索
 │   ├── source-analyzer.js       # 源码结构分析
+│   ├── interaction-contract.js   # 源码交互契约匹配
+│   ├── test-scheduler.js         # 共享 setup 的场景编排
+│   ├── redaction.js              # 错误诊断导出脱敏
+│   ├── diagnostic-store.js        # 错误诊断本地存储容量控制
+│   ├── test-report.js              # 结构化测试报告与 Markdown 导出
+│   ├── run-history.js               # 有容量上限的报告历史
+│   ├── tab-eligibility.js            # 目标页面资格判断
+│   ├── progress-guard.js              # 基于页面进展的交互停滞熔断
+│   ├── config-validator.js       # API 端点配置校验
 │   ├── project-analyzer.js      # 项目架构分析
 │   └── test-summary-cache.js    # 用例间摘要缓存
 └── devtools/
@@ -118,7 +127,20 @@ flowchart TB
 - AI 不允许通过 `eval_in_page` 模拟用户操作。
 - 基础 `click/type/press/scroll/hover` 均走 CDP。
 - `select_option/select_multi/fill_input/click_button/toggle_switch` 等模板内部先只读定位，再用 CDP 操作，最后验证结果。
+- 源码契约存在时，模板先使用其触发、展开、激活和提交关系；没有契约时，从当前 DOM 节点的标准语义（checkbox/radio/ARIA state）解析实际激活目标，避免把展示文字当作点击点。
 - 如果 CDP attach 失败，测试不能继续宣称“真实用户行为”。
+
+## 源码关联、场景与诊断
+
+- 每一轮根据 URL、页面标题、DOM 文本和当前 TC 对上传文件排序，只给模型注入最相关的少量源码；需要更多上下文时仍可使用 `read_source`。
+- 源码分析以 `data-testid`、ARIA、placeholder、id/name 等稳定属性产出框架无关的交互契约。专用组件解析只能提供额外精度，核心执行仍使用标准 DOM 语义和 CDP。
+- DOM 快照中的可交互节点附带短引用；基础操作仅可使用该引用、显式查找结果或当前源码交互契约中的 selector，避免模型根据页面结构臆造选择器。
+- `assert` 仅可提交给运行时状态机中的当前 TC。模型写错 TC 编号时，工具拒绝该断言而不切换、回退或覆盖其他用例。
+- 调度器仅让相邻、同页面、共享前置条件且不改变页面状态的 TC 复用 setup。筛选、搜索、保存、分页等状态变更用例会隔离，且每个 TC 都必须独立断言。
+- 工具失败、循环停滞和断言失败会保存最近决策轨迹、当前/前一份 DOM 摘要和相关交互契约；导出前会脱敏密钥、Token、Cookie 和 Bearer 值。
+- Side Panel 可直接查看单条诊断详情；持久化层按数量和字节预算压缩旧记录，避免诊断数据撑满扩展存储。
+- 测试结束时将用例状态、断言、总结和本次运行的诊断记录组成版本化报告，可导出为 JSON 或 Markdown 供缺陷跟踪和回归留档。
+- 最近报告在扩展本地以数量和体积上限保存，可重新打开或再次导出；报告仅保留诊断摘要，详细轨迹仍存于错误记录。
 
 ## 视觉 + CDP
 
@@ -172,12 +194,16 @@ flowchart TB
 
 - API Key 只保存在扩展存储中，只由 Side Panel 读取。
 - Key 不传给 Content Script，不注入被测页面，不进入 prompt。
+- API URL 必须是 HTTP(S) 地址；非本机 HTTP 地址会显示传输安全警告，避免无意间用明文传输 API Key。
 - 上传源码只用于本地索引和 AI 上下文，不写回页面。
+- 源码上传按支持的文本后缀顺序读取并限制单文件读取量；成功替换源码时会使架构缓存失效，禁止新项目复用旧分析。
 - CDP 连接在测试结束、用户中止、Side Panel 断开或 tab 关闭时清理。
 
 ## 已知限制
 
 - `chrome.debugger` 同一 tab 只能有一个调试器连接。如果用户打开 DevTools 或其他工具占用 debugger，本产品会失败并提示，而不是降级成脚本模拟。
+- 运行前会确认目标页面是可注入的 http(s)/file 页面，并注入观察器发送 PING；受限内部页和已关闭标签页会在 Agent 启动前失败。
+- 交互失败轨迹同时记录目标和当前页面签名。相同目标在页面未变化时持续失败会先提示换策略，随后自动熔断并标记当前 TC 失败，避免无效轮次消耗。
 - 原生浏览器下拉弹层不是 DOM 节点，模板通过 CDP 键盘路径处理原生 select。
-- Canvas/WebGL 内部对象需要视觉坐标或业务源码辅助定位。
+- Canvas/WebGL 内部对象需要视觉坐标或业务源码辅助定位；`surface_interact` 先读取实时元素边界，再按 0-1 相对坐标发送 CDP 点击/拖拽，不依赖图表库或组件库。
 - 封闭 Shadow DOM 只能通过视觉/CDP 坐标测试，无法通过普通 DOM 读取内部状态。

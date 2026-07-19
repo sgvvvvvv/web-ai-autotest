@@ -20,6 +20,10 @@
     "[role=tab]",
     "[role=option]",
     "[role=treeitem]",
+    "canvas",
+    "svg",
+    "video",
+    "[role=img]",
     "[contenteditable=true]",
     "[onclick]",
     "[tabindex]",
@@ -51,9 +55,12 @@
 
   function isVisible(el) {
     if (!el) return false;
-    const style = getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
-    if (parseFloat(style.opacity) === 0) return false;
+    for (var current = el; current && current !== document.documentElement; current = current.parentElement) {
+      var style = getComputedStyle(current);
+      if (current.hidden || current.getAttribute("aria-hidden") === "true") return false;
+      if (style.display === "none" || style.visibility === "hidden" || style.contentVisibility === "hidden") return false;
+      if (parseFloat(style.opacity) === 0) return false;
+    }
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return false;
     return true;
@@ -179,6 +186,7 @@
       const rect = el.getBoundingClientRect();
       var selector = buildSelector(el);
       nodes.push({
+        ref: "e" + (nodes.length + 1),
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute("role") || "",
         type: el.getAttribute("type") || "",

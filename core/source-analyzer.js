@@ -182,6 +182,29 @@
     }
   }
 
+  function attributeSelector(name, value) {
+    return '[' + name + '="' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+  }
+
+  function extractStableTriggerSelector(attrs) {
+    var candidates = [
+      { pattern: /data-testid\s*=\s*["']([^"']+)["']/i, attribute: "data-testid" },
+      { pattern: /data-test\s*=\s*["']([^"']+)["']/i, attribute: "data-test" },
+      { pattern: /data-qa\s*=\s*["']([^"']+)["']/i, attribute: "data-qa" },
+      { pattern: /aria-label\s*=\s*["']([^"']+)["']/i, attribute: "aria-label" },
+      { pattern: /placeholder\s*=\s*["']([^"']+)["']/i, attribute: "placeholder", inputOnly: true },
+      { pattern: /\bid\s*=\s*["']([^"']+)["']/i, attribute: "id" },
+      { pattern: /\bname\s*=\s*["']([^"']+)["']/i, attribute: "name" },
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var match = attrs.match(candidates[i].pattern);
+      if (!match) continue;
+      var selector = attributeSelector(candidates[i].attribute, match[1]);
+      return candidates[i].inputOnly ? "input" + selector : selector;
+    }
+    return "";
+  }
+
   function extractGenericSelectionInteractions(content, info) {
     var tagRegex = /<([A-Za-z][\w.-]*)\b([^>]*?)>/g;
     var match;
@@ -190,15 +213,13 @@
       var attrs = match[2] || '';
       // 已由专用适配器提供更精确契约的组件不重复登记。
       if (/^(el-cascader|el-select|a-select|select)$/i.test(tag)) continue;
-      var model = attrs.match(/(?:v-model|value|modelValue|selected(?:Value)?)\s*=\s*["{]([^"}\s]+)/i);
-      var placeholderMatch = attrs.match(/placeholder\s*=\s*["']([^"']+)["']/i);
+      var model = attrs.match(/(?:v-model|value|modelValue|model-value|model_value|selected(?:Value|-value|_value)?)\s*=\s*["{]([^"}\s]+)/i);
       var hasChoices = /(?:options|items|choices|data|tree-data|treeData|menu-items)\s*=/i.test(attrs);
       var isMultiple = /\bmultiple\b|multi(?:ple)?\s*=\s*(?:"?true|{true})/i.test(attrs);
       var isHierarchical = /(?:tree|cascade|hierarch|nested|expandTrigger)/i.test(tag + ' ' + attrs);
       if (!model || !hasChoices) continue;
 
-      var placeholder = placeholderMatch ? placeholderMatch[1] : '';
-      var triggerSelector = placeholder ? 'input[placeholder="' + placeholder + '"]' : '';
+      var triggerSelector = extractStableTriggerSelector(attrs);
       // 没有稳定触发器时仍保留语义，但不让模板误匹配到错误控件。
       if (!triggerSelector) continue;
       var duplicate = info.interactions.some(function(item) { return item.triggerSelector === triggerSelector; });

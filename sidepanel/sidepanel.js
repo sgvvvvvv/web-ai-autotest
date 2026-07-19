@@ -8,13 +8,18 @@ var tabSelector = document.getElementById("tabSelector");
 var refreshTabBtn = document.getElementById("refreshTabBtn");
 var tabInfo = document.getElementById("tabInfo");
 
+function getTabEligibility(tab) {
+  if (window.AIFT_TabEligibility && AIFT_TabEligibility.evaluate) return AIFT_TabEligibility.evaluate(tab && tab.url);
+  return tab && /^https?:\/\//i.test(tab.url || "") ? { ok: true } : { ok: false, error: "目标页面不可测试" };
+}
+
 async function refreshTabList() {
   try {
     var tabs = await chrome.tabs.query({});
     tabSelector.innerHTML = "";
     for (var i = 0; i < tabs.length; i++) {
       var t = tabs[i];
-      if (t.url && (t.url.indexOf("chrome://") === 0 || t.url.indexOf("chrome-extension://") === 0)) continue;
+      if (!getTabEligibility(t).ok) continue;
       var opt = document.createElement("option");
       opt.value = t.id;
       opt.textContent = (t.title || t.url || "Tab " + t.id).substring(0, 60);
@@ -23,11 +28,15 @@ async function refreshTabList() {
     }
     // 尝试选中当前活跃标签
     var active = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (active && active[0]) {
+    if (active && active[0] && getTabEligibility(active[0]).ok && tabSelector.querySelector('option[value="' + active[0].id + '"]')) {
       tabSelector.value = active[0].id;
       tabId = active[0].id;
       tabInfo.textContent = "目标: " + (active[0].title || active[0].url || "").substring(0, 40);
       tabInfo.style.color = "#0a7c3e";
+    } else {
+      tabId = null;
+      tabInfo.textContent = "请选择可测试的 http(s) 页面";
+      tabInfo.style.color = "#d97706";
     }
   } catch (e) {
     tabInfo.textContent = "获取标签页失败: " + (e.message || e);
@@ -73,6 +82,11 @@ const els = {
   errorRecordList: document.getElementById("errorRecordList"),
   exportErrorsBtn: document.getElementById("exportErrorsBtn"),
   clearErrorsBtn: document.getElementById("clearErrorsBtn"),
+  errorDetailModal: document.getElementById("errorDetailModal"),
+  errorDetailTitle: document.getElementById("errorDetailTitle"),
+  errorDetailMeta: document.getElementById("errorDetailMeta"),
+  errorDetailContent: document.getElementById("errorDetailContent"),
+  errorDetailClose: document.getElementById("errorDetailClose"),
   chatInputRow: document.getElementById("chatInputRow"),
   chatInput: document.getElementById("chatInput"),
   chatSendBtn: document.getElementById("chatSendBtn"),
@@ -91,6 +105,10 @@ const els = {
   exportArchBtn: document.getElementById("exportArchBtn"),
   // 测试用例导出
   exportTestCasesBtn: document.getElementById("exportTestCasesBtn"),
+  exportTestReportBtn: document.getElementById("exportTestReportBtn"),
+  runHistoryCount: document.getElementById("runHistoryCount"),
+  runHistoryList: document.getElementById("runHistoryList"),
+  clearRunHistoryBtn: document.getElementById("clearRunHistoryBtn"),
   // 导出弹框
   exportModal: document.getElementById("exportModal"),
   exportModalTitle: document.getElementById("exportModalTitle"),
@@ -537,20 +555,55 @@ async function loadConfig() {
   updateButtonStates();
 }
 
-async function saveConfig() {
-  const config = {
+function getAiConfig() {
+  return {
     apiUrl: els.apiUrl.value.trim(),
     apiKey: els.apiKey.value.trim(),
     model: els.model.value.trim(),
     contextSize: parseInt(els.contextSize.value) || 128,
     visionSupported: els.visionSupported.checked,
     enableThinking: els.enableThinking.checked,
+  };
+}
+
+function validateAiConfig(config, requireComplete) {
+  if (window.AIFT_ConfigValidator && AIFT_ConfigValidator.validateAiConfig) {
+    return AIFT_ConfigValidator.validateAiConfig(config, requireComplete);
+  }
+  if (requireComplete && (!config.apiUrl || !config.apiKey || !config.model)) {
+    return { ok: false, error: "请先填写 AI 配置（API URL / Key / 模型）" };
+  }
+  return { ok: true };
+}
+
+function reportConfigValidation(config, requireComplete) {
+  var validation = validateAiConfig(config, requireComplete);
+  if (!validation.ok) {
+    log(validation.error);
+    setStatus("AI 配置无效");
+    return false;
+  }
+  if (validation.warning) log("⚠️ " + validation.warning);
+  return true;
+}
+
+async function saveConfig() {
+  const config = Object.assign(getAiConfig(), {
     requirement: els.requirement.value,
     testCases: els.testCases.value,
-  };
+  });
+  var validation = validateAiConfig(config, false);
   await chrome.storage.local.set({ aift_config: config });
   log("配置已保存");
-  setStatus("配置已保存");
+  if (validation.warning) {
+    log("⚠️ " + validation.warning);
+    setStatus("配置已保存（注意传输安全）");
+  } else if (!validation.ok) {
+    log("⚠️ " + validation.error);
+    setStatus("配置已保存（尚未有效）");
+  } else {
+    setStatus("配置已保存");
+  }
 }
 
 // 文本模型无法消费截图。即使模型忽略了提示词，最终用例也不能留下不可执行的视觉断言。
@@ -570,6 +623,43 @@ async function ensureContentScript() {
   });
 }
 
+async function preflightTargetTab() {
+  if (!tabId) {
+    log("请先选择目标标签页");
+    setStatus("未选择标签页");
+    return false;
+  }
+  var tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    log("目标标签页不可用: " + (error.message || error));
+    setStatus("目标标签页已关闭");
+    return false;
+  }
+  var eligibility = getTabEligibility(tab);
+  if (!eligibility.ok) {
+    log(eligibility.error);
+    setStatus("目标页面不可测试");
+    return false;
+  }
+  try {
+    await ensureContentScript();
+    var ping = await sendToContent(tabId, { type: "AIFT_PING" });
+    if (!ping || !ping.ok || !ping.pong) throw new Error("观察器未响应");
+    if (eligibility.warning) log("⚠️ " + eligibility.warning);
+    return true;
+  } catch (error) {
+    var message = error.message || String(error);
+    if (/file:|file URL|文件网址/i.test(tab.url || "") || /file:|file URL|文件网址/i.test(message)) {
+      message = "无法访问本地文件页面，请在扩展详情中启用“允许访问文件网址”";
+    }
+    log("目标页面预检失败: " + message);
+    setStatus("目标页面不可注入");
+    return false;
+  }
+}
+
 // ---- 发消息给 content script ----
 function sendToContent(tabId, message) {
   return chrome.tabs.sendMessage(tabId, message);
@@ -582,9 +672,29 @@ var expandedReportCases = new Set(); // 测试报告中已展开的用例 key
 var currentAssertions = []; // 当前断言列表（供折叠/展开重渲染时使用）
 var lastReportResult = null; // 上次测试报告结果
 var lastReportSummary = ""; // 上次测试报告总结
+var lastTestReport = null;
+var runHistory = [];
+var RUN_HISTORY_KEY = "aift_run_history_v1";
 var errorRecords = [];
 var ERROR_RECORDS_KEY = "aift_error_records_v1";
 var activeErrorRunId = "";
+
+function getErrorRecordLabel(record) {
+  return record.category === "failed_assertion" ? "❌ 断言失败" :
+    (record.category === "agent_pause" || record.category === "agent_limit" ? "⚠️ Agent 陷入停滞" : "⚠️ 工具失败");
+}
+
+function redactDiagnostic(value) {
+  return window.AIFT_Redaction && AIFT_Redaction.redact ? AIFT_Redaction.redact(value) : value;
+}
+
+function trimErrorRecords() {
+  if (window.AIFT_DiagnosticStore && AIFT_DiagnosticStore.trimForStorage) {
+    errorRecords = AIFT_DiagnosticStore.trimForStorage(errorRecords, { maxRecords: 100, maxBytes: 2 * 1024 * 1024 });
+  } else {
+    errorRecords = errorRecords.slice(-100);
+  }
+}
 
 function renderErrorRecords() {
   var total = errorRecords.length;
@@ -596,33 +706,180 @@ function renderErrorRecords() {
     return;
   }
   var recent = errorRecords.slice(-5).reverse();
-  var html = recent.map(function(record) {
-    var label = record.category === "failed_assertion" ? "❌ 断言失败" :
-      (record.category === "agent_pause" || record.category === "agent_limit" ? "⚠️ Agent 陷入停滞" : "⚠️ 工具失败");
+  var html = recent.map(function(record, index) {
+    var recordIndex = errorRecords.length - 1 - index;
+    var label = getErrorRecordLabel(record);
     var detail = record.message || record.description || record.reason || "未知错误";
     var traceHint = record.recentTrace && record.recentTrace.length ? " · 已保存 " + record.recentTrace.length + " 步轨迹" : "";
-    return '<div class="error-record-item"><span class="error-record-title">' + label +
+    return '<div class="error-record-item"><div class="error-record-copy"><span class="error-record-title">' + label +
       (record.testCaseId ? " · " + escapeHtml(record.testCaseId) : "") +
-      '</span><span class="error-record-detail">第 ' + (record.round || 0) + " 轮 · " + escapeHtml(detail) + escapeHtml(traceHint) + '</span></div>';
+      '</span><span class="error-record-detail">第 ' + (record.round || 0) + " 轮 · " + escapeHtml(detail) + escapeHtml(traceHint) +
+      '</span></div><button class="btn btn-secondary btn-sm error-detail-btn" data-error-index="' + recordIndex + '">查看</button></div>';
   }).join("");
-  if (total > recent.length) html += '<div class="error-record-more">另有 ' + (total - recent.length) + ' 条，请导出查看</div>';
+  if (total > recent.length) html += '<div class="error-record-more">另有 ' + (total - recent.length) + ' 条较早记录已保留，可导出或按新错误继续查看</div>';
   els.errorRecordList.innerHTML = html;
 }
 
 function persistErrorRecords() {
-  chrome.storage.local.set({ [ERROR_RECORDS_KEY]: errorRecords.slice(-500) });
+  chrome.storage.local.set({ [ERROR_RECORDS_KEY]: errorRecords }).catch(function(error) {
+    log("错误记录保存失败: " + (error.message || error));
+  });
 }
 
 function addErrorRecord(record) {
-  errorRecords.push(record);
+  errorRecords.push(redactDiagnostic(record));
+  trimErrorRecords();
   persistErrorRecords();
   renderErrorRecords();
 }
 
 async function loadErrorRecords() {
-  var stored = await chrome.storage.local.get(ERROR_RECORDS_KEY);
-  errorRecords = Array.isArray(stored[ERROR_RECORDS_KEY]) ? stored[ERROR_RECORDS_KEY] : [];
+  try {
+    var stored = await chrome.storage.local.get(ERROR_RECORDS_KEY);
+    errorRecords = Array.isArray(stored[ERROR_RECORDS_KEY]) ? stored[ERROR_RECORDS_KEY] : [];
+    trimErrorRecords();
+  } catch (error) {
+    errorRecords = [];
+    log("错误记录读取失败: " + (error.message || error));
+  }
   renderErrorRecords();
+}
+
+function showErrorDetail(index) {
+  var record = errorRecords[index];
+  if (!record) return;
+  var safe = redactDiagnostic(record);
+  var detail = safe.message || safe.description || safe.reason || "未知错误";
+  els.errorDetailTitle.textContent = getErrorRecordLabel(safe);
+  els.errorDetailMeta.textContent = [
+    safe.testCaseId || "未关联 TC",
+    "第 " + (safe.round || 0) + " 轮",
+    safe.timestamp || "",
+    safe.diagnosticTruncated ? "旧记录已压缩" : "",
+  ].filter(Boolean).join(" · ");
+  els.errorDetailContent.textContent = [
+    "错误信息",
+    detail,
+    "",
+    "AI 推理",
+    safe.reasoning || "（模型未返回可记录的推理内容）",
+    "",
+    "最近执行轨迹",
+    JSON.stringify(safe.recentTrace || [], null, 2),
+    "",
+    "当前 DOM 摘要",
+    JSON.stringify(safe.domSnapshot || null, null, 2),
+    "",
+    "前一份 DOM 摘要",
+    JSON.stringify(safe.previousDomSnapshot || null, null, 2),
+    "",
+    "相关源码交互契约",
+    JSON.stringify(safe.sourceInteractions || [], null, 2),
+  ].join("\n");
+  els.errorDetailModal.style.display = "flex";
+}
+
+function closeErrorDetail() {
+  els.errorDetailModal.style.display = "none";
+}
+
+function createTestReport(result, summary, assertions) {
+  if (!window.AIFT_TestReport) return null;
+  var currentRunErrors = errorRecords.filter(function(record) { return record.runId === activeErrorRunId; });
+  return AIFT_TestReport.buildReport({
+    runId: activeErrorRunId,
+    result: result,
+    summary: summary,
+    requirement: els.requirement.value.trim(),
+    target: document.getElementById("tabInfo").textContent || "",
+    testCases: testCasesState,
+    assertions: assertions || currentAssertions,
+    errorRecords: redactDiagnostic(currentRunErrors),
+  });
+}
+
+function trimRunHistory() {
+  if (window.AIFT_RunHistory && AIFT_RunHistory.trim) {
+    runHistory = AIFT_RunHistory.trim(runHistory, { maxReports: 20, maxBytes: 1024 * 1024 });
+  } else {
+    runHistory = runHistory.slice(-20);
+  }
+}
+
+function renderRunHistory() {
+  var total = runHistory.length;
+  els.runHistoryCount.textContent = total > 0 ? total + " 次" : "";
+  els.clearRunHistoryBtn.disabled = total === 0;
+  if (total === 0) {
+    els.runHistoryList.textContent = "暂无已保存的测试报告";
+    return;
+  }
+  var recent = runHistory.slice(-5).reverse();
+  els.runHistoryList.innerHTML = recent.map(function(report, index) {
+    var reportIndex = runHistory.length - 1 - index;
+    var stats = report.stats || {};
+    var resultClass = report.result === "pass" ? "run-history-pass" : (report.result === "fail" ? "run-history-fail" : "run-history-unknown");
+    var resultLabel = report.result === "pass" ? "✅ 通过" : (report.result === "fail" ? "❌ 失败" : "⚠️ 未完成");
+    var generatedAt = report.generatedAt ? new Date(report.generatedAt).toLocaleString() : "未知时间";
+    return '<div class="run-history-item"><div class="run-history-copy"><span class="run-history-title ' + resultClass + '">' + resultLabel +
+      '</span><span class="run-history-meta">' + escapeHtml(generatedAt) + " · " + (stats.passed || 0) + "/" + (stats.total || 0) + " 通过" +
+      '</span></div><button class="btn btn-secondary btn-sm" data-report-view="' + reportIndex + '">查看</button><button class="btn btn-secondary btn-sm" data-report-export="' + reportIndex + '">导出</button></div>';
+  }).join("");
+}
+
+function persistRunHistory() {
+  chrome.storage.local.set({ [RUN_HISTORY_KEY]: runHistory }).catch(function(error) {
+    log("测试报告历史保存失败: " + (error.message || error));
+  });
+}
+
+function rememberTestReport(report) {
+  if (!report) return;
+  runHistory = runHistory.filter(function(item) { return item.runId !== report.runId; });
+  runHistory.push(report);
+  trimRunHistory();
+  persistRunHistory();
+  renderRunHistory();
+}
+
+async function loadRunHistory() {
+  try {
+    var stored = await chrome.storage.local.get(RUN_HISTORY_KEY);
+    runHistory = Array.isArray(stored[RUN_HISTORY_KEY]) ? stored[RUN_HISTORY_KEY] : [];
+    trimRunHistory();
+  } catch (error) {
+    runHistory = [];
+    log("测试报告历史读取失败: " + (error.message || error));
+  }
+  renderRunHistory();
+}
+
+function showStoredReport(index) {
+  if (currentPhase) {
+    setStatus("运行中不能切换历史报告");
+    return;
+  }
+  var report = runHistory[index];
+  if (!report) return;
+  lastTestReport = report;
+  lastReportResult = report.result;
+  lastReportSummary = report.summary || "";
+  testCasesState = report.testCases || [];
+  currentAssertions = report.assertions || [];
+  expandedCases.clear();
+  expandedReportCases.clear();
+  els.exportTestReportBtn.disabled = false;
+  els.resultArea.innerHTML = renderTestReport(lastReportResult, lastReportSummary, testCasesState, currentAssertions);
+  setStatus("正在查看历史报告");
+}
+
+function clearRunHistory() {
+  runHistory = [];
+  chrome.storage.local.remove(RUN_HISTORY_KEY).catch(function(error) {
+    log("测试报告历史清除失败: " + (error.message || error));
+  });
+  renderRunHistory();
+  setStatus("测试报告历史已清除");
 }
 
 function renderTestResults(testCases, assertions) {
@@ -997,24 +1254,14 @@ function isPhaseAborted() {
 
 async function runPlan() {
   // 校验配置
-  var config = {
-    apiUrl: els.apiUrl.value.trim(),
-    apiKey: els.apiKey.value.trim(),
-    model: els.model.value.trim(),
-    contextSize: parseInt(els.contextSize.value) || 128,
-    visionSupported: els.visionSupported.checked,
-    enableThinking: els.enableThinking.checked,
-  };
-  if (!config.apiUrl || !config.apiKey || !config.model) {
-    log("请先填写并保存 AI 配置（API URL / Key / 模型）");
-    setStatus("配置不完整");
-    return;
-  }
+  var config = getAiConfig();
+  if (!reportConfigValidation(config, true)) return;
   if (!tabId) {
     log("请先选择目标标签页");
     setStatus("未选择标签页");
     return;
   }
+  if (!await preflightTargetTab()) return;
 
   // 检查是否已上传源码
   if (Object.keys(uploadedSourceFiles).length === 0) {
@@ -1091,24 +1338,14 @@ async function runAgent() {
   if (extraPrompt === null) return;
 
   // 校验配置
-  var config = {
-    apiUrl: els.apiUrl.value.trim(),
-    apiKey: els.apiKey.value.trim(),
-    model: els.model.value.trim(),
-    contextSize: parseInt(els.contextSize.value) || 128,
-    visionSupported: els.visionSupported.checked,
-    enableThinking: els.enableThinking.checked,
-  };
-  if (!config.apiUrl || !config.apiKey || !config.model) {
-    log("请先填写并保存 AI 配置（API URL / Key / 模型）");
-    setStatus("配置不完整");
-    return;
-  }
+  var config = getAiConfig();
+  if (!reportConfigValidation(config, true)) return;
   if (!tabId) {
     log("请先选择目标标签页");
     setStatus("未选择标签页");
     return;
   }
+  if (!await preflightTargetTab()) return;
 
   var requirement = els.requirement.value.trim();
   var testCases = els.testCases.value.trim();
@@ -1154,6 +1391,8 @@ async function runAgent() {
     onTestCasesParsed: function (testCases) {
       testCasesState = testCases;
       currentAssertions = [];
+      lastTestReport = null;
+      els.exportTestReportBtn.disabled = true;
       expandedCases.clear();
       expandedReportCases.clear();
       renderTestResults(testCases, []);
@@ -1202,6 +1441,9 @@ async function runAgent() {
       lastReportResult = result;
       lastReportSummary = summary;
       currentAssertions = assertions;
+      lastTestReport = createTestReport(result, summary, assertions);
+      rememberTestReport(lastTestReport);
+      els.exportTestReportBtn.disabled = !lastTestReport;
       els.resultArea.innerHTML = renderTestReport(result, summary, testCasesState, assertions);
 
       els.runAgentBtn.disabled = false;
@@ -1415,6 +1657,7 @@ async function analyzeArchitecture() {
     setStatus("未选择标签页");
     return;
   }
+  if (!await preflightTargetTab()) return;
 
   var extraPrompt = await showPromptDialog(
     "架构分析 - 额外提示词",
@@ -1423,13 +1666,8 @@ async function analyzeArchitecture() {
   );
   if (extraPrompt === null) return;
 
-  var config = {
-    apiUrl: els.apiUrl.value.trim(),
-    apiKey: els.apiKey.value.trim(),
-    model: els.model.value.trim(),
-    contextSize: parseInt(els.contextSize.value) || 128,
-  };
-  var hasAIConfig = config.apiUrl && config.apiKey && config.model;
+  var config = getAiConfig();
+  var hasAIConfig = config.apiUrl && config.apiKey && config.model && reportConfigValidation(config, true);
 
   els.analyzeBtn.disabled = true;
   els.analyzeBtn.textContent = "分析中...";
@@ -1731,20 +1969,46 @@ function exportErrorRecords() {
     return;
   }
   var filename = "ai_test_error_records_" + formatTimestamp() + ".json";
+  var safeRecords = window.AIFT_Redaction && AIFT_Redaction.redact
+    ? AIFT_Redaction.redact(errorRecords) : errorRecords;
   var content = JSON.stringify({
     schemaVersion: 2,
     exportedAt: new Date().toISOString(),
     recordCount: errorRecords.length,
-    records: errorRecords,
+    records: safeRecords,
   }, null, 2);
   downloadFile(filename, content, "application/json");
   log("错误记录已导出: " + filename);
   setStatus("已导出错误记录");
 }
 
+function exportTestReport(reportOverride) {
+  var reportToExport = reportOverride || lastTestReport;
+  if (!reportToExport) {
+    setStatus("暂无可导出的测试报告");
+    return;
+  }
+  showExportDialog("导出测试报告", [
+    { label: "JSON 格式", value: "json" },
+    { label: "Markdown 格式", value: "md" },
+  ], function(format) {
+    var report = redactDiagnostic(reportToExport);
+    var suffix = format === "md" ? "md" : "json";
+    var filename = "ai_test_report_" + formatTimestamp(report.generatedAt) + "." + suffix;
+    var content = format === "md" && window.AIFT_TestReport
+      ? AIFT_TestReport.buildMarkdown(report)
+      : JSON.stringify(report, null, 2);
+    downloadFile(filename, content, format === "md" ? "text/markdown" : "application/json");
+    log("测试报告已导出: " + filename);
+    setStatus("已导出测试报告");
+  });
+}
+
 function clearErrorRecords() {
   errorRecords = [];
-  chrome.storage.local.remove(ERROR_RECORDS_KEY);
+  chrome.storage.local.remove(ERROR_RECORDS_KEY).catch(function(error) {
+    log("错误记录清除失败: " + (error.message || error));
+  });
   renderErrorRecords();
   setStatus("错误记录已清除");
 }
@@ -2600,19 +2864,8 @@ async function generateTestCases() {
   );
   if (extraPrompt === null) return;
 
-  var config = {
-    apiUrl: els.apiUrl.value.trim(),
-    apiKey: els.apiKey.value.trim(),
-    model: els.model.value.trim(),
-    contextSize: parseInt(els.contextSize.value) || 128,
-    visionSupported: els.visionSupported.checked,
-    enableThinking: els.enableThinking.checked,
-  };
-  if (!config.apiUrl || !config.apiKey || !config.model) {
-    log("请先填写并保存 AI 配置");
-    setStatus("AI 配置不完整");
-    return;
-  }
+  var config = getAiConfig();
+  if (!reportConfigValidation(config, true)) return;
 
   els.genTestCasesBtn.disabled = true;
   els.genTestCasesBtn.textContent = "生成中...";
@@ -3184,13 +3437,50 @@ async function generateTestCases() {
 
 // ---- 上传源码 ----
 var uploadedSourceFiles = {};
+var SUPPORTED_SOURCE_FILE = /\.(?:js|vue|ts|jsx|tsx|css|json)$/i;
+var MAX_SOURCE_FILE_BYTES = 512 * 1024;
 
-function handleSourceUpload(event) {
+function readSourceFile(file) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    var blob = file.size > MAX_SOURCE_FILE_BYTES ? file.slice(0, MAX_SOURCE_FILE_BYTES) : file;
+    reader.onload = function(event) {
+      var content = String(event.target.result || "");
+      if (content.length > 8000) content = content.substring(0, 8000) + "\n// ... [内容已截断]";
+      if (file.size > MAX_SOURCE_FILE_BYTES) content += "\n// ... [文件超过 " + MAX_SOURCE_FILE_BYTES + " 字节，仅读取开头]";
+      resolve(content);
+    };
+    reader.onerror = function() { reject(reader.error || new Error("文件读取失败")); };
+    reader.readAsText(blob);
+  });
+}
+
+async function resetArchitectureForSourceChange() {
+  archAnalysis = null;
+  els.archCacheInfo.textContent = "源码已更新，等待重新分析";
+  els.archCacheInfo.style.color = "#d97706";
+  els.archResult.innerHTML = '<div class="arch-empty">源码已更新。请重新执行架构分析，避免使用旧项目的上下文。</div>';
+  els.exportArchBtn.disabled = true;
+  try {
+    await AIFT_ProjectAnalyzer.clearCache();
+  } catch (error) {
+    log("旧架构缓存清除失败: " + (error.message || error));
+  }
+}
+
+async function handleSourceUpload(event) {
   var files = event.target.files;
   if (!files || files.length === 0) return;
+  if (currentPhase) {
+    log("当前任务运行中，已阻止替换源码上下文");
+    setStatus("运行中不能更换源码");
+    event.target.value = "";
+    return;
+  }
 
-  uploadedSourceFiles = {};
-  var pending = 0;
+  var nextSourceFiles = {};
+  var candidates = [];
+  var skipped = 0;
 
   for (var i = 0; i < files.length; i++) {
     var file = files[i];
@@ -3200,49 +3490,52 @@ function handleSourceUpload(event) {
     if (firstSlash !== -1) {
       relPath = relPath.substring(firstSlash + 1);
     }
-    // 跳过 node_modules
-    if (relPath.indexOf("node_modules") !== -1) continue;
-
-    pending++;
-    (function (path, f) {
-      var reader = new FileReader();
-      reader.onload = function (e) {
-        var content = e.target.result;
-        // 截断过长文件
-        if (content.length > 8000) {
-          content = content.substring(0, 8000) + "\n// ... [截断，原始长度 " + content.length + "]";
-        }
-        uploadedSourceFiles[path] = content;
-        pending--;
-        if (pending === 0) {
-          finishUpload();
-        }
-      };
-      reader.onerror = function () {
-        pending--;
-        if (pending === 0) {
-          finishUpload();
-        }
-      };
-      reader.readAsText(f);
-    })(relPath, file);
+    // 目录选择器会返回图片、锁文件等所有子文件；只接收可分析的文本源码。
+    if (relPath.indexOf("node_modules/") !== -1 || !SUPPORTED_SOURCE_FILE.test(relPath)) {
+      skipped++;
+      continue;
+    }
+    candidates.push({ path: relPath, file: file });
   }
 
-  function finishUpload() {
-    var count = Object.keys(uploadedSourceFiles).length;
-    if (count === 0) {
-      els.sourceUploadInfo.textContent = "未找到有效源码文件";
-      els.sourceUploadInfo.style.color = "#e74c3c";
-    } else {
-      els.sourceUploadInfo.textContent = "已加载 " + count + " 个文件";
-      els.sourceUploadInfo.style.color = "#0a7c3e";
-    }
-    log("源码上传完成: " + count + " 个文件");
-    if (window.AIFT_SourceReader) {
-      AIFT_SourceReader.setSourceFiles(uploadedSourceFiles);
-    }
-    updateButtonStates();
+  if (candidates.length === 0) {
+    els.sourceUploadInfo.textContent = "未找到可分析的源码文件，保留当前源码";
+    els.sourceUploadInfo.style.color = "#e74c3c";
+    event.target.value = "";
+    return;
   }
+
+  els.sourceUploadInfo.style.color = "#4e5969";
+  var failed = 0;
+  for (var ci = 0; ci < candidates.length; ci++) {
+    els.sourceUploadInfo.textContent = "正在读取源码 " + (ci + 1) + "/" + candidates.length;
+    try {
+      nextSourceFiles[candidates[ci].path] = await readSourceFile(candidates[ci].file);
+    } catch (error) {
+      failed++;
+      log("源码读取失败: " + candidates[ci].path + " - " + (error.message || error));
+    }
+  }
+
+  var count = Object.keys(nextSourceFiles).length;
+  if (count === 0) {
+    els.sourceUploadInfo.textContent = "源码读取失败，保留当前源码";
+    els.sourceUploadInfo.style.color = "#e74c3c";
+    event.target.value = "";
+    return;
+  }
+
+  uploadedSourceFiles = nextSourceFiles;
+  await resetArchitectureForSourceChange();
+  if (window.AIFT_SourceReader) AIFT_SourceReader.setSourceFiles(uploadedSourceFiles);
+  var detail = "已加载 " + count + " 个文件";
+  if (skipped > 0) detail += "，跳过 " + skipped + " 个非源码文件";
+  if (failed > 0) detail += "，" + failed + " 个读取失败";
+  els.sourceUploadInfo.textContent = detail;
+  els.sourceUploadInfo.style.color = "#0a7c3e";
+  log("源码上传完成: " + detail + "；旧架构分析已失效");
+  event.target.value = "";
+  updateButtonStates();
 }
 
 // ---- 事件绑定 ----
@@ -3263,8 +3556,28 @@ els.archFileInput.addEventListener("change", handleArchFileImport);
 els.clearCacheBtn.addEventListener("click", clearArchCache);
 els.exportArchBtn.addEventListener("click", exportArchitecture);
 els.exportTestCasesBtn.addEventListener("click", exportTestCases);
+els.exportTestReportBtn.addEventListener("click", exportTestReport);
+els.clearRunHistoryBtn.addEventListener("click", clearRunHistory);
+els.runHistoryList.addEventListener("click", function(event) {
+  var viewButton = event.target.closest("[data-report-view]");
+  if (viewButton) {
+    showStoredReport(Number(viewButton.getAttribute("data-report-view")));
+    return;
+  }
+  var exportButton = event.target.closest("[data-report-export]");
+  if (exportButton) exportTestReport(runHistory[Number(exportButton.getAttribute("data-report-export"))]);
+});
 els.exportErrorsBtn.addEventListener("click", exportErrorRecords);
 els.clearErrorsBtn.addEventListener("click", clearErrorRecords);
+els.errorRecordList.addEventListener("click", function(event) {
+  var button = event.target.closest("[data-error-index]");
+  if (!button) return;
+  showErrorDetail(Number(button.getAttribute("data-error-index")));
+});
+els.errorDetailClose.addEventListener("click", closeErrorDetail);
+els.errorDetailModal.addEventListener("click", function(event) {
+  if (event.target === els.errorDetailModal) closeErrorDetail();
+});
 els.testCases.addEventListener("input", function () {
   els.exportTestCasesBtn.disabled = !els.testCases.value.trim();
   updateButtonStates();
@@ -3337,6 +3650,7 @@ els.resultArea.addEventListener("click", function (e) {
 });
 
 loadConfig();
+loadRunHistory().catch(function () {});
 log("Side Panel 已就绪（Side Panel + CDP 架构），请选择目标标签页");
 
 // 建立 port 连接，Service Worker 在断开时清理 debugger

@@ -31,6 +31,9 @@
   }
 
   function findSourceInteraction(deps, trigger) {
+    if (global.AIFT_InteractionContract && global.AIFT_InteractionContract.match) {
+      return global.AIFT_InteractionContract.match(deps.sourceInteractions, trigger);
+    }
     var contracts = deps.sourceInteractions || [];
     var value = trigger && trigger.value || "";
     for (var i = 0; i < contracts.length; i++) {
@@ -185,16 +188,11 @@
       "  var tagFilter = " + JSON.stringify(opts.tag || "") + ";" +
       "  var visibleOnly = " + (opts.visibleOnly !== false) + ";" +
       "  var els = [];" +
+      "  function visible(el){for(var p=el;p&&p!==document.documentElement;p=p.parentElement){var st=getComputedStyle(p);if(p.hidden||p.getAttribute('aria-hidden')==='true'||st.display==='none'||st.visibility==='hidden'||st.contentVisibility==='hidden')return false;}var r=el.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.top<window.innerHeight&&r.right>0;}" +
       "  if (findBy === 'text') {" +
-      "    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {" +
-      "      acceptNode: function(node) {" +
-      "        if (node.children.length > 5) return NodeFilter.FILTER_REJECT;" +
-      "        var t = (node.textContent || '').trim();" +
-      "        if (!t || t.indexOf(val) === -1 || t.length > 80) return NodeFilter.FILTER_REJECT;" +
-      "        return NodeFilter.FILTER_ACCEPT;" +
-      "      }" +
-      "    });" +
-      "    while ((node = walker.nextNode()) && els.length < 10) { els.push(node); }" +
+      "    var semantic='a,button,input,select,textarea,label,li,[role=button],[role=link],[role=menuitem],[role=tab],[role=option],[role=treeitem],[tabindex],[onclick]';" +
+      "    els=Array.prototype.slice.call(document.querySelectorAll(semantic)).filter(function(node){var t=(node.textContent||node.value||'').replace(/\\s+/g,' ').trim();return t&&t.length<=160&&(t===val||t.indexOf(val)!==-1);});" +
+      "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node;while((node=walker.nextNode())&&els.length<10){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=5&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
       "  } else if (findBy === 'text_contains') {" +
       "    els = Array.from(document.querySelectorAll(tagFilter || '*')).filter(function(el) {" +
       "      if (el.children.length > 5) return false;" +
@@ -235,7 +233,7 @@
       "      if (c.length) sel = '.' + c.join('.');" +
       "    }" +
       "    if (!sel) sel = el.tagName.toLowerCase();" +
-      "    var vis = r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight && r.right > 0;" +
+      "    var vis = visible(el);" +
       "    return {tag: el.tagName, id: el.id, " +
       "      class: (typeof el.className==='string'?el.className:'').substring(0,100)," +
       "      text: (el.textContent||'').substring(0,80).trim()," +
@@ -355,19 +353,17 @@
 
   async function getPageState(evalInPage) {
     var code = "(function() {" +
-      "  var dialog = document.querySelector('.el-dialog__wrapper:not([style*=\"display: none\"]), .el-drawer__wrapper:not([style*=\"display: none\"]), .ant-modal:not([style*=\"display: none\"]), [role=\"dialog\"]:not([hidden])');" +
+      "  function visible(el){if(!el)return false;for(var p=el;p&&p!==document.documentElement;p=p.parentElement){var s=getComputedStyle(p);if(p.hidden||p.getAttribute('aria-hidden')==='true'||s.display==='none'||s.visibility==='hidden'||s.contentVisibility==='hidden'||parseFloat(s.opacity)===0)return false;}var r=el.getBoundingClientRect();return r.width>0&&r.height>0;}" +
+      "  function firstVisible(selector){var all=document.querySelectorAll(selector);for(var i=0;i<all.length;i++){if(visible(all[i]))return all[i];}return null;}" +
+      "  var dialog = firstVisible('[role=\"dialog\"],[aria-modal=\"true\"],dialog[open],[class*=\"dialog\"],[class*=\"modal\"],[class*=\"drawer\"]');" +
       "  var ddSels = " + JSON.stringify(DROPDOWN_SELECTORS) + ";" +
       "  var dropdown = null;" +
       "  for (var i = 0; i < ddSels.length; i++) {" +
-      "    dropdown = document.querySelector(ddSels[i]);" +
-      "    if (dropdown) {" +
-      "      var r = dropdown.getBoundingClientRect();" +
-      "      if (r.width > 0 && r.height > 0) break;" +
-      "      dropdown = null;" +
-      "    }" +
+      "    dropdown = firstVisible(ddSels[i]);" +
+      "    if (dropdown) break;" +
       "  }" +
-      "  var msg = document.querySelector('.el-message:not([style*=\"display: none\"]), .ant-message-notice:not([style*=\"display: none\"]), [role=\"alert\"]:not([hidden])');" +
-      "  var mask = document.querySelector('.el-loading-mask:not([style*=\"display: none\"]), .ant-spin-spinning, [role=\"progressbar\"]');" +
+      "  var msg = firstVisible('[role=\"alert\"],[aria-live=\"assertive\"],[class*=\"message\"],[class*=\"toast\"],[class*=\"notification\"]');" +
+      "  var mask = firstVisible('[role=\"progressbar\"],[aria-busy=\"true\"],[class*=\"loading\"],[class*=\"spinner\"],[class*=\"skeleton\"]');" +
       "  return JSON.stringify({" +
       "    dialog: !!dialog, dialogText: dialog ? dialog.textContent.substring(0, 150).trim() : ''," +
       "    dropdown: !!dropdown, dropdownText: dropdown ? dropdown.textContent.substring(0, 150).trim() : ''," +
@@ -383,12 +379,38 @@
   async function waitForLoading(evalInPage, timeout) {
     timeout = timeout || 5000;
     var start = Date.now();
+    var sawLoading = false;
+    var quietPolls = 0;
     while (Date.now() - start < timeout) {
       var state = await getPageState(evalInPage);
-      if (!state.loading) return true;
-      await sleep(300);
+      if (state.loading) {
+        sawLoading = true;
+        quietPolls = 0;
+      } else {
+        quietPolls++;
+        // 请求可能没有 loading UI；至少观察两个稳定轮次，避免点击后立即误判完成。
+        if ((sawLoading && quietPolls >= 1) || (!sawLoading && quietPolls >= 3)) return true;
+      }
+      await sleep(120);
     }
     return false;
+  }
+
+  async function waitForSettledPage(evalInPage, timeout) {
+    timeout = timeout || 2500;
+    var start = Date.now();
+    var lastSignature = "";
+    var stablePolls = 0;
+    while (Date.now() - start < timeout) {
+      var state = await getPageState(evalInPage);
+      var signature = [state.dialog, state.dropdown, state.loading, state.message, state.dialogText, state.dropdownText].join("|");
+      if (!state.loading && signature === lastSignature) stablePolls++;
+      else stablePolls = 0;
+      if (stablePolls >= 2) return state;
+      lastSignature = signature;
+      await sleep(100);
+    }
+    return await getPageState(evalInPage);
   }
 
   var templates = {};
@@ -710,7 +732,7 @@
         return { ok: false, result: "选项点击未生效: " + (optionClick.error || "未命中可操作控件"), pageState: await getPageState(evalInPage) };
       }
     }
-    await sleep(STEP_DELAY);
+    await waitForSettledPage(evalInPage);
     var expectedOptionText = (optionOrdinal(optionValue) !== null && optionEl && optionEl.text) ? optionEl.text : optionValue;
 
     // ===== 步骤5: 验证选择是否生效 =====
@@ -766,7 +788,7 @@
         if (!retryOptionClick.ok) {
           return { ok: false, result: "选项重试点击未生效: " + (retryOptionClick.error || "未命中可操作控件"), pageState: await getPageState(evalInPage) };
         }
-        await sleep(STEP_DELAY);
+        await waitForSettledPage(evalInPage);
         // 重新验证
         var verifyResp2 = await evalInPage(verifyCode);
         if (verifyResp2 && verifyResp2.ok && verifyResp2.result && verifyResp2.result !== "null") {
@@ -893,12 +915,12 @@
       } else {
         failed.push(opt.value);
       }
-      await sleep(STEP_DELAY);
+      await waitForSettledPage(evalInPage);
     }
 
     if (params.closeOnDone !== false) {
       await dismissFloatingOrEscape(evalInPage, vc);
-      await sleep(STEP_DELAY);
+      await waitForSettledPage(evalInPage);
     }
 
     if (params.applyAfterSelection) {

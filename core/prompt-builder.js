@@ -245,6 +245,14 @@
       parts.push("");
     }
 
+    if (params.scenarioPlan && params.scenarioPlan.length > 0) {
+      parts.push("## 执行场景计划");
+      params.scenarioPlan.forEach(function (scenario) {
+        parts.push("- " + scenario.id + "（" + scenario.title + "）：" + scenario.cases.join(" -> ") + "。共享 setup 的用例保留页面状态，但每个 TC 必须分别 assert；状态变更用例已独立隔离。");
+      });
+      parts.push("");
+    }
+
     var srcText = formatSourceFiles(params.sourceFiles);
     if (srcText) {
       parts.push(srcText);
@@ -527,6 +535,7 @@
       if (n.className) attrs.push('class="' + n.className + '"');
       if (attrs.length > 0) line += " " + attrs.join(" ");
       line += ">";
+      if (n.ref) line += "  [ref:" + n.ref + "]";
       if (n.text) line += " " + n.text;
       if (n.value) line += ' value="' + n.value + '"';
       if (n.inFloatingLayer) line += "  [浮层元素]";
@@ -623,13 +632,14 @@
         type: "function",
         function: {
           name: "click",
-          description: "点击指定 CSS 选择器匹配的元素。通过 CDP 真实鼠标移动/按下/释放执行，失败则返回失败。",
+          description: "点击最新 DOM 快照中的 elementRef（优先）或已观察到的 CSS selector。通过 CDP 真实鼠标移动/按下/释放执行。不得猜测 selector；未观察到时先调用 find_element。",
           parameters: {
             type: "object",
             properties: {
-              selector: { type: "string", description: "CSS 选择器，如 '#login-btn' 或 '.menu-item:nth-child(2)'。快照中每个元素附有建议的 selector。" },
+              elementRef: { type: "string", description: "最新 DOM 快照中元素的引用，如 e12。优先使用。" },
+              selector: { type: "string", description: "仅限最新快照、find_element 结果或源码交互契约中出现过的 CSS selector。" },
             },
-            required: ["selector"],
+            anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
           },
         },
       },
@@ -641,10 +651,12 @@
           parameters: {
             type: "object",
             properties: {
-              selector: { type: "string", description: "CSS 选择器定位输入框元素" },
+              elementRef: { type: "string", description: "最新 DOM 快照中输入元素的引用，如 e12。优先使用。" },
+              selector: { type: "string", description: "已观察到的 CSS 选择器。" },
               text: { type: "string", description: "要输入的文本" },
             },
-            required: ["selector", "text"],
+            required: ["text"],
+            anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
           },
         },
       },
@@ -670,7 +682,8 @@
           parameters: {
             type: "object",
             properties: {
-              selector: { type: "string", description: "要滚动到的元素的 CSS 选择器（可选）" },
+              elementRef: { type: "string", description: "最新 DOM 快照中要滚动到的元素引用（可选）。" },
+              selector: { type: "string", description: "已观察到的 CSS 选择器（可选）。" },
             },
           },
         },
@@ -683,9 +696,39 @@
           parameters: {
             type: "object",
             properties: {
-              selector: { type: "string", description: "要悬停的元素的 CSS 选择器" },
+              elementRef: { type: "string", description: "最新 DOM 快照中元素的引用，如 e12。优先使用。" },
+              selector: { type: "string", description: "已观察到的 CSS 选择器。" },
             },
-            required: ["selector"],
+            anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "surface_interact",
+          description: "对 Canvas、SVG、视频画面或其他自绘交互面执行真实 CDP 点击/拖拽。目标必须使用最新快照的 elementRef（优先）或已观察 selector；坐标为目标内部 0 到 1 的相对比例，因此页面滚动、缩放或布局变化后仍可靠。操作后必须用 DOM、截图或网络响应验证结果。",
+          parameters: {
+            type: "object",
+            properties: {
+              elementRef: { type: "string", description: "最新 DOM 快照中交互面的引用，如 e12。优先使用。" },
+              selector: { type: "string", description: "已观察到的交互面 CSS selector。" },
+              action: { type: "string", enum: ["click", "drag"], description: "点击或拖拽。" },
+              start: {
+                type: "object",
+                description: "起点在目标内部的相对坐标，x/y 均在 0 到 1 之间。",
+                properties: { x: { type: "number" }, y: { type: "number" } },
+                required: ["x", "y"],
+              },
+              end: {
+                type: "object",
+                description: "drag 的终点相对坐标，x/y 均在 0 到 1 之间。",
+                properties: { x: { type: "number" }, y: { type: "number" } },
+                required: ["x", "y"],
+              },
+            },
+            required: ["action", "start"],
+            anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
           },
         },
       },
@@ -765,7 +808,7 @@
         type: "function",
         function: {
           name: "assert",
-          description: "记录一条断言结果。只有所有功能正常且所有数据准确时才标记 passed:true。API 字段为空/null、页面展示与 API 不一致、数据缺失等情况必须标记 passed:false。description 必须采用「TC编号: ✅ 通过 - 证据」或「TC编号: ❌ 失败 - 证据」格式。",
+          description: "记录当前正在执行用例的一条断言结果。description 必须以当前 TC 编号开头，例如「TC5: ✅ 通过 - 证据」；编号不一致会被拒绝，绝不切换或覆盖其他用例。只有所有功能正常且数据准确时才标记 passed:true。",
           parameters: {
             type: "object",
             properties: {

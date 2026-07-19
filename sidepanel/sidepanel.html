@@ -158,8 +158,23 @@
     </section>
 
     <section class="card">
-      <h2>测试结果 <span id="testProgress" class="test-progress"></span></h2>
+      <div class="stream-header">
+        <h2>测试结果 <span id="testProgress" class="test-progress"></span></h2>
+        <div class="stream-actions">
+          <button id="exportTestReportBtn" class="btn btn-secondary btn-sm" disabled>导出报告</button>
+        </div>
+      </div>
       <div id="resultArea" class="result-area">尚未运行</div>
+    </section>
+
+    <section class="card">
+      <div class="stream-header">
+        <h2>最近报告 <span id="runHistoryCount" class="test-progress"></span></h2>
+        <div class="stream-actions">
+          <button id="clearRunHistoryBtn" class="btn btn-secondary btn-sm" disabled>清除</button>
+        </div>
+      </div>
+      <div id="runHistoryList" class="run-history-list">暂无已保存的测试报告</div>
     </section>
 
     <section class="card">
@@ -211,9 +226,34 @@
       </div>
     </div>
 
+    <div id="errorDetailModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="errorDetailTitle">
+      <div class="modal-box diagnostic-modal">
+        <div class="modal-header">
+          <h3 id="errorDetailTitle">错误诊断</h3>
+        </div>
+        <div class="modal-body">
+          <div id="errorDetailMeta" class="diagnostic-meta"></div>
+          <pre id="errorDetailContent" class="diagnostic-content"></pre>
+        </div>
+        <div class="modal-footer">
+          <button id="errorDetailClose" class="btn btn-secondary">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 核心模块 -->
     <script src="../core/source-reader.js"></script>
     <script src="../core/source-analyzer.js"></script>
+    <script src="../core/interaction-contract.js"></script>
+    <script src="../core/test-scheduler.js"></script>
+    <script src="../core/redaction.js"></script>
+    <script src="../core/diagnostic-store.js"></script>
+    <script src="../core/test-report.js"></script>
+    <script src="../core/run-history.js"></script>
+    <script src="../core/config-validator.js"></script>
+    <script src="../core/tab-eligibility.js"></script>
+    <script src="../core/progress-guard.js"></script>
+    <script src="../core/agent-guard.js"></script>
     <script src="../core/network-recorder.js"></script>
     <script src="../core/test-summary-cache.js"></script>
     <script src="../core/ai-client.js"></script>
