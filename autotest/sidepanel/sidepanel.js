@@ -822,7 +822,7 @@ function renderRunHistory() {
     var resultLabel = report.result === "pass" ? "✅ 通过" : (report.result === "fail" ? "❌ 失败" : "⚠️ 未完成");
     var generatedAt = report.generatedAt ? new Date(report.generatedAt).toLocaleString() : "未知时间";
     return '<div class="run-history-item"><div class="run-history-copy"><span class="run-history-title ' + resultClass + '">' + resultLabel +
-      '</span><span class="run-history-meta">' + escapeHtml(generatedAt) + " · " + (stats.passed || 0) + "/" + (stats.total || 0) + " 通过" +
+      '</span><span class="run-history-meta">' + escapeHtml(generatedAt) + " · " + (stats.passed || 0) + "/" + (stats.total || 0) + " 通过" + ((stats.inconclusive || 0) ? " · " + stats.inconclusive + " 未完成验证" : "") +
       '</span></div><button class="btn btn-secondary btn-sm" data-report-view="' + reportIndex + '">查看</button><button class="btn btn-secondary btn-sm" data-report-export="' + reportIndex + '">导出</button></div>';
   }).join("");
 }
@@ -892,21 +892,23 @@ function renderTestResults(testCases, assertions) {
     return;
   }
 
-  var passed = 0, failed = 0, pending = 0, testing = 0;
+  var passed = 0, failed = 0, inconclusive = 0, pending = 0, testing = 0;
   for (var i = 0; i < testCases.length; i++) {
     if (testCases[i].status === "passed") passed++;
     else if (testCases[i].status === "failed") failed++;
+    else if (testCases[i].status === "inconclusive") inconclusive++;
     else if (testCases[i].status === "testing") testing++;
     else pending++;
   }
 
   var total = testCases.length;
-  var tested = passed + failed;
+  var tested = passed + failed + inconclusive;
   var progressParts = [];
   if (total > 0) {
     progressParts.push(tested + "/" + total + " 已测");
     if (passed > 0) progressParts.push(passed + " 通过");
     if (failed > 0) progressParts.push(failed + " 失败");
+    if (inconclusive > 0) progressParts.push(inconclusive + " 未完成验证");
     if (testing > 0) progressParts.push(testing + " 测试中");
     if (pending > 0) progressParts.push(pending + " 待测");
   }
@@ -927,7 +929,7 @@ function renderTestResults(testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedCases.has(tcKey);
       var cls = "test-case test-" + tc.status + (isExpanded ? "" : " collapsed");
-      var icon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
+      var icon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "⚠️" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
       html += '<div class="' + cls + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="test-case-header">';
       html += '<span class="test-toggle">' + (isExpanded ? "▼" : "▶") + '</span>';
@@ -973,8 +975,8 @@ function renderTestResults(testCases, assertions) {
       html += '<div class="test-extra-list"><div class="test-extra-title">额外断言:</div>';
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
-        var ucls = u.passed ? "test-case test-case-simple test-passed" : "test-case test-case-simple test-failed";
-        var uicon = u.passed ? "✅" : "❌";
+        var ucls = u.outcome === "inconclusive" ? "test-case test-case-simple test-inconclusive" : (u.passed ? "test-case test-case-simple test-passed" : "test-case test-case-simple test-failed");
+        var uicon = u.outcome === "inconclusive" ? "⚠️" : (u.passed ? "✅" : "❌");
         html += '<div class="' + ucls + '">';
         html += '<span class="test-icon">' + uicon + '</span>';
         html += '<span class="test-text">' + escapeHtml(u.description) + '</span>';
@@ -1015,18 +1017,20 @@ function renderTestReport(result, summary, testCases, assertions) {
   testCases = testCases || testCasesState;
   assertions = assertions || [];
 
-  var passed = 0, failed = 0, skipped = 0, pending = 0, testing = 0;
+  var passed = 0, failed = 0, inconclusive = 0, skipped = 0, pending = 0, testing = 0;
   for (var i = 0; i < testCases.length; i++) {
     var s = testCases[i].status;
     if (s === "passed") passed++;
     else if (s === "failed") failed++;
+    else if (s === "inconclusive") inconclusive++;
     else if (s === "skipped") skipped++;
     else if (s === "testing") testing++;
     else pending++;
   }
   var total = testCases.length;
-  var tested = passed + failed;
-  var passRate = tested > 0 ? Math.round(passed / tested * 100) : 0;
+  var tested = passed + failed + inconclusive;
+  var conclusive = passed + failed;
+  var passRate = conclusive > 0 ? Math.round(passed / conclusive * 100) : 0;
 
   // 整体结果样式
   var resultClass = result === "pass" ? "report-result-pass" : (result === "fail" ? "report-result-fail" : "report-result-unknown");
@@ -1055,6 +1059,7 @@ function renderTestReport(result, summary, testCases, assertions) {
   html += '<div class="report-stats">';
   html += '<div class="stat-item stat-passed"><span class="stat-num">' + passed + '</span><span class="stat-label">通过</span></div>';
   html += '<div class="stat-item stat-failed"><span class="stat-num">' + failed + '</span><span class="stat-label">失败</span></div>';
+  if (inconclusive > 0) html += '<div class="stat-item stat-inconclusive"><span class="stat-num">' + inconclusive + '</span><span class="stat-label">未完成验证</span></div>';
   if (skipped > 0) html += '<div class="stat-item stat-skipped"><span class="stat-num">' + skipped + '</span><span class="stat-label">跳过</span></div>';
   if (testing > 0) html += '<div class="stat-item stat-testing"><span class="stat-num">' + testing + '</span><span class="stat-label">测试中</span></div>';
   if (pending > 0) html += '<div class="stat-item stat-pending"><span class="stat-num">' + pending + '</span><span class="stat-label">未测</span></div>';
@@ -1065,9 +1070,11 @@ function renderTestReport(result, summary, testCases, assertions) {
     html += '<div class="report-progress-bar">';
     var passPct = (passed / total * 100);
     var failPct = (failed / total * 100);
+    var inconclusivePct = (inconclusive / total * 100);
     var skipPct = (skipped / total * 100);
     html += '<div class="progress-segment progress-passed" style="width:' + passPct + '%"></div>';
     html += '<div class="progress-segment progress-failed" style="width:' + failPct + '%"></div>';
+    html += '<div class="progress-segment progress-inconclusive" style="width:' + inconclusivePct + '%"></div>';
     html += '<div class="progress-segment progress-skipped" style="width:' + skipPct + '%"></div>';
     html += '</div>';
   }
@@ -1096,7 +1103,7 @@ function renderTestReport(result, summary, testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedReportCases.has(tcKey);
       var tcClass = "report-case report-case-" + tc.status + (isExpanded ? "" : " collapsed");
-      var tcIcon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○")));
+      var tcIcon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "⚠️" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
 
       html += '<div class="' + tcClass + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="case-header">';
@@ -1134,8 +1141,8 @@ function renderTestReport(result, summary, testCases, assertions) {
       html += '<div class="report-extra-title">额外断言 (' + unmatched.length + ')</div>';
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
-        var uIcon = u.passed ? "✅" : "❌";
-        var uClass = u.passed ? "extra-passed" : "extra-failed";
+        var uIcon = u.outcome === "inconclusive" ? "⚠️" : (u.passed ? "✅" : "❌");
+        var uClass = u.outcome === "inconclusive" ? "extra-inconclusive" : (u.passed ? "extra-passed" : "extra-failed");
         html += '<div class="report-extra-item ' + uClass + '"><span>' + uIcon + '</span> ' + escapeHtml(u.description) + '</div>';
       }
       html += '</div>';
@@ -1417,21 +1424,23 @@ async function runAgent() {
       testCasesState = testCases || testCasesState;
 
       // 更新进度文本
-      var passed = 0, failed = 0, pending = 0, testing = 0;
+      var passed = 0, failed = 0, inconclusive = 0, pending = 0, testing = 0;
       for (var i = 0; i < testCasesState.length; i++) {
         var s = testCasesState[i].status;
         if (s === "passed") passed++;
         else if (s === "failed") failed++;
+        else if (s === "inconclusive") inconclusive++;
         else if (s === "testing") testing++;
         else pending++;
       }
       var total = testCasesState.length;
-      var tested = passed + failed;
+      var tested = passed + failed + inconclusive;
       var progressParts = [];
       if (total > 0) {
         progressParts.push(tested + "/" + total + " 已测");
         if (passed > 0) progressParts.push(passed + " 通过");
         if (failed > 0) progressParts.push(failed + " 失败");
+        if (inconclusive > 0) progressParts.push(inconclusive + " 未完成验证");
         if (testing > 0) progressParts.push(testing + " 测试中");
         if (pending > 0) progressParts.push(pending + " 待测");
       }

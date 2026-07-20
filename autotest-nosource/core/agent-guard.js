@@ -7,7 +7,7 @@
     return String(value || "").trim();
   }
 
-  function resolveObservedTarget(snapshot, observedSelectors, interactions, args) {
+  function resolveObservedTarget(snapshot, observedSelectors, unusedInteractions, args) {
     args = args || {};
     var nodes = (snapshot && snapshot.nodes) || [];
     var selector = normalize(args.selector);
@@ -28,12 +28,6 @@
     }
     for (var k = 0; k < (observedSelectors || []).length; k++) {
       if (observedSelectors[k] === selector) return { ok: true, selector: selector, source: "find-element" };
-    }
-    for (var m = 0; m < (interactions || []).length; m++) {
-      var item = interactions[m] || {};
-      if (selector === item.triggerSelector || selector === item.activationSelector || selector === item.applySelector) {
-        return { ok: true, selector: selector, source: "source-contract" };
-      }
     }
     return { ok: false, error: "该 selector 未由当前页面观察确认: " + selector + "。请先使用快照 elementRef 或 find_element，避免猜测 selector。" };
   }

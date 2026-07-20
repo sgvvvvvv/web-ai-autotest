@@ -134,7 +134,7 @@ async function run() {
     ],
     assertions: [{ description: "❌ checkbox 未勾选", passed: false }],
   });
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(report.stats)), { total: 2, passed: 1, failed: 1, skipped: 0, pending: 0, testing: 0, tested: 2, passRate: 50 });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(report.stats)), { total: 2, passed: 1, failed: 1, inconclusive: 0, skipped: 0, pending: 0, testing: 0, tested: 2, conclusive: 2, passRate: 50 });
   assert.ok(testReport.buildMarkdown(report).indexOf("❌ checkbox 未勾选") !== -1);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(runHistory.trim([{ runId: "old" }, { runId: "new" }], { maxReports: 1 }))), [{ runId: "new" }]);
   assert.strictEqual(tabEligibility.evaluate("https://example.com").ok, true);
@@ -173,6 +173,22 @@ async function run() {
   assert.strictEqual(agentGuard.validateAssertionForCurrent("TC12: ✅ 通过 - 已验证", "TC12").ok, true);
   assert.strictEqual(agentGuard.validateAssertionForCurrent("TC11: ✅ 通过 - 已验证", "TC12").ok, false);
   assert.strictEqual(agentGuard.validateAssertionForCurrent("✅ 通过 - 已验证", "TC12").ok, false);
+  const incompleteOutcome = agentGuard.resolveAssertionOutcome({ passed: true }, "TC5: ⚠️ 部分通过 - 无法在自动化环境中触发真实文件校验，未能完整验证");
+  assert.strictEqual(incompleteOutcome.outcome, "inconclusive");
+  assert.strictEqual(incompleteOutcome.downgraded, true);
+  assert.strictEqual(agentGuard.resolveAssertionOutcome({ outcome: "failed" }, "TC5: ❌ 已观察到错误提示不一致").outcome, "failed");
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(agentGuard.reconcileRunResult("pass", [{ status: "passed" }, { status: "inconclusive" }]))),
+    { result: "unknown", adjusted: true, reason: "至少一个测试用例未完成验证或未执行" }
+  );
+
+  const inconclusiveReport = testReport.buildReport({
+    testCases: [{ id: "TC3", title: "原生文件选择", status: "inconclusive", assertionDesc: "⚠️ 未完成验证" }],
+    assertions: [{ description: "TC3: ⚠️ 未完成验证", outcome: "inconclusive", passed: false }],
+  });
+  assert.strictEqual(inconclusiveReport.stats.inconclusive, 1);
+  assert.strictEqual(inconclusiveReport.stats.passRate, 0);
+  assert.ok(testReport.buildMarkdown(inconclusiveReport).indexOf("未完成验证") !== -1);
 
   assert.strictEqual(validator.validateApiEndpoint("ftp://example.com").ok, false);
   assert.strictEqual(validator.validateApiEndpoint("https://api.example.com/v1").ok, true);
@@ -199,6 +215,9 @@ async function run() {
   });
   assert.ok(observedMessages[1].content.indexOf("[ref:e7]") !== -1);
   assert.ok(promptBuilder.buildTools({ visionSupported: false }).some(function(tool) { return tool.function.name === "surface_interact"; }));
+  const systemPrompt = promptBuilder.buildMessages({ requirement: "编辑并删除测试脚本", testCases: "TC1,编辑脚本,脚本管理,列表有数据,编辑保存并删除,接口成功", sourceFiles: [], snapshot: { nodes: [] }, visionSupported: false })[0].content;
+  assert.ok(systemPrompt.indexOf("避免修改后端数据") !== -1);
+  assert.ok(systemPrompt.indexOf("默认测试环境") !== -1);
 
   console.log("All tests passed.");
 }

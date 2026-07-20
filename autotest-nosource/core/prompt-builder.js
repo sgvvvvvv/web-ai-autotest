@@ -5,8 +5,6 @@
 (function (global) {
   "use strict";
 
-  var MAX_SOURCE_PER_MSG = 5;
-  var MAX_SOURCE_CHARS = 6000;
   var MAX_SNAPSHOT_NODES = 60;
 
   /**
@@ -23,7 +21,7 @@
       "# 核心原则",
       "1. 每轮返回一个工具调用，不要只分析不行动",
       "2. 操作优先使用预设模板（select_option/select_multi/fill_input/click_button 等），简单直接；下拉或级联选择都使用 select_option，不要拆成多轮点击",
-      "3. 若上下文给出「源码交互契约」，必须按契约使用对应模板；截图标注编号只能传给 smart_click(label)，绝不能拼成 click 的 CSS selector。",
+      "3. 只依据当前 DOM、可访问性语义、截图和网络响应行动；截图标注编号只能传给 smart_click(label)，绝不能拼成 click 的 CSS selector。",
       visionSupported
         ? "4. 找不到元素时用 find_element 或 screenshot 标注获取准确坐标/selector"
         : "4. 找不到元素时用 find_element 获取准确坐标和 selector，不要请求或依赖截图",
@@ -57,7 +55,6 @@
     }
     lines.push(
       "- API 数据：get_network_responses(urlPattern) — 获取网络响应",
-      "- 源码检索：read_source(filePattern) — 查看项目源码",
       "- 断言：assert(description, passed)",
       "- 完成：finish(result, summary)",
       "",
@@ -102,7 +99,7 @@
       "<env>",
       "  运行环境: Chrome Side Panel 扩展",
       "  操作方式: CDP 真实鼠标/键盘执行写操作；Content Script 仅用于观察",
-      "  源码读取: 用户上传项目源码文件",
+      "  测试模式: 黑盒测试，不读取或依赖项目源码",
       "  网络监听: 通过 CDP Network 域自动捕获页面所有 API 请求和响应",
       "  视觉能力: " + (visionSupported ? "支持（可截图分析）" : "不支持"),
       "</env>",
@@ -126,13 +123,11 @@
    * @param {Object} params
    *   - requirement: string 原始需求
    *   - testCases: string 测试用例
-   *   - sourceFiles: Array<{path, content}>
    *   - snapshot: Object DOM 快照
    *   - screenshot: Object 截图数据 {dataUrl, width, height}（视觉模式）
    *   - history: Array<{action, result}>
    *   - conversationHistory: Array 历史对话
    *   - visionSupported: boolean 模型是否支持图片（默认 true）
-   *   - architecture: Object 项目架构分析结果
    * @returns {Array} OpenAI 消息数组
    */
   function buildMessages(params) {
@@ -143,7 +138,7 @@
     var hasHistory = params.conversationHistory && params.conversationHistory.length > 0;
 
     if (!hasHistory) {
-      // 首轮：构建初始用户消息（需求 + 用例 + 架构 + 源码 + 初始快照 + 初始截图）
+      // 首轮：构建初始用户消息（需求、用例、运行时快照和截图）
       var initialContent = buildInitialUserMessage(params);
       if (visionSupported && params.screenshot && params.screenshot.dataUrl) {
         // 视觉模式：多模态初始消息（文本 + 截图）
@@ -223,28 +218,6 @@
     parts.push(params.testCases || "（未提供）");
     parts.push("");
 
-    // 注入项目架构概览
-    if (params.architecture && global.AIFT_ProjectAnalyzer) {
-      var archText = global.AIFT_ProjectAnalyzer.formatForPrompt(params.architecture);
-      if (archText) {
-        parts.push(archText);
-        parts.push("");
-      }
-    }
-
-    if (params.sourceInteractions && params.sourceInteractions.length > 0) {
-      parts.push("## 源码交互契约（优先执行）");
-      for (var si = 0; si < params.sourceInteractions.length; si++) {
-        var interaction = params.sourceInteractions[si];
-        parts.push("- " + interaction.kind + ": trigger=" + interaction.triggerSelector +
-          "; reveal=" + (interaction.reveal || "click") +
-          "; activation=" + interaction.activationSelector +
-          (interaction.applySelector ? "; apply=" + interaction.applySelector : "") +
-          "。使用 select_multi/select_option，不要直接点击文字。");
-      }
-      parts.push("");
-    }
-
     if (params.scenarioPlan && params.scenarioPlan.length > 0) {
       parts.push("## 执行场景计划");
       params.scenarioPlan.forEach(function (scenario) {
@@ -253,20 +226,10 @@
       parts.push("");
     }
 
-    var srcText = formatSourceFiles(params.sourceFiles);
-    if (srcText) {
-      parts.push(srcText);
-      parts.push("");
-      // 注入源码组件分析（结构化的选择器、选项、绑定信息）
-      if (global.AIFT_SourceAnalyzer && params.sourceFiles) {
-        var compAnalysis = global.AIFT_SourceAnalyzer.analyzeFiles(
-          params.sourceFiles.reduce(function(obj, sf) { obj[sf.path] = sf.content; return obj; }, {})
-        );
-        if (compAnalysis) {
-          parts.push(compAnalysis);
-          parts.push("");
-        }
-      }
+    if (params.runtimeInventory) {
+      parts.push("## 运行时站点勘探");
+      parts.push(formatRuntimeInventory(params.runtimeInventory));
+      parts.push("只测试此处和后续真实交互中可观察到的页面、入口与状态；不要猜测隐藏路由或实现细节。\n");
     }
 
     parts.push("## 初始 DOM 快照");
@@ -275,9 +238,9 @@
     // 视觉模式：提示截图已附在消息中
     if (params.visionSupported !== false && params.screenshot && params.screenshot.dataUrl) {
       parts.push("");
-      parts.push("## 初始页面标注截图");
+      parts.push("## 初始页面聚焦标注截图");
       parts.push("截图已附在消息中（" + params.screenshot.width + "x" + params.screenshot.height + " 像素）。");
-      parts.push("截图中每个可交互元素上有红色编号标签，可参考编号位置。优先使用预设模板；基础 click/type 会通过 CDP 执行；找不到稳定 selector 时可用 smart_click(label)。");
+      parts.push("截图只标注当前测试用例关联的控件；无关联命中时才会展示少量全局候选。优先使用预设模板；基础 click/type 会通过 CDP 执行；找不到稳定 selector 时可用 smart_click(label)。");
     }
 
     if (params.extraPrompt) {
@@ -299,9 +262,9 @@
     var parts = [];
     // 视觉模式：截图已附在消息中，提示 AI 优先看截图
     if (params.screenshot && params.screenshot.dataUrl) {
-      parts.push("## 操作后的标注截图");
+      parts.push("## 操作后的聚焦标注截图");
       parts.push("截图已附在消息中（" + params.screenshot.width + "x" + params.screenshot.height + " 像素）。");
-      parts.push("截图中每个可交互元素上有红色编号标签，可参考编号位置。优先使用预设模板；基础 click/type 会通过 CDP 执行；找不到稳定 selector 时可用 smart_click(label)。");
+      parts.push("截图优先标注当前测试用例关联控件，可能已裁剪到对应区域。优先使用预设模板；基础 click/type 会通过 CDP 执行；找不到稳定 selector 时可用 smart_click(label)。");
       parts.push("");
     }
     parts.push("## DOM 快照（辅助参考）");
@@ -486,27 +449,6 @@
   }
 
   /**
-   * 格式化源码片段
-   */
-  function formatSourceFiles(sourceFiles) {
-    if (!sourceFiles || sourceFiles.length === 0) return "";
-    var parts = ["## 相关源码"];
-    var count = Math.min(MAX_SOURCE_PER_MSG, sourceFiles.length);
-    for (var i = 0; i < count; i++) {
-      var f = sourceFiles[i];
-      var content = f.content || "";
-      if (content.length > MAX_SOURCE_CHARS) {
-        content = content.slice(0, MAX_SOURCE_CHARS) + "\n…（已截断）";
-      }
-      parts.push("### " + f.path);
-      parts.push("```");
-      parts.push(content);
-      parts.push("```");
-    }
-    return parts.join("\n");
-  }
-
-  /**
    * 格式化 DOM 快照为紧凑文本
    * 格式：<tag attr="value"> 文本  [selector: ...]
    */
@@ -603,6 +545,20 @@
     return parts.join("\n");
   }
 
+  function formatRuntimeInventory(inventory) {
+    inventory = inventory || {};
+    var snapshot = inventory.snapshot || {};
+    var parts = ["起始页面: " + (snapshot.title || "") + " " + (snapshot.url || "")];
+    var navigation = inventory.navigation || [];
+    if (navigation.length) {
+      parts.push("已发现导航:");
+      navigation.slice(0, 80).forEach(function(item) {
+        parts.push("- " + (item.text || "无文本") + " -> " + (item.path || ""));
+      });
+    }
+    return parts.join("\n");
+  }
+
   /**
    * 格式化动作历史
    */
@@ -637,7 +593,7 @@
             type: "object",
             properties: {
               elementRef: { type: "string", description: "最新 DOM 快照中元素的引用，如 e12。优先使用。" },
-              selector: { type: "string", description: "仅限最新快照、find_element 结果或源码交互契约中出现过的 CSS selector。" },
+              selector: { type: "string", description: "仅限最新快照或 find_element 结果中出现过的 CSS selector。" },
             },
             anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
           },
@@ -777,20 +733,6 @@
       {
         type: "function",
         function: {
-          name: "read_source",
-          description: "按文件名/路径关键词检索项目源码，获取相关文件内容。用于理解页面组件结构、查找元素 class/id/data 属性。",
-          parameters: {
-            type: "object",
-            properties: {
-              filePattern: { type: "string", description: "文件路径或关键词，空格或逗号分隔" },
-            },
-            required: ["filePattern"],
-          },
-        },
-      },
-      {
-        type: "function",
-        function: {
           name: "get_network_responses",
           description: "检索页面发出的网络请求及其响应数据。可按 URL 子串、响应体关键词、HTTP 方法、状态码过滤。用于对比 API 响应数据与页面展示数据是否一致。",
           parameters: {
@@ -857,14 +799,14 @@
       type: "function",
       function: {
         name: "select_multi",
-        description: "【预设模板】多选。若上传源码已提供交互契约，模板会按契约 hover/展开并点击真实激活控件，避免点击文字。applyAfterSelection=true 时会执行源码声明的提交动作。",
+        description: "【预设模板】多选。通过可见 DOM、ARIA 语义和浮层定位触发器及选项，并用 CDP 真实点击完成选择。",
         parameters: {
           type: "object",
           properties: {
             trigger: { type: "object", description: "下拉框触发元素定位", properties: { findBy: findByDesc, value: { type: "string" } }, required: ["findBy", "value"] },
             options: { type: "array", description: "要选择的选项列表", items: { type: "object", properties: { findBy: findByDesc, value: { type: "string" } }, required: ["findBy", "value"] } },
             closeOnDone: { type: "boolean", description: "选完后是否关闭下拉，默认 true" },
-            applyAfterSelection: { type: "boolean", description: "按源码交互契约执行提交/搜索动作，默认 false" },
+            applyAfterSelection: { type: "boolean", description: "选择后尝试点击当前页面可见的搜索或提交控件，默认 false" },
           },
           required: ["trigger", "options"],
         },
@@ -997,7 +939,7 @@
         type: "function",
         function: {
           name: "verify_ui",
-          description: "UI 视觉验证：截取当前页面截图（不带标注），发送给 AI 检查页面展示是否正确。用于验证布局、CSS 样式、数据展示、交互状态等视觉效果。与 screenshot 不同：verify_ui 专注于「验证」而非「操作」，截图不带标注框，避免干扰视觉判断。",
+          description: "UI 视觉验证：优先截取当前测试用例关联区域的纯净截图，找不到关联控件时回退整个视口。用于验证布局、CSS、数据展示和交互状态；截图不带标注框，避免干扰视觉判断。",
           parameters: {
             type: "object",
             properties: {
@@ -1019,7 +961,7 @@
         type: "function",
         function: {
           name: "screenshot",
-          description: "截取标注截图：每个可交互元素会被画上红色编号框。用于定位元素位置参考。如需验证页面展示效果请使用 verify_ui（不带标注，纯净截图）。",
+          description: "截取聚焦标注截图：优先为当前测试用例关联的可交互元素画编号框，并在区域集中时自动裁剪；无关联命中时回退少量全局候选。用于定位元素，视觉验收请使用 verify_ui。",
           parameters: {
             type: "object",
             properties: {

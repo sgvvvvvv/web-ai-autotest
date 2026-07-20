@@ -435,7 +435,7 @@
       var bestIdx = -1;
       var bestScore = 0;
       for (var i = 0; i < testCases.length; i++) {
-        if (testCases[i].status === "passed" || testCases[i].status === "failed") continue;
+        if (testCases[i].status === "passed" || testCases[i].status === "failed" || testCases[i].status === "inconclusive") continue;
         // 用 TC 编号精确匹配（避免 tc1 匹配 tc10）
         var tcId = (testCases[i].id || "").toLowerCase();
         if (tcId && matchTcId(desc, tcId)) return i;
@@ -458,7 +458,7 @@
       // 如果没有匹配到，返回第一个未完成的用例
       if (bestIdx === -1) {
         for (var i = 0; i < testCases.length; i++) {
-          if (testCases[i].status !== "passed" && testCases[i].status !== "failed") return i;
+          if (testCases[i].status !== "passed" && testCases[i].status !== "failed" && testCases[i].status !== "inconclusive") return i;
         }
       }
       return bestIdx;
@@ -1375,8 +1375,12 @@
 
         case "assert":
           var assertionDescription = String(args.description || "").trim();
-          var assertionIcon = args.passed ? "✅" : "❌";
-          if (assertionDescription.indexOf("✅") === -1 && assertionDescription.indexOf("❌") === -1) {
+          var outcomeInfo = global.AIFT_AgentGuard && global.AIFT_AgentGuard.resolveAssertionOutcome
+            ? global.AIFT_AgentGuard.resolveAssertionOutcome(args, assertionDescription)
+            : { outcome: args.passed ? "passed" : "failed", downgraded: false, reason: "" };
+          var assertionOutcome = outcomeInfo.outcome;
+          var assertionIcon = assertionOutcome === "passed" ? "✅" : (assertionOutcome === "failed" ? "❌" : "⚠️");
+          if (assertionDescription.indexOf("✅") === -1 && assertionDescription.indexOf("❌") === -1 && assertionDescription.indexOf("⚠️") === -1) {
             var tcPrefix = assertionDescription.match(/^(TC\d+\s*:\s*)/i);
             assertionDescription = tcPrefix
               ? tcPrefix[1] + assertionIcon + " " + assertionDescription.substring(tcPrefix[1].length)
@@ -1407,11 +1411,13 @@
           }
           var assertion = {
             description: assertionDescription,
-            passed: !!args.passed,
+            passed: assertionOutcome === "passed",
+            outcome: assertionOutcome,
           };
           state.assertions.push(assertion);
-          result.result = args.passed ? "✅ PASS" : "❌ FAIL";
-          log("断言: " + assertion.description + " → " + (args.passed ? "✅ PASS" : "❌ FAIL"));
+          result.result = assertionOutcome === "passed" ? "✅ PASS" : (assertionOutcome === "failed" ? "❌ FAIL" : "⚠️ INCONCLUSIVE");
+          if (outcomeInfo.downgraded) result.result += "（已根据证据完整性自动降级：" + outcomeInfo.reason + "）";
+          log("断言: " + assertion.description + " → " + result.result);
           var assertionAccepted = true;
           if (deps.onAssertion) {
             // 断言只会归属当前执行中的用例，绝不按模型描述重新匹配。
@@ -1420,7 +1426,7 @@
               var matchedTC = state.testCases[matchedIdx];
               // 保存原始状态，以便断言异常时回退
               var previousStatus = matchedTC.status;
-              matchedTC.status = assertion.passed ? "passed" : "failed";
+              matchedTC.status = assertionOutcome;
               matchedTC.assertionDesc = assertion.description;
 
               // ===== 断言内容相关性检查 =====
@@ -1500,11 +1506,18 @@
             }
           }
           if (assertionAccepted && deps.onAssertion) deps.onAssertion(assertion, state.assertions, state.testCases);
-          if (assertionAccepted && !assertion.passed) {
+          if (assertionAccepted && assertionOutcome === "failed") {
             recordError("failed_assertion", {
               description: assertion.description,
               action: "assert",
               args: { passed: false },
+            });
+          } else if (assertionAccepted && assertionOutcome === "inconclusive") {
+            recordError("inconclusive_assertion", {
+              description: assertion.description,
+              action: "assert",
+              args: { outcome: "inconclusive" },
+              message: outcomeInfo.reason || "至少一项预期未被直接验证",
             });
           }
           // 用例断言完成后，生成上下文摘要并缓存
@@ -1513,7 +1526,7 @@
               var summarySnapshot = state.snapshot;
               var summaryParts = [];
               summaryParts.push("已完成的用例：" + (matchedTC.id || "") + " - " + (matchedTC.title || ""));
-              summaryParts.push("断言结果：" + (assertion.passed ? "PASS" : "FAIL") + " - " + (assertion.description || "").substring(0, 200));
+              summaryParts.push("断言结果：" + assertionOutcome.toUpperCase() + " - " + (assertion.description || "").substring(0, 200));
               if (summarySnapshot) {
                 summaryParts.push("当前页面 URL：" + (summarySnapshot.url || ""));
                 summaryParts.push("当前页面标题：" + (summarySnapshot.title || ""));
@@ -1522,7 +1535,7 @@
               var completedTCs = [];
               for (var cti = 0; cti < state.testCases.length; cti++) {
                 var tc = state.testCases[cti];
-                if (tc.status === "passed" || tc.status === "failed") {
+                if (tc.status === "passed" || tc.status === "failed" || tc.status === "inconclusive") {
                   completedTCs.push(tc.id + "(" + tc.status + ")");
                 }
               }
@@ -1735,7 +1748,7 @@
                   "必须立即停止点击此区域。请选择以下策略之一：\n" +
                   "1. 调用 select_option 模板（推荐，自动处理下拉框选择）\n" +
                   "2. 调用 eval_in_page 执行 JS 查找下拉选项的精确坐标\n" +
-                  "3. 基于当前可见信息直接 assert(passed:false) 标记失败\n" +
+                  "3. 基于当前可见信息直接 assert(outcome='failed') 标记失败\n" +
                   "4. 如果所有用例已处理则调用 finish\n" +
                   "严禁继续使用 visual_click 点击此区域！";
               }
@@ -3155,7 +3168,7 @@
                 if (state.consecutiveWaitCount >= 2) {
                   state.loopWarning = "💡 你已连续 " + state.consecutiveWaitCount + " 轮只调用了 wait，没有推进测试步骤。\n" +
                     "请立即执行实际的测试操作（如 eval_in_page 获取数据、get_network_responses 检查接口、assert 断言结果），不要继续空等。\n" +
-                    "如果页面已加载完成，请直接执行测试步骤；如果遇到问题，请 assert(passed:false) 标记失败并继续下一个用例。";
+                    "如果页面已加载完成，请直接执行测试步骤；如果遇到已证实的问题，请 assert(outcome='failed') 标记失败；若无法完成验证，请 assert(outcome='inconclusive') 并继续下一个用例。";
                   log("💡 连续 wait 提示：已连续 " + state.consecutiveWaitCount + " 轮纯 wait");
                 }
               } else {
@@ -3205,7 +3218,7 @@
                 "然后执行以下之一：\n" +
                 "- 使用 select_option 模板（自动定位下拉框和选项，推荐）\n" +
                 "- 使用 find_element(findBy='class', value='el-select-dropdown__item') 获取下拉选项精确坐标\n" +
-                "- assert(passed:false) 标记当前用例失败，继续下一个\n" +
+                "- assert(outcome='failed') 标记当前用例失败，继续下一个\n" +
                 "- 所有用例已处理则调用 finish\n" +
                 "不要继续重复相同操作！";
               log("⚠️ 死循环警告：" + reasonStr);
@@ -3216,7 +3229,7 @@
               // Level 4: 严重 + 强制要求改变策略
               state.loopWarning = "🚨 严重死循环！必须立即停止当前操作路径。\n" +
                 "你已经多次尝试相同策略且未成功。请选择：\n" +
-                "→ assert(passed:false, description:'TC编号: 多次尝试未成功，自动标记失败') 然后继续下一个用例\n" +
+                "→ assert(outcome='inconclusive', description:'TC编号: 多次尝试后仍无法完成验证') 然后继续下一个用例\n" +
                 "→ 或直接调用 finish 结束测试\n" +
                 "不要再尝试相同的操作！";
               log("🚨 严重死循环警告");
@@ -3280,8 +3293,15 @@
           setStatus("已中止");
           if (deps.onFinish) deps.onFinish(abortResult, abortSummary, state.assertions, state.testCases);
         } else {
-          var finalResult = state.finishResult || "unknown";
+          var requestedResult = state.finishResult || "unknown";
+          var reconciledResult = global.AIFT_AgentGuard && global.AIFT_AgentGuard.reconcileRunResult
+            ? global.AIFT_AgentGuard.reconcileRunResult(requestedResult, state.testCases)
+            : { result: requestedResult, adjusted: false, reason: "" };
+          var finalResult = reconciledResult.result;
           var finalSummary = state.finishSummary || "";
+          if (reconciledResult.adjusted) {
+            finalSummary = (finalSummary ? finalSummary + "\n\n" : "") + "系统已校正整体结论：" + reconciledResult.reason + "。";
+          }
           log("测试完成: " + finalResult + " - " + finalSummary);
           setStatus("完成: " + finalResult);
           if (deps.onFinish) deps.onFinish(finalResult, finalSummary, state.assertions, state.testCases);

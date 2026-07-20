@@ -126,6 +126,7 @@ flowchart TB
 
 - AI 不允许通过 `eval_in_page` 模拟用户操作。
 - 基础 `click/type/press/scroll/hover` 均走 CDP。
+- Agent 默认在测试环境执行。用例要求的 CRUD、保存、提交、删除和二次确认均是必须执行的真实 CDP 操作，不会因数据影响顾虑自动跳过。
 - `select_option/select_multi/fill_input/click_button/toggle_switch` 等模板内部先只读定位，再用 CDP 操作，最后验证结果。
 - 源码契约存在时，模板先使用其触发、展开、激活和提交关系；没有契约时，从当前 DOM 节点的标准语义（checkbox/radio/ARIA state）解析实际激活目标，避免把展示文字当作点击点。
 - 如果 CDP attach 失败，测试不能继续宣称“真实用户行为”。

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>AI 黑盒 Web 测试</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="header">
+      <h1>AI 黑盒 Web 测试</h1>
+      <span class="badge badge-stage3">CDP + Vision</span>
+    </header>
+
+    <section class="card">
+      <h2>目标站点</h2>
+      <div class="row">
+        <select id="tabSelector" class="tab-selector"></select>
+        <button id="refreshTabBtn" class="btn btn-secondary btn-sm">刷新</button>
+      </div>
+      <span id="tabInfo" class="status">请选择可测试的 http(s) 页面</span>
+    </section>
+
+    <section class="card">
+      <h2>AI 配置</h2>
+      <div class="field"><label for="apiUrl">API URL</label><input id="apiUrl" type="text" placeholder="https://api.openai.com/v1" /></div>
+      <div class="field"><label for="apiKey">API Key</label><input id="apiKey" type="password" placeholder="sk-..." /></div>
+      <div class="field"><label for="model">模型</label><input id="model" type="text" placeholder="gpt-4o" /></div>
+      <div class="field field-inline"><label><input id="visionSupported" type="checkbox" /><span>模型支持图片</span></label></div>
+      <button id="saveConfig" class="btn btn-secondary">保存配置</button>
+    </section>
+
+    <section class="card">
+      <h2>测试范围</h2>
+      <div class="field">
+        <label for="requirement">业务需求或关注点</label>
+        <textarea id="requirement" rows="4" placeholder="例如：验证登录、搜索、订单创建和权限提示。留空时按已发现的页面功能进行探索测试。"></textarea>
+      </div>
+      <div class="row">
+        <button id="discoverBtn" class="btn btn-secondary">勘探当前站点</button>
+        <button id="genTestCasesBtn" class="btn btn-primary">生成黑盒用例</button>
+      </div>
+      <div id="inventory" class="result-area">尚未勘探。勘探只读取页面已渲染的导航、文本和控件，不读取源码。</div>
+    </section>
+
+    <section class="card">
+      <h2>运行时覆盖</h2>
+      <div id="coverage" class="result-area">测试开始后显示已发现页面、控件、真实交互和用例完成情况。</div>
+    </section>
+
+    <section class="card">
+      <h2>测试用例</h2>
+      <div class="field"><textarea id="testCases" rows="9" placeholder="点击“生成黑盒用例”，或手动输入 CSV：TC编号,标题,页面,前置条件,操作步骤,预期结果"></textarea></div>
+      <div class="row">
+        <button id="runAgentBtn" class="btn btn-primary">运行真实交互测试</button>
+        <button id="abortBtn" class="btn btn-danger" disabled>中止</button>
+        <span id="status" class="status">就绪</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>执行日志</h2>
+      <pre id="log" class="stream-log"></pre>
+    </section>
+    <section class="card">
+      <h2>测试结果 <span id="testProgress" class="test-progress"></span></h2>
+      <div id="resultArea" class="result-area">尚未运行</div>
+    </section>
+
+    <script src="../core/test-scheduler.js"></script>
+    <script src="../core/coverage-tracker.js"></script>
+    <script src="../core/redaction.js"></script>
+    <script src="../core/diagnostic-store.js"></script>
+    <script src="../core/test-report.js"></script>
+    <script src="../core/config-validator.js"></script>
+    <script src="../core/tab-eligibility.js"></script>
+    <script src="../core/progress-guard.js"></script>
+    <script src="../core/agent-guard.js"></script>
+    <script src="../core/network-recorder.js"></script>
+    <script src="../core/test-summary-cache.js"></script>
+    <script src="../core/ai-client.js"></script>
+    <script src="../core/visual-controller.js"></script>
+    <script src="../core/action-templates.js"></script>
+    <script src="../core/prompt-builder.js"></script>
+    <script src="../core/agent-loop.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

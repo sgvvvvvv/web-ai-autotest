@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "AI 黑盒 Web 测试",
+  "version": "0.3.0",
+  "description": "无需源码，通过真实浏览器交互测试已部署 Web 站点。",
+  "background": { "service_worker": "background/service-worker.js" },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "permissions": ["scripting", "activeTab", "storage", "debugger", "sidePanel", "tabs"],
+  "icons": {
+    "16": "devtools/icon-16.png",
+    "48": "devtools/icon-48.png",
+    "128": "devtools/icon-128.png"
+  },
+  "host_permissions": ["<all_urls>"]
+}
