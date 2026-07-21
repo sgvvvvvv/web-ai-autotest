@@ -852,7 +852,6 @@
       noToolCallCount: 0,    // 连续无 tool_calls 的轮数，超过阈值才真正结束
       maxSteps: 200,         // 当前步数上限（动态计算：用例数 × 30 + 50）
       maxStepsLimit: 600,    // 绝对上限，防止无限提升
-      turnPaused: false,     // finish 导致的暂停（可恢复，不终止测试）
     };
 
     function log(msg) {
@@ -1702,17 +1701,16 @@
           break;
 
         case "finish":
-          // finish 只中止当前对话轮次，不终止整个测试流程
-          // 暂停等待用户输入，用户可输入消息继续执行或点击中止结束测试
-          state.turnPaused = true;
-          state.paused = true;
+          // AI 显式结束测试时，立即退出循环并生成最终报告。
+          state.finished = true;
+          state.paused = false;
           state.finishResult = args.result || "unknown";
           state.finishSummary = args.summary || "";
           // 清空摘要缓存
           if (global.AIFT_SummaryCache) {
             global.AIFT_SummaryCache.clear();
           }
-          result.result = "已暂停对话。测试未终止，等待用户输入指令继续执行。";
+          result.result = "测试已结束，正在生成报告。";
           break;
 
         case "screenshot":
@@ -2664,7 +2662,8 @@
       state.conversationHistory = [];
       state.assertions = [];
       state.finished = false;
-      state.turnPaused = false;
+      state.finishResult = null;
+      state.finishSummary = "";
       state.screenshot = null;
       state.snapshot = null;
       state.previousSnapshot = null;
@@ -3349,14 +3348,7 @@
             // 每个动作后刷新测试用例状态（可能有 testing 状态更新）
             if (deps.onAssertion) deps.onAssertion(null, state.assertions, state.testCases);
 
-            if (state.finished || state.turnPaused) break;
-          }
-
-          // finish 导致暂停：跳过后续处理，直接到 while 循环顶部暂停检查
-          if (state.turnPaused) {
-            notifyAutoPause("finish");
-            stream("info", "⏸️ AI 调用了 finish，对话已暂停。请输入指令继续测试，或点击「继续」让 AI 自行调整。");
-            continue;
+            if (state.finished) break;
           }
 
           var stalledFailure = global.AIFT_ProgressGuard && global.AIFT_ProgressGuard.detectStall
@@ -3685,11 +3677,6 @@
      */
     function resume() {
       state.paused = false;
-      if (state.turnPaused) {
-        state.turnPaused = false;
-        // 用户点击"继续"恢复 finish 暂停，注入提示让 AI 继续测试
-        state.loopWarning = "用户点击了「继续」。请继续执行未完成的测试用例，不要再次调用 finish。";
-      }
       if (state.resumeResolver) {
         state.resumeResolver();
         state.resumeResolver = null;
@@ -3759,7 +3746,6 @@
       // 如果处于暂停状态，自动恢复执行
       if (state.paused && state.resumeResolver) {
         state.paused = false;
-        state.turnPaused = false;
         state.resumeResolver();
         state.resumeResolver = null;
         log("已从暂停状态自动恢复，注入用户消息");

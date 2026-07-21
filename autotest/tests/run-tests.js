@@ -24,6 +24,8 @@ async function run() {
   assertSidePanelDomContract();
   const agentLoopSource = fs.readFileSync(path.join(__dirname, "..", "core", "agent-loop.js"), "utf8");
   assert.strictEqual(/AIFT_AIClient\.chat\(/.test(agentLoopSource), false, "Agent Loop 的 AI 请求必须使用流式 chatStream");
+  assert.ok(/case "finish":\s*[\s\S]*?state\.finished = true;/.test(agentLoopSource), "AI 调用 finish 后必须立即结束测试");
+  assert.strictEqual(/AI 调用了 finish，对话已暂停/.test(agentLoopSource), false, "finish 不应暂停等待用户手动停止");
   const context = vm.createContext({ window: {}, URL: URL });
   loadModule("source-reader.js", context);
   loadModule("interaction-contract.js", context);
