@@ -27,7 +27,9 @@
       steps: testCase.steps || "",
       expected: testCase.expected || "",
       status: testCase.status || "pending",
-      assertion: testCase.assertionDesc || "",
+      // 保留旧字段 assertion，新增 assertionDesc 供侧边栏历史报告直接回显。
+      assertion: testCase.assertionDesc || testCase.assertion || "",
+      assertionDesc: testCase.assertionDesc || testCase.assertion || "",
       scenarioId: testCase.scenarioId || "",
     };
   }

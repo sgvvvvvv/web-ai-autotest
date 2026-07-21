@@ -34,7 +34,7 @@
       lines.push("7. 需要验证页面展示时用 verify_ui 截图");
       lines.push("8. 需要验证 API 数据时用 get_network_responses");
       lines.push("9. 断言描述以 TC 编号开头并带状态图标；失败必须说明具体证据。");
-      lines.push("10. 用例改变了页面状态时，完成全部业务验证后再执行恢复步骤（关闭弹窗、清空输入等）");
+      lines.push("10. 当前场景还有待测关联用例时，必须保留页面、弹窗、筛选和输入状态；严禁执行恢复、清空或返回原页。仅在场景最后一个用例结束且后续场景不兼容时才清理。");
       lines.push("11. 连续 3 次相同操作未成功，换策略或标记失败");
       lines.push("12. 所有文本使用简体中文");
     } else {
@@ -42,7 +42,7 @@
       lines.push("8. 需要验证 API 数据时用 get_network_responses");
       lines.push("9. 用 eval_in_page 检查元素文本、属性、class、可见性和尺寸，验证 UI 状态");
       lines.push("10. 断言描述以 TC 编号开头并带状态图标；失败必须说明具体证据。");
-      lines.push("11. 用例改变了页面状态时，完成全部业务验证后再执行恢复步骤（关闭弹窗、清空输入等）");
+      lines.push("11. 当前场景还有待测关联用例时，必须保留页面、弹窗、筛选和输入状态；严禁执行恢复、清空或返回原页。仅在场景最后一个用例结束且后续场景不兼容时才清理。");
       lines.push("12. 连续 3 次相同操作未成功，换策略或标记失败");
       lines.push("13. 所有文本使用简体中文");
     }
@@ -53,6 +53,7 @@
       "- 基础操作：click(selector)/type(selector,text)/press(key)/scroll(selector?)/hover(selector) — 默认通过 CDP 真实鼠标/键盘执行。弹框内关闭下拉浮层时不要主动使用 Escape，应点击浮层外的弹框安全区域。",
       "- 查找元素：find_element(findBy,value) — 找不到元素时用这个获取准确坐标和 selector",
       "- 页面 JS：eval_in_page(code) — 读取页面状态（不要用来模拟操作）",
+      "- iframe：快照中的 [ref:f<frameId>:e<编号>] 表示该元素位于对应 iframe。跨域 iframe 必须使用这个 elementRef，并使用 click/type/scroll/hover 基础操作；不要用预设模板或尝试从父页面读取它的 DOM。",
     );
     if (visionSupported) {
       lines.push("- 截图验证：verify_ui() — 截图检查页面展示是否正确");
@@ -60,12 +61,13 @@
     lines.push(
       "- API 数据：get_network_responses(urlPattern) — 获取网络响应",
       "- 源码检索：read_source(filePattern) — 查看项目源码",
-      "- 断言：assert(description, passed)",
+      "- 断言：assert(description, outcome, fieldMappings?)；表格/列表与 API 一致性通过时 fieldMappings 必填",
       "- 完成：finish(result, summary)",
       "",
       "# 断言标准",
       "FAILED 条件（任一）：已直接观察到 API 字段为空/null/缺失、页面展示不一致、功能异常或 UI 异常。",
       "PASSED 条件（全部）：当前 TC 的每项预期均已通过真实页面、网络响应、截图或源码与运行时证据交叉直接验证。",
+      "数据展示类 PASSED 额外条件：用例预期必须定义「字段映射：页面列头 <- API字段」；assert 必须提交至少 2 条 fieldMappings，每条包含 uiLabel、apiField、pageValue、apiValue，且页面列头和网络响应字段均已观察到。没有映射或映射语义不明确时只能 inconclusive。",
       "INCONCLUSIVE 条件：因权限、浏览器限制、缺少可控测试数据、原生文件选择器等原因，至少一项预期未能直接验证。此时绝不能写 passed；调用 assert(outcome='inconclusive') 并明确列出未验证项。",
       "",
       "# 表格数据提取",
@@ -252,7 +254,7 @@
     if (params.scenarioPlan && params.scenarioPlan.length > 0) {
       parts.push("## 执行场景计划");
       params.scenarioPlan.forEach(function (scenario) {
-        parts.push("- " + scenario.id + "（" + scenario.title + "）：" + scenario.cases.join(" -> ") + "。共享 setup 的用例保留页面状态，但每个 TC 必须分别 assert；状态变更用例已独立隔离。");
+        parts.push("- " + scenario.id + "（" + scenario.title + "）：" + scenario.cases.join(" -> ") + "。共享 setup 的用例保留页面状态，但每个 TC 必须分别 assert；状态变更用例已独立隔离。" + (scenario.rationale ? " 分组依据：" + scenario.rationale : ""));
       });
       parts.push("");
     }
@@ -301,6 +303,11 @@
 
   function buildObservationMessage(params) {
     var parts = [];
+    function stepsForCurrentScenario(steps, deferRecovery) {
+      var text = String(steps || "");
+      if (!deferRecovery) return text;
+      return text.replace(/\s*(?:→|\-|;|；)?\s*恢复[：:][\s\S]*$/, "").trim();
+    }
     // 视觉模式：截图已附在消息中，提示 AI 优先看截图
     if (params.screenshot && params.screenshot.dataUrl) {
       parts.push("## 操作后的标注截图");
@@ -361,7 +368,9 @@
         if (roundsLeft <= reserveRounds + 1) {
           parts.push("🚨 收尾预算：当前用例已执行 " + currentTcRounds + "/" + maxTcRounds + " 轮，剩余 " + roundsLeft + " 轮。");
           if (roundsLeft > reserveRounds) {
-            parts.push("本轮仅用于完成必要的恢复步骤（如关闭弹窗、清空筛选）；不得继续探索、重试或收集非必要数据。下一轮必须 assert。");
+            parts.push(currentScenarioPending > 0
+              ? "本场景仍有待测关联用例：本轮不得执行恢复、清空或返回原页；仅完成当前用例断言后继续下一个关联用例。"
+              : "本轮仅用于完成必要的场景切换清理；不得继续探索、重试或收集非必要数据。下一轮必须 assert。");
           } else {
             parts.push("立即停止所有测试操作。基于已获得证据调用 assert；即使恢复未完成，也要在断言中如实说明。不得开始下一个 TC，也不得再尝试页面交互。");
           }
@@ -370,7 +379,7 @@
         if (currentTC.preconditions) parts.push("前置条件：" + currentTC.preconditions);
         if (currentTC.steps) {
           parts.push("操作步骤（请严格按步骤执行，使用步骤中标注的工具和参数）：");
-          parts.push(currentTC.steps);
+          parts.push(stepsForCurrentScenario(currentTC.steps, currentScenarioPending > 0));
         }
         if (currentTC.expected) parts.push("预期结果：" + currentTC.expected);
         // 断言 TC 编号提醒 + 内容相关性提醒
@@ -408,7 +417,7 @@
           parts.push("UI 交互关注点：" + uiHints.join("、") + "（用 eval_in_page 检查）");
         }
         if (/新增|创建|编辑|保存|提交|删除|确认删除|上传|下载|更新/.test(tcFullText)) {
-          parts.push("🚨 写操作执行授权：当前为测试环境。必须执行本用例要求的真实 CRUD/提交/删除与确认步骤；不得因担心修改后端数据而跳过。完成后用 get_network_responses 验证对应接口和页面刷新，再执行恢复步骤。");
+          parts.push("🚨 写操作执行授权：当前为测试环境。必须执行本用例要求的真实 CRUD/提交/删除与确认步骤；不得因担心修改后端数据而跳过。完成后用 get_network_responses 验证对应接口和页面刷新；本场景仍有关联用例时必须保留当前状态。 ");
         }
         // 数据验证提醒
         if (/数据|指标|列表|表格|数值|展示|显示|查询|搜索|详情/.test(tcFullText)) {
@@ -478,7 +487,7 @@
       } else if (hasRecoveryStep && currentScenarioPending > 0) {
         parts.push("→ 当前场景还有共享用例待执行：先 assert 当前用例，保留状态；不要执行恢复步骤。");
       } else if (hasRecoveryStep && !hasAsserted) {
-        parts.push("→ 请继续执行当前用例操作，包括最后的「恢复：」步骤。恢复步骤执行完毕后再 assert。");
+        parts.push("→ 当前用例文本包含旧版「恢复：」步骤。先完成业务验证并 assert；恢复动作由场景边界统一决定，不要在此用例中执行。");
       } else {
         parts.push("→ 请继续执行当前用例操作或调用 assert 断言。");
       }
@@ -523,9 +532,18 @@
     parts.push("URL: " + (snapshot.url || ""));
     parts.push("Title: " + (snapshot.title || ""));
     parts.push("可交互元素: " + (snapshot.interactiveCount || 0) + " 个");
+    if (snapshot.frames && snapshot.frames.length > 1) {
+      parts.push("Frame: " + snapshot.frames.map(function(frame) {
+        return "iframe-" + frame.frameId + "(" + (frame.title || frame.url || "无标题") + ", " + frame.interactiveCount + " 个元素)";
+      }).join("; "));
+      parts.push("跨域 iframe 元素必须使用带 frameId 的 elementRef，例如 [ref:f12:e3]。");
+    }
     parts.push("");
 
-    var nodes = snapshot.nodes || [];
+    // 长顶层页面不能挤掉 iframe 内的可操作元素；frame 节点优先进入模型上下文。
+    var nodes = (snapshot.nodes || []).slice().sort(function(a, b) {
+      return (a.frameId === 0 ? 1 : 0) - (b.frameId === 0 ? 1 : 0);
+    });
     var count = Math.min(MAX_SNAPSHOT_NODES, nodes.length);
     // 检测 UI 交互状态元素
     var uiStateElements = [];
@@ -543,6 +561,7 @@
       if (attrs.length > 0) line += " " + attrs.join(" ");
       line += ">";
       if (n.ref) line += "  [ref:" + n.ref + "]";
+      if (n.frameId !== undefined && n.frameId !== 0) line += "  [iframe:" + n.frameId + "]";
       if (n.text) line += " " + n.text;
       if (n.value) line += ' value="' + n.value + '"';
       if (n.inFloatingLayer) line += "  [浮层元素]";
@@ -746,8 +765,9 @@
           description: "在页面上下文中执行 JavaScript 表达式并返回结果。必须显式返回值，不要只写 console.log；多语句请写 (()=>{ ...; return value; })()。仅用于读取页面状态（如获取元素文本、检查 class、获取属性值、检查 iframe 列表），严禁用于模拟用户操作。用户操作必须使用 click/type/press/hover/scroll 等专用工具。",
           parameters: {
             type: "object",
-            properties: {
-              code: { type: "string", description: "要执行的 JavaScript 代码。必须返回可序列化结果；例如 Array.from(document.querySelectorAll('iframe')).map((f,i)=>({i,src:f.src}))，或 (()=>{ const f=document.querySelector('iframe'); return f ? f.src : 'no iframe'; })()" },
+          properties: {
+            code: { type: "string", description: "要执行的 JavaScript 代码。必须返回可序列化结果；例如 document.body.innerText.slice(0,1000)。" },
+            frameId: { type: "integer", description: "可选。快照中 iframe 元素所属 frameId；不传则在顶层页面执行。" },
             },
             required: ["code"],
           },
@@ -820,6 +840,20 @@
             type: "object",
             properties: {
               description: { type: "string", description: "断言描述，如「TC5: ❌ 失败 - API 返回 username 为空」或「TC5: ⚠️ 未完成验证 - 无法触发原生文件选择器」" },
+              fieldMappings: {
+                type: "array",
+                description: "数据展示/API 一致性用例通过时必填。每项记录已验证的页面列头与 API 字段映射；无明确映射时不得判定通过。",
+                items: {
+                  type: "object",
+                  properties: {
+                    uiLabel: { type: "string", description: "页面实际列头，如 任务名称" },
+                    apiField: { type: "string", description: "已确认对应的 API 字段，如 taskName" },
+                    pageValue: { type: "string", description: "页面中读取到的实际值" },
+                    apiValue: { type: "string", description: "API 响应中读取到的实际值" },
+                  },
+                  required: ["uiLabel", "apiField", "pageValue", "apiValue"],
+                },
+              },
               outcome: { type: "string", enum: ["passed", "failed", "inconclusive"], description: "passed=全部预期有直接证据；failed=已证实异常；inconclusive=至少一项未验证。" },
               passed: { type: "boolean", description: "兼容字段。新调用应使用 outcome；passed:true 仍会在描述含未验证证据时自动降级为 inconclusive。" },
             },

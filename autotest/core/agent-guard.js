@@ -16,7 +16,9 @@
     if (reference) {
       for (var i = 0; i < nodes.length; i++) {
         if (nodes[i].ref === reference) {
-          return { ok: !!nodes[i].selector, selector: nodes[i].selector || "", source: "snapshot-ref" };
+          var byRef = { ok: !!nodes[i].selector, selector: nodes[i].selector || "", source: "snapshot-ref" };
+          if (nodes[i].frameId !== undefined) byRef.frameId = nodes[i].frameId;
+          return byRef;
         }
       }
       return { ok: false, error: "当前页面快照中不存在元素引用 " + reference + "；请先重新观察或使用 find_element。" };
@@ -24,10 +26,20 @@
 
     if (!selector) return { ok: false, error: "缺少 elementRef 或 selector。请使用最新快照中的元素引用，或先调用 find_element。" };
     for (var j = 0; j < nodes.length; j++) {
-      if (nodes[j].selector === selector) return { ok: true, selector: selector, source: "snapshot-selector" };
+      if (nodes[j].selector === selector) {
+        var bySelector = { ok: true, selector: selector, source: "snapshot-selector" };
+        if (nodes[j].frameId !== undefined) bySelector.frameId = nodes[j].frameId;
+        return bySelector;
+      }
     }
     for (var k = 0; k < (observedSelectors || []).length; k++) {
-      if (observedSelectors[k] === selector) return { ok: true, selector: selector, source: "find-element" };
+      var observed = observedSelectors[k];
+      if (observed === selector) return { ok: true, selector: selector, source: "find-element" };
+      if (observed && typeof observed === "object" && observed.selector === selector) {
+        var byFind = { ok: true, selector: selector, source: "find-element" };
+        if (observed.frameId !== undefined) byFind.frameId = observed.frameId;
+        return byFind;
+      }
     }
     for (var m = 0; m < (interactions || []).length; m++) {
       var item = interactions[m] || {};
@@ -68,6 +80,49 @@
     return { outcome: requested, downgraded: false, reason: "" };
   }
 
+  function requiresFieldMapping(testCase) {
+    // 字段语义审查只适用于用例明确声明的页面列头/API 字段映射。
+    // 普通 UI、接口状态和业务流程用例不应被映射规则降级。
+    return String((testCase && testCase.expected) || "").indexOf("字段映射") !== -1;
+  }
+
+  // 数据展示通过必须有已定义的“页面列头 <- API 字段”映射和网络字段证据。
+  function validateFieldMappings(testCase, mappings, snapshot, networkEvidence) {
+    if (!requiresFieldMapping(testCase)) return { ok: true, required: false };
+    var expected = String((testCase && testCase.expected) || "");
+    if (expected.indexOf("字段映射") === -1) {
+      return { ok: false, required: true, reason: "当前数据展示用例的预期结果未定义「字段映射」，不能仅凭字段同时存在就判定页面与 API 一致" };
+    }
+    if (!Array.isArray(mappings) || mappings.length < 2) {
+      return { ok: false, required: true, reason: "数据展示通过至少需要 2 条字段映射（页面列头、API 字段、页面值、API 值）" };
+    }
+    var pageText = String((snapshot && snapshot.pageText) || "");
+    var networkText = String(networkEvidence || "");
+    for (var i = 0; i < mappings.length; i++) {
+      var mapping = mappings[i] || {};
+      var uiLabel = normalize(mapping.uiLabel);
+      var apiField = normalize(mapping.apiField);
+      var pageValue = normalize(mapping.pageValue);
+      var apiValue = normalize(mapping.apiValue);
+      if (!uiLabel || !apiField || !pageValue || !apiValue) {
+        return { ok: false, required: true, reason: "第 " + (i + 1) + " 条字段映射缺少页面列头、API 字段、页面值或 API 值" };
+      }
+      if (expected.indexOf(uiLabel) === -1 || expected.indexOf(apiField) === -1) {
+        return { ok: false, required: true, reason: "第 " + (i + 1) + " 条映射「" + uiLabel + " <- " + apiField + "」未在用例预期的字段映射中定义" };
+      }
+      if (pageText.indexOf(uiLabel) === -1) {
+        return { ok: false, required: true, reason: "当前页面快照未观察到列头「" + uiLabel + "」，不能确认其与 API 字段「" + apiField + "」的映射" };
+      }
+      if (networkText.indexOf(apiField) === -1) {
+        return { ok: false, required: true, reason: "当前用例未获取包含 API 字段「" + apiField + "」的网络响应证据" };
+      }
+      if (pageValue !== apiValue) {
+        return { ok: false, required: true, reason: "字段映射「" + uiLabel + " <- " + apiField + "」的页面值与 API 值不一致" };
+      }
+    }
+    return { ok: true, required: true };
+  }
+
   function reconcileRunResult(requestedResult, testCases) {
     var requested = normalize(requestedResult).toLowerCase() || "unknown";
     var cases = testCases || [];
@@ -88,6 +143,8 @@
     resolveObservedTarget: resolveObservedTarget,
     validateAssertionForCurrent: validateAssertionForCurrent,
     resolveAssertionOutcome: resolveAssertionOutcome,
+    requiresFieldMapping: requiresFieldMapping,
+    validateFieldMappings: validateFieldMappings,
     reconcileRunResult: reconcileRunResult,
   };
 })(window);

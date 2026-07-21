@@ -195,7 +195,7 @@ flowchart TB
 
 - API Key 只保存在扩展存储中，只由 Side Panel 读取。
 - Key 不传给 Content Script，不注入被测页面，不进入 prompt。
-- API URL 必须是 HTTP(S) 地址；非本机 HTTP 地址会显示传输安全警告，避免无意间用明文传输 API Key。
+- API URL 必须是 HTTP(S) 地址，且不允许在 URL 中嵌入用户名或密码。
 - 上传源码只用于本地索引和 AI 上下文，不写回页面。
 - 源码上传按支持的文本后缀顺序读取并限制单文件读取量；成功替换源码时会使架构缓存失效，禁止新项目复用旧分析。
 - CDP 连接在测试结束、用户中止、Side Panel 断开或 tab 关闭时清理。

@@ -153,7 +153,7 @@ AI 在测试过程中可调用的工具主要包括：
 
 - API Key 只保存在 `chrome.storage.local`，由 Side Panel 读取。
 - API Key 不传给 Content Script，不注入被测页面，也不进入 prompt。
-- 非本机 HTTP API 地址会给出传输安全警告；生产服务建议使用 HTTPS。错误导出会隐藏 Key、Token、Cookie 和 Bearer 凭据。
+- API URL 仅接受 HTTP(S) 地址，且不允许在 URL 中嵌入用户名或密码；错误导出会隐藏 Key、Token、Cookie 和 Bearer 凭据。
 - 错误记录可在侧边栏直接查看 AI 推理、工具轨迹、DOM 前后快照；本地记录有数量和体积上限，旧记录会优先压缩而非影响执行。
 - 测试完成后可导出 JSON 或 Markdown 报告，包含用例状态、断言、AI 总结及本次运行关联的错误诊断。
 - 最近测试报告会保存在扩展本地，可重新查看或再次导出；历史只保留有限条目和摘要，完整诊断仍由错误记录管理。
@@ -165,7 +165,8 @@ AI 在测试过程中可调用的工具主要包括：
 
 - Chrome 同一 tab 只能有一个 debugger 连接。打开 DevTools 或其他自动化工具时可能导致 CDP attach 失败。
 - 原生文件选择器、系统级弹窗、真实硬件输入等场景仍需要额外能力。
-- 跨域 iframe、封闭 Shadow DOM、Canvas/WebGL 内部对象通常需要视觉坐标或业务源码辅助；可用 `surface_interact` 以相对坐标执行真实输入，结果仍需通过 DOM、截图或网络响应验证。
+- 跨域 iframe 会由扩展分别注入观察器并以 frame 专属元素引用执行基础操作；`sandbox` 禁止脚本、浏览器内部页面及主动反自动化控件仍可能不可访问。
+- 封闭 Shadow DOM、Canvas/WebGL 内部对象通常需要视觉坐标或业务源码辅助；可用 `surface_interact` 以相对坐标执行真实输入，结果仍需通过 DOM、截图或网络响应验证。
 - 视觉能力依赖所配置模型是否真正支持图片输入。
 - 浏览器交互仍需在加载扩展后手动验收；仓库提供纯 Node 回归测试和 JavaScript 静态语法检查。
 

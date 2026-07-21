@@ -192,7 +192,7 @@
       "  if (findBy === 'text') {" +
       "    var semantic='a,button,input,select,textarea,label,li,[role=button],[role=link],[role=menuitem],[role=tab],[role=option],[role=treeitem],[tabindex],[onclick]';" +
       "    els=Array.prototype.slice.call(document.querySelectorAll(semantic)).filter(function(node){var t=(node.textContent||node.value||'').replace(/\\s+/g,' ').trim();return t&&t.length<=160&&(t===val||t.indexOf(val)!==-1);});" +
-      "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node;while((node=walker.nextNode())&&els.length<10){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=5&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
+      "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node,scanned=0;while((node=walker.nextNode())&&els.length<10&&scanned++<8000){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=5&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
       "  } else if (findBy === 'text_contains') {" +
       "    els = Array.from(document.querySelectorAll(tagFilter || '*')).filter(function(el) {" +
       "      if (el.children.length > 5) return false;" +

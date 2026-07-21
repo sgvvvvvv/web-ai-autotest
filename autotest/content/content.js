@@ -221,6 +221,52 @@
     };
   }
 
+  function visibleTarget(selector) {
+    var element = document.querySelector(selector);
+    if (!element) return null;
+    if (!isVisible(element)) return null;
+    return element;
+  }
+
+  function nativeSetValue(element, value) {
+    var prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (descriptor && descriptor.set) descriptor.set.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function interactWithFrame(msg) {
+    var element = visibleTarget(msg.selector || "");
+    if (!element) return { ok: false, error: "frame 内未找到可见元素: " + (msg.selector || "") };
+    element.scrollIntoView({ block: "center", inline: "nearest" });
+    if (msg.action === "click") {
+      element.focus({ preventScroll: true });
+      element.click();
+      return { ok: true, result: "已在当前 frame 内点击并触发事件" };
+    }
+    if (msg.action === "type") {
+      element.focus({ preventScroll: true });
+      if (element.isContentEditable) {
+        element.textContent = msg.text || "";
+        element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: msg.text || "" }));
+      } else if (element.matches("input,textarea")) {
+        nativeSetValue(element, msg.text || "");
+      } else {
+        return { ok: false, error: "目标不是可输入元素" };
+      }
+      return { ok: true, result: "已在当前 frame 内输入并触发 input/change" };
+    }
+    if (msg.action === "scroll") return { ok: true, result: "已滚动到当前 frame 内元素" };
+    if (msg.action === "hover") {
+      element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, view: window }));
+      element.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, view: window }));
+      return { ok: true, result: "已在当前 frame 内派发 hover 事件" };
+    }
+    return { ok: false, error: "不支持的 frame 操作: " + msg.action };
+  }
+
   // ---- 运行时导航菜单提取 ----
 
   /**
@@ -351,6 +397,14 @@
     }
     if (msg.type === "AIFT_PING") {
       sendResponse({ ok: true, pong: true, url: location.href });
+      return true;
+    }
+    if (msg.type === "AIFT_FRAME_INTERACT") {
+      try {
+        sendResponse(interactWithFrame(msg));
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) ? e.message : e) });
+      }
       return true;
     }
     if (msg.type === "AIFT_CAPTURE_NAVIGATION") {

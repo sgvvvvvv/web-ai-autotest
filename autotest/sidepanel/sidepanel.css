@@ -337,7 +337,14 @@ body {
 .report-extra {
   margin-top: 12px; padding-top: 8px; border-top: 1px dashed #e5e6eb;
 }
-.report-extra-title { font-size: 11px; font-weight: 600; color: #86909c; margin-bottom: 6px; }
+.report-extra-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 2px 0 6px;
+  border: 0; background: transparent; color: #4e5969; cursor: pointer;
+  font: 600 11px/1.5 inherit; text-align: left;
+}
+.report-extra-toggle:hover { color: #1d2129; }
+.report-extra-arrow { width: 12px; color: #86909c; text-align: center; }
+.report-extra-content.collapsed { display: none; }
 .report-extra-item {
   padding: 4px 8px; margin-bottom: 3px; border-radius: 4px; font-size: 11px;
   display: flex; align-items: center; gap: 6px;
@@ -385,8 +392,29 @@ body {
   margin-bottom: 10px;
 }
 .stream-header h2 { margin: 0; }
-.stream-actions { display: flex; gap: 8px; }
+.stream-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .btn-abort { padding: 4px 16px; font-size: 12px; }
+.context-meter {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  color: #86909c; font-size: 11px; white-space: nowrap;
+}
+.context-meter-label { font-variant-numeric: tabular-nums; }
+.context-meter-track {
+  display: block; width: 46px; height: 5px; overflow: hidden;
+  border-radius: 3px; background: #e5e6eb;
+}
+.context-meter-bar {
+  display: block; width: 0; height: 100%; border-radius: inherit;
+  background: #3b82f6; transition: width 0.2s ease, background-color 0.2s ease;
+}
+.context-meter.is-warning .context-meter-label { color: #d97706; }
+.context-meter.is-warning .context-meter-bar { background: #f0a830; }
+.context-meter.is-danger .context-meter-label { color: #e74c3c; }
+.context-meter.is-danger .context-meter-bar { background: #e74c3c; }
+@media (max-width: 370px) {
+  .stream-header { flex-wrap: wrap; gap: 6px; }
+  .stream-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+}
 .stream-log {
   max-height: 400px; overflow-y: auto; overflow-x: hidden;
   background: #1e1e2e; border-radius: 6px; padding: 10px;

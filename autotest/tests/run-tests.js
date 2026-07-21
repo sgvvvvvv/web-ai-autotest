@@ -22,6 +22,8 @@ function assertSidePanelDomContract() {
 
 async function run() {
   assertSidePanelDomContract();
+  const agentLoopSource = fs.readFileSync(path.join(__dirname, "..", "core", "agent-loop.js"), "utf8");
+  assert.strictEqual(/AIFT_AIClient\.chat\(/.test(agentLoopSource), false, "Agent Loop 的 AI 请求必须使用流式 chatStream");
   const context = vm.createContext({ window: {}, URL: URL });
   loadModule("source-reader.js", context);
   loadModule("interaction-contract.js", context);
@@ -86,6 +88,22 @@ async function run() {
   assert.strictEqual(scheduler.isStateChanging(cases[2]), true);
   const plan = JSON.parse(JSON.stringify(scheduler.buildPlan(cases)));
   assert.deepStrictEqual(plan.map(function (item) { return item.cases; }), [["TC1", "TC2"], ["TC3"]]);
+  const aiScheduled = [
+    { id: "TC1", title: "列表默认展示" },
+    { id: "TC2", title: "列表筛选" },
+    { id: "TC3", title: "用户编辑" },
+  ];
+  const aiPlan = scheduler.applyAiPlan(aiScheduled, {
+    groups: [
+      { title: "用户编辑", caseIds: ["TC3"] },
+      { title: "列表操作", caseIds: ["TC1", "TC2"] },
+    ],
+  });
+  assert.deepStrictEqual(aiScheduled.map(function(testCase) { return testCase.id; }), ["TC3", "TC1", "TC2"]);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(aiPlan.map(function(group) { return group.cases; }))), [["TC3"], ["TC1", "TC2"]]);
+  assert.strictEqual(scheduler.applyAiPlan(aiScheduled, { groups: [{ caseIds: ["TC1"] }] }), null);
+  assert.deepStrictEqual(aiScheduled.map(function(testCase) { return testCase.id; }), ["TC3", "TC1", "TC2"]);
+  assert.strictEqual(aiScheduled[1].scenarioTitle, "列表操作");
 
   const genericContracts = analyzer.getInteractionContracts({
     "components/TagPicker.vue": '<SmartPicker v-model="tags" multiple :options="tagOptions" placeholder="选择标签" />',
@@ -109,6 +127,36 @@ async function run() {
   });
   assert.ok(initialMessages[1].content.indexOf("执行场景计划") !== -1);
   assert.ok(initialMessages[1].content.indexOf("TC1 -> TC2") !== -1);
+  const iframeMessages = promptBuilder.buildMessages({
+    requirement: "提交嵌入表单",
+    testCases: "TC1,提交表单,嵌入页,已打开,点击提交,提交成功",
+    sourceFiles: [],
+    snapshot: {
+      url: "http://host.example", title: "宿主页面", nodes: [
+        { ref: "e1", tag: "button", text: "顶层按钮", selector: "#top", frameId: 0 },
+        { ref: "f12:e3", tag: "button", text: "提交", selector: "#submit", frameId: 12 },
+      ],
+      frames: [{ frameId: 0, interactiveCount: 1 }, { frameId: 12, title: "跨域表单", interactiveCount: 1 }],
+    },
+    visionSupported: false,
+  });
+  assert.ok(iframeMessages[1].content.indexOf("f12:e3") !== -1);
+  assert.ok(iframeMessages[1].content.indexOf("iframe:12") !== -1);
+  const continuousScenarioMessages = promptBuilder.buildMessages({
+    requirement: "连续筛选验证",
+    testCases: "TC1,筛选,列表页,已进入,选择筛选,列表更新",
+    sourceFiles: [],
+    snapshot: { url: "http://localhost", title: "列表页", nodes: [] },
+    conversationHistory: [{ role: "user", content: "开始执行" }],
+    testCasesState: [
+      { id: "TC1", title: "筛选", status: "testing", scenarioId: "SC1", scenarioTitle: "列表筛选", steps: "选择筛选条件 → 恢复：清空筛选" },
+      { id: "TC2", title: "搜索", status: "pending", scenarioId: "SC1", steps: "输入关键词" },
+    ],
+    visionSupported: false,
+  });
+  const continuousObservation = continuousScenarioMessages[continuousScenarioMessages.length - 1].content;
+  assert.ok(continuousObservation.indexOf("选择筛选条件") !== -1);
+  assert.strictEqual(continuousObservation.indexOf("恢复："), -1);
 
   const safe = redaction.redact({ password: "secret", message: "Bearer abcdefghijklmnopqrstuvwxyz", apiKey: "sk-abcdefghijklmnop" });
   assert.strictEqual(safe.password, "[REDACTED]");
@@ -135,7 +183,14 @@ async function run() {
     assertions: [{ description: "❌ checkbox 未勾选", passed: false }],
   });
   assert.deepStrictEqual(JSON.parse(JSON.stringify(report.stats)), { total: 2, passed: 1, failed: 1, inconclusive: 0, skipped: 0, pending: 0, testing: 0, tested: 2, conclusive: 2, passRate: 50 });
+  assert.strictEqual(report.testCases[0].assertionDesc, "✅ 默认展示正确");
+  assert.strictEqual(report.testCases[1].assertion, "❌ checkbox 未勾选");
+  const legacyAssertionReport = testReport.buildReport({
+    testCases: [{ id: "TC0", assertion: "旧报告断言" }],
+  });
+  assert.strictEqual(legacyAssertionReport.testCases[0].assertionDesc, "旧报告断言");
   assert.ok(testReport.buildMarkdown(report).indexOf("❌ checkbox 未勾选") !== -1);
+  assert.ok(testReport.buildMarkdown(report).indexOf("TC1 默认展示") !== -1);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(runHistory.trim([{ runId: "old" }, { runId: "new" }], { maxReports: 1 }))), [{ runId: "new" }]);
   assert.strictEqual(tabEligibility.evaluate("https://example.com").ok, true);
   assert.ok(tabEligibility.evaluate("file:///tmp/demo.html").warning);
@@ -170,9 +225,34 @@ async function run() {
     agentGuard.resolveObservedTarget(observedSnapshot, [".found-after-search"], [], { selector: ".found-after-search" }).ok,
     true
   );
+  const iframeSnapshot = {
+    nodes: [{ ref: "f12:e3", selector: "#submit", frameId: 12 }],
+  };
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(agentGuard.resolveObservedTarget(iframeSnapshot, [], [], { elementRef: "f12:e3" }))),
+    { ok: true, selector: "#submit", source: "snapshot-ref", frameId: 12 }
+  );
   assert.strictEqual(agentGuard.validateAssertionForCurrent("TC12: ✅ 通过 - 已验证", "TC12").ok, true);
   assert.strictEqual(agentGuard.validateAssertionForCurrent("TC11: ✅ 通过 - 已验证", "TC12").ok, false);
   assert.strictEqual(agentGuard.validateAssertionForCurrent("✅ 通过 - 已验证", "TC12").ok, false);
+  const mappedDataCase = {
+    title: "任务列表数据一致性",
+    steps: "获取接口响应并检查表格",
+    expected: "字段映射：任务名称 <- taskName；状态 <- status；页面与 API 一致",
+  };
+  assert.strictEqual(agentGuard.validateFieldMappings(mappedDataCase, [
+    { uiLabel: "任务名称", apiField: "taskName", pageValue: "任务A", apiValue: "任务A" },
+    { uiLabel: "状态", apiField: "status", pageValue: "下发中", apiValue: "下发中" },
+  ], { pageText: "任务名称 状态 任务A 下发中" }, '{"taskName":"任务A","status":"下发中"}').required, true);
+  const nonMappingDataCase = agentGuard.validateFieldMappings({
+    title: "任务列表数据一致性", steps: "获取接口响应并检查表格", expected: "页面与 API 一致",
+  }, [], { pageText: "任务名称 状态" }, '{"taskName":"任务A"}');
+  assert.strictEqual(nonMappingDataCase.ok, true);
+  assert.strictEqual(nonMappingDataCase.required, false);
+  assert.strictEqual(agentGuard.validateFieldMappings(mappedDataCase, [
+    { uiLabel: "下发时间", apiField: "createdTime", pageValue: "2026-01-01", apiValue: "2026-01-01" },
+    { uiLabel: "状态", apiField: "status", pageValue: "下发中", apiValue: "下发中" },
+  ], { pageText: "下发时间 状态" }, '{"createdTime":"2026-01-01","status":"下发中"}').ok, false);
   const incompleteOutcome = agentGuard.resolveAssertionOutcome({ passed: true }, "TC5: ⚠️ 部分通过 - 无法在自动化环境中触发真实文件校验，未能完整验证");
   assert.strictEqual(incompleteOutcome.outcome, "inconclusive");
   assert.strictEqual(incompleteOutcome.downgraded, true);
@@ -192,8 +272,12 @@ async function run() {
 
   assert.strictEqual(validator.validateApiEndpoint("ftp://example.com").ok, false);
   assert.strictEqual(validator.validateApiEndpoint("https://api.example.com/v1").ok, true);
-  assert.ok(validator.validateApiEndpoint("http://api.example.com/v1").warning);
-  assert.strictEqual(validator.validateApiEndpoint("http://localhost:11434/v1").warning, undefined);
+  const remoteHttpEndpoint = validator.validateApiEndpoint("http://api.example.com/v1");
+  assert.strictEqual(remoteHttpEndpoint.ok, true);
+  assert.strictEqual(remoteHttpEndpoint.warning, undefined);
+  const localHttpEndpoint = validator.validateApiEndpoint("http://localhost:11434/v1");
+  assert.strictEqual(localHttpEndpoint.ok, true);
+  assert.strictEqual(localHttpEndpoint.warning, undefined);
 
   let clickProbe = "";
   await visualController.clickAtPoint(async function (code) {

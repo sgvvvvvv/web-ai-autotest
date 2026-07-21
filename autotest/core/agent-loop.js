@@ -29,6 +29,15 @@
     "confirm_dialog", "toggle_switch",
   ];
   var MAX_TC_ROUNDS = 30; // 单个测试用例最大执行轮数，超限自动标记失败
+  var TOOL_TIMEOUT_MS = {
+    find_element: 12000,
+    eval_in_page: 12000,
+    read_source: 10000,
+    get_network_responses: 12000,
+    screenshot: 30000,
+    verify_ui: 30000,
+    default: 25000,
+  };
   // 为恢复页面状态和提交断言预留轮次，避免到达上限后才要求收尾。
   var TC_RECOVERY_RESERVE_ROUNDS = 2;
   // 借鉴 OpenCode 的 DOOM_LOOP_THRESHOLD：连续 N 次完全相同的工具调用触发 doom loop
@@ -62,6 +71,28 @@
       if (args1 !== args2) return false;
     }
     return true;
+  }
+
+  function runWithTimeout(promise, timeoutMs, label) {
+    return new Promise(function(resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function() {
+        if (settled) return;
+        settled = true;
+        reject(new Error((label || "工具执行") + "超时（" + timeoutMs + "ms）"));
+      }, timeoutMs);
+      Promise.resolve(promise).then(function(value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }, function(error) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
   }
 
   /**
@@ -888,18 +919,61 @@
       if (deps.onStream) deps.onStream(type, content);
     }
 
+    function countContextChars(value) {
+      if (typeof value === "string") return value.length;
+      if (Array.isArray(value)) {
+        var arrayChars = 0;
+        for (var ai = 0; ai < value.length; ai++) {
+          // 图片数据 URL 的 token 计数由模型服务端根据图片尺寸决定，不能按 base64 长度估算。
+          if (value[ai] && value[ai].type === "image_url") continue;
+          arrayChars += countContextChars(value[ai]);
+        }
+        return arrayChars;
+      }
+      if (value && typeof value === "object") {
+        try { return JSON.stringify(value).length; } catch (e) { return 0; }
+      }
+      return 0;
+    }
+
+    function reportContextUsage(messages, tools) {
+      var chars = 0;
+      for (var ci = 0; ci < messages.length; ci++) {
+        var message = messages[ci] || {};
+        chars += countContextChars(message.content);
+        if (message.tool_calls) chars += countContextChars(message.tool_calls);
+      }
+      chars += countContextChars(tools || []);
+      var contextTokens = Math.max(1, (deps.config.contextSize || 128) * 1000);
+      var inputTokens = Math.ceil(chars / 3);
+      var reservedOutputTokens = Math.min(20000, contextTokens);
+      stream("context_usage", JSON.stringify({
+        round: state.round,
+        inputTokens: inputTokens,
+        contextTokens: contextTokens,
+        reservedOutputTokens: reservedOutputTokens,
+        percent: Math.min(100, inputTokens / contextTokens * 100),
+      }));
+    }
+
     /**
      * 获取 DOM 快照
      */
     async function getSnapshot() {
       await deps.ensureContentScript();
-      var resp = await deps.sendMessage(deps.tabId, { type: "AIFT_CAPTURE_SNAPSHOT" });
+      var resp = await runWithTimeout(
+        deps.sendMessage(deps.tabId, { type: "AIFT_CAPTURE_SNAPSHOT" }),
+        TOOL_TIMEOUT_MS.find_element,
+        "DOM 快照采集"
+      );
       if (!resp || !resp.ok) {
         throw new Error(resp ? resp.error : "无响应");
       }
       state.previousSnapshot = state.snapshot;
       state.snapshot = resp.snapshot;
-      state.observedSelectors = (state.snapshot.nodes || []).map(function(node) { return node.selector; }).filter(Boolean);
+      state.observedSelectors = (state.snapshot.nodes || []).filter(function(node) { return node.selector; }).map(function(node) {
+        return { selector: node.selector, frameId: node.frameId };
+      });
       return resp.snapshot;
     }
 
@@ -933,6 +1007,24 @@
           }
         }
         return { ok: false, result: "CDP 视觉控制器不可用，无法执行真实" + desc };
+      }
+
+      async function tryFrameInteraction(target, action, extra) {
+        if (target.frameId === undefined || Number(target.frameId) === 0) return null;
+        try {
+          var frameResponse = await deps.sendMessage(deps.tabId, Object.assign({
+            type: "AIFT_FRAME_INTERACT",
+            frameId: Number(target.frameId),
+            action: action,
+            selector: target.selector,
+          }, extra || {}));
+          if (!frameResponse || !frameResponse.ok) {
+            return { ok: false, result: (frameResponse && frameResponse.error) || "iframe 内操作未生效" };
+          }
+          return { ok: true, result: "iframe-" + target.frameId + " " + (frameResponse.result || "操作成功"), via: "frame" };
+        } catch (e) {
+          return { ok: false, result: "iframe-" + target.frameId + " 操作失败: " + (e.message || e) };
+        }
       }
 
       async function interactionAtPoint(x, y) {
@@ -989,8 +1081,9 @@
             result.result = clickTarget.error;
             break;
           }
-          result.args = Object.assign({}, args, { selector: clickTarget.selector });
-          var clickRet = await tryCdpOnly({ selector: clickTarget.selector },
+          result.args = Object.assign({}, args, { selector: clickTarget.selector, frameId: clickTarget.frameId });
+          var frameClickRet = await tryFrameInteraction(clickTarget, "click");
+          var clickRet = frameClickRet || await tryCdpOnly({ selector: clickTarget.selector },
             async function () {
               return await global.AIFT_VisualController.clickBySelector(deps.evalInPage, clickTarget.selector);
             }, "点击");
@@ -1005,8 +1098,9 @@
             result.result = typeTarget.error;
             break;
           }
-          result.args = Object.assign({}, args, { selector: typeTarget.selector });
-          var typeRet = await tryCdpOnly({ selector: typeTarget.selector, text: args.text },
+          result.args = Object.assign({}, args, { selector: typeTarget.selector, frameId: typeTarget.frameId });
+          var frameTypeRet = await tryFrameInteraction(typeTarget, "type", { text: args.text || "" });
+          var typeRet = frameTypeRet || await tryCdpOnly({ selector: typeTarget.selector, text: args.text },
             async function () {
               return await global.AIFT_VisualController.typeBySelector(deps.evalInPage, typeTarget.selector, args.text);
             }, "输入");
@@ -1054,8 +1148,9 @@
                   result.result = scrollTarget.error;
                   break;
                 }
-                result.args = Object.assign({}, args, { selector: scrollTarget.selector });
-                var scrollResult = await global.AIFT_VisualController.scrollToElement(deps.evalInPage, scrollTarget.selector);
+                result.args = Object.assign({}, args, { selector: scrollTarget.selector, frameId: scrollTarget.frameId });
+                var frameScrollRet = await tryFrameInteraction(scrollTarget, "scroll");
+                var scrollResult = frameScrollRet || await global.AIFT_VisualController.scrollToElement(deps.evalInPage, scrollTarget.selector);
                 if (scrollResult.ok) {
                   result.result = "CDP 滚动到: " + scrollTarget.selector;
                   break;
@@ -1090,8 +1185,9 @@
                 result.result = hoverTarget.error;
                 break;
               }
-              result.args = Object.assign({}, args, { selector: hoverTarget.selector });
-              var hoverResult = await global.AIFT_VisualController.hoverBySelector(deps.evalInPage, hoverTarget.selector);
+              result.args = Object.assign({}, args, { selector: hoverTarget.selector, frameId: hoverTarget.frameId });
+              var frameHoverRet = await tryFrameInteraction(hoverTarget, "hover");
+              var hoverResult = frameHoverRet || await global.AIFT_VisualController.hoverBySelector(deps.evalInPage, hoverTarget.selector);
               if (hoverResult.ok) {
                 result.result = "CDP 悬停: " + hoverTarget.selector;
                 break;
@@ -1146,7 +1242,7 @@
             result.result = "eval_in_page 不可用（需要 chrome.scripting 权限）";
             break;
           }
-          var evalResult = await deps.evalInPage(args.code || "");
+          var evalResult = await deps.evalInPage(args.code || "", args.frameId);
           result.ok = evalResult.ok;
           result.result = evalResult.ok ? (evalResult.result || "无返回值：请在 eval_in_page 代码中显式 return 一个字符串/数组/对象，不要只写 console.log。") : ("执行失败: " + evalResult.error);
           log("eval_in_page: " + (args.code || "").substring(0, 80) + " → " + (evalResult.ok ? "成功" : "失败"));
@@ -1176,7 +1272,7 @@
               "  if (findBy === 'text') {" +
               "    var semantic='a,button,input,select,textarea,label,li,[role=button],[role=link],[role=menuitem],[role=tab],[role=option],[role=treeitem],[tabindex],[onclick]';" +
               "    els=Array.prototype.slice.call(document.querySelectorAll(semantic)).filter(function(node){var t=(node.textContent||node.value||'').replace(/\\s+/g,' ').trim();return t&&t.length<=160&&(t===val||t.indexOf(val)!==-1);});" +
-              "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node;while((node=walker.nextNode())&&els.length<10){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=2&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
+              "    if(!els.length){var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT),node,scanned=0;while((node=walker.nextNode())&&els.length<10&&scanned++<8000){var text=(node.textContent||'').replace(/\\s+/g,' ').trim();if(text&&(text===val||(node.children.length<=2&&text.length<=100&&text.indexOf(val)!==-1)))els.push(node);}}" +
               "  } else if (findBy === 'text_contains') {" +
               "    var walker2 = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {" +
               "      acceptNode: function(node) {" +
@@ -1228,22 +1324,33 @@
               "  });" +
               "  return JSON.stringify(results);" +
               "})()";
-            var findResult = await deps.evalInPage(findCode);
-            if (!findResult.ok) {
-              result.ok = false;
-              result.result = "查找失败: " + (findResult.error || "");
-              break;
-            }
             try {
-              var foundEls = JSON.parse(findResult.result || "[]");
+              var foundEls = [];
+              var searchFrames = (state.snapshot && state.snapshot.frames) || [{ frameId: 0 }];
+              var findErrors = [];
+              for (var frameIndex = 0; frameIndex < searchFrames.length; frameIndex++) {
+                var searchFrameId = searchFrames[frameIndex].frameId;
+                var findResult = await deps.evalInPage(findCode, searchFrameId);
+                if (!findResult.ok) {
+                  findErrors.push("iframe-" + searchFrameId + ": " + (findResult.error || "查找失败"));
+                  continue;
+                }
+                var frameFound = JSON.parse(findResult.result || "[]");
+                frameFound.forEach(function(found) { found.frameId = searchFrameId; });
+                foundEls = foundEls.concat(frameFound);
+              }
               if (foundEls.length === 0) {
                 result.ok = false;
                 result.result = "未找到匹配元素: findBy=" + findBy + ", value=" + findValue +
-                  "\n建议：1) 检查当前 DOM 快照中的文本、label、placeholder 和 elementRef 2) 改用 text_contains 或 label 查找 3) 需要源码语义时用 read_source。";
+                  "\n建议：1) 检查当前 DOM 快照中的文本、label、placeholder 和 elementRef 2) 改用 text_contains 或 label 查找 3) 需要源码语义时用 read_source。" +
+                  (findErrors.length ? "\n不可访问的 frame: " + findErrors.join("; ") : "");
               } else {
                 foundEls.forEach(function(found) {
-                  if (found.selector && state.observedSelectors.indexOf(found.selector) === -1) {
-                    state.observedSelectors.push(found.selector);
+                  var exists = state.observedSelectors.some(function(observed) {
+                    return observed && typeof observed === "object" && observed.selector === found.selector && observed.frameId === found.frameId;
+                  });
+                  if (found.selector && !exists) {
+                    state.observedSelectors.push({ selector: found.selector, frameId: found.frameId });
                   }
                 });
                 var findParts = ["找到 " + foundEls.length + " 个匹配元素:"];
@@ -1255,6 +1362,7 @@
                     (fe.id ? " id=\"" + fe.id + "\"" : "") + "> " + (fe.text || "(无文本)") +
                     "\n  坐标: (" + fe.x + ", " + fe.y + ") 尺寸: " + fe.width + "x" + fe.height +
                     (fe.visible ? " [可见]" : " [不可见]") +
+                    (fe.frameId ? " [iframe:" + fe.frameId + "]" : "") +
                     "\n  selector: " + fe.selector +
                     "\n  → selector 稳定时用 click(selector)；不稳定或同类元素较多时用 smart_click(findBy=\"" + findBy + "\", value=\"" + findValue + "\")"
                   );
@@ -1408,6 +1516,34 @@
             result.result = "当前用例 " + assertionCheck.testCaseId + " 未处于 testing 状态，断言未写入。";
             log("⚠️ 已拒绝断言: " + result.result);
             break;
+          }
+          var currentAssertionTC = state.testCases[currentAssertionIdx];
+          if (assertionOutcome === "passed" && global.AIFT_AgentGuard && global.AIFT_AgentGuard.validateFieldMappings) {
+            var networkEvidence = state.history.filter(function(item) {
+              return String(item.action || "").indexOf("get_network_responses") === 0;
+            }).map(function(item) { return item.result || ""; }).join("\n");
+            var mappingCheck = global.AIFT_AgentGuard.validateFieldMappings(
+              currentAssertionTC, args.fieldMappings, state.snapshot, networkEvidence
+            );
+            if (!mappingCheck.ok) {
+              assertionOutcome = "inconclusive";
+              outcomeInfo = { outcome: "inconclusive", downgraded: true, reason: mappingCheck.reason };
+              assertionDescription = assertionDescription.replace("✅", "⚠️") +
+                "（字段映射未充分验证：" + mappingCheck.reason + "）";
+            } else if (mappingCheck.required) {
+              var semanticReview = await reviewFieldMappingSemantics(currentAssertionTC, args.fieldMappings);
+              if (semanticReview.verdict !== "match") {
+                assertionOutcome = semanticReview.verdict === "mismatch" ? "failed" : "inconclusive";
+                outcomeInfo = {
+                  outcome: assertionOutcome,
+                  downgraded: true,
+                  reason: "字段映射语义审查为 " + semanticReview.verdict + "：" + semanticReview.reason,
+                };
+                assertionDescription = assertionDescription.replace("✅", assertionOutcome === "failed" ? "❌" : "⚠️") +
+                  "（字段映射语义" + (semanticReview.verdict === "mismatch" ? "不匹配" : "待确认") +
+                  "：" + formatFieldMappingReviewIssues(args.fieldMappings, semanticReview) + "）";
+              }
+            }
           }
           var assertion = {
             description: assertionDescription,
@@ -2347,6 +2483,173 @@
       return parts.join("\n");
     }
 
+    function parseAiScenarioPlan(content) {
+      var text = String(content || "").trim();
+      var fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fenced) text = fenced[1].trim();
+      var start = text.indexOf("{");
+      var end = text.lastIndexOf("}");
+      if (start < 0 || end <= start) return null;
+      try { return JSON.parse(text.substring(start, end + 1)); }
+      catch (e) { return null; }
+    }
+
+    function formatFieldMappingReviewIssues(mappings, review) {
+      var submitted = Array.isArray(mappings) ? mappings : [];
+      var reviewed = Array.isArray(review && review.mappings) ? review.mappings : [];
+      var issues = [];
+
+      function compactReason(value, fallback) {
+        var text = String(value || fallback || "未提供可验证的语义依据").replace(/\s+/g, " ").trim();
+        return text.substring(0, 180);
+      }
+
+      submitted.forEach(function(mapping) {
+        var uiLabel = String((mapping && mapping.uiLabel) || "").trim();
+        var apiField = String((mapping && mapping.apiField) || "").trim();
+        var reviewedMapping = reviewed.filter(function(item) {
+          return item && String(item.uiLabel || "").trim() === uiLabel &&
+            String(item.apiField || "").trim() === apiField;
+        })[0];
+        var verdict = String((reviewedMapping && reviewedMapping.verdict) || "").toLowerCase();
+        var overallVerdict = String((review && review.verdict) || "").toLowerCase();
+        if (verdict === "match" && overallVerdict === "match") return;
+        var status = verdict === "mismatch" ? "不匹配" : "待确认";
+        var reason = compactReason(
+          reviewedMapping && reviewedMapping.reason,
+          review && review.reason
+        );
+        issues.push("页面列头「" + (uiLabel || "未提供") + "」← API字段 " +
+          (apiField || "未提供") + "：" + status + "（" + reason + "）");
+      });
+
+      if (issues.length > 0) return issues.join("；");
+      return compactReason(review && review.reason, "AI 未返回可定位到具体字段的语义审查结果");
+    }
+
+    async function reviewFieldMappingSemantics(testCase, mappings) {
+      if (!global.AIFT_AIClient || !Array.isArray(mappings) || mappings.length === 0) {
+        return { verdict: "uncertain", reason: "字段映射语义审查不可用" };
+      }
+      stream("info", "🔎 正在进行字段名与页面列头的语义审查...");
+      var messages = [{
+        role: "system",
+        content: [
+          "你是严格的数据语义审查员。判断页面列头与 API 字段是否表达同一业务含义，而不是仅判断名称或值是否相似。",
+          "字段 createdTime 只表示创建时间；除非提供明确业务定义，否则不能推断为下发时间、完成时间或更新时间。",
+          "当没有足够的需求、源码或 API 字段定义证明映射时，必须给出 uncertain；明显不同则 mismatch。",
+          "只输出 JSON：{\"verdict\":\"match|mismatch|uncertain\",\"reason\":\"...\",\"mappings\":[{\"uiLabel\":\"...\",\"apiField\":\"...\",\"verdict\":\"match|mismatch|uncertain\",\"reason\":\"...\"}]}。",
+          "mappings 必须逐条包含输入中的每一项映射，uiLabel 和 apiField 必须原样返回；不得省略、合并或新增映射。",
+          "任一映射为 mismatch 时整体 verdict 必须为 mismatch；任一映射 uncertain 且没有 mismatch 时整体 verdict 必须为 uncertain。",
+        ].join("\n"),
+      }, {
+        role: "user",
+        content: JSON.stringify({
+          testCase: { title: testCase.title || testCase.text || "", steps: testCase.steps || "", expected: testCase.expected || "" },
+          mappings: mappings.map(function(mapping) {
+            return { uiLabel: mapping.uiLabel, apiField: mapping.apiField, pageValue: mapping.pageValue, apiValue: mapping.apiValue };
+          }),
+        }),
+      }];
+      state.abortController = new AbortController();
+      try {
+        var response = await global.AIFT_AIClient.chatStream(deps.config, messages, [], {
+          timeout: 60000,
+          maxRetries: 1,
+          signal: state.abortController.signal,
+          onDelta: function(type, content) {
+            if (type === "reasoning") stream("reasoning", content);
+            else if (type === "content") stream("content", content);
+          },
+        });
+        var review = parseAiScenarioPlan(response.message && response.message.content) || {};
+        var verdict = String(review.verdict || "uncertain").toLowerCase();
+        if (["match", "mismatch", "uncertain"].indexOf(verdict) === -1) verdict = "uncertain";
+        var reviewedMappings = Array.isArray(review.mappings) ? review.mappings.map(function(mapping) {
+          return {
+            uiLabel: String((mapping && mapping.uiLabel) || ""),
+            apiField: String((mapping && mapping.apiField) || ""),
+            verdict: String((mapping && mapping.verdict) || "uncertain").toLowerCase(),
+            reason: String((mapping && mapping.reason) || ""),
+          };
+        }) : [];
+        var mappingVerdicts = reviewedMappings.map(function(mapping) {
+          return String((mapping && mapping.verdict) || "uncertain").toLowerCase();
+        });
+        if (mappingVerdicts.indexOf("mismatch") !== -1) verdict = "mismatch";
+        else if (mappingVerdicts.indexOf("uncertain") !== -1 && verdict === "match") verdict = "uncertain";
+        return {
+          verdict: verdict,
+          reason: String(review.reason || "AI 未提供可验证的语义依据"),
+          mappings: reviewedMappings,
+        };
+      } catch (e) {
+        if (state.aborted) return { verdict: "uncertain", reason: "语义审查被中止" };
+        return { verdict: "uncertain", reason: "字段映射语义审查失败: " + (e.message || e) };
+      } finally {
+        state.abortController = null;
+      }
+    }
+
+    async function planExecutionScenariosWithAi(params) {
+      if (state.testCases.length < 2 || !global.AIFT_AIClient || !global.AIFT_TestScheduler || !global.AIFT_TestScheduler.applyAiPlan) return;
+      setStatus("AI 分析用例相关性...");
+      stream("info", "📋 正在分析用例相关性并优化执行顺序...");
+      var caseList = state.testCases.map(function(testCase) {
+        return {
+          id: testCase.id, title: testCase.title || testCase.text || "", page: testCase.page || "",
+          preconditions: testCase.preconditions || "", steps: testCase.steps || "", expected: testCase.expected || "",
+        };
+      });
+      var messages = [{
+        role: "system",
+        content: [
+          "你是自动化测试执行调度专家。根据测试用例语义找出可共享页面导航、登录状态、打开弹窗、筛选条件或列表定位的用例，并给出高效且安全的执行顺序。",
+          "可在同一页面或同一弹窗中连续验证的筛选、搜索、创建、编辑、保存、提交和状态切换应优先分组并复用状态；只有不可逆、相互冲突或需要全新前置条件的用例才隔离。每个 TC 仍必须单独执行断言。",
+          "只输出 JSON，不要 Markdown 或解释。格式：{\"groups\":[{\"title\":\"共享场景名称\",\"caseIds\":[\"TC1\",\"TC2\"],\"rationale\":\"可复用的 setup\"}]}。",
+          "groups 必须包含每个给定 TC 一次且仅一次，caseIds 只能使用给定编号。",
+        ].join("\n"),
+      }, {
+        role: "user",
+        content: JSON.stringify({
+          requirement: params.requirement || "", testCases: caseList,
+          currentPage: state.snapshot ? { url: state.snapshot.url || "", title: state.snapshot.title || "" } : {},
+          architecture: params.architecture && params.architecture.summary || "",
+          sourceInteractions: (state.sourceInteractions || []).slice(0, 20).map(function(item) {
+            return { kind: item.kind, triggerSelector: item.triggerSelector, source: item.source };
+          }),
+        }),
+      }];
+      state.abortController = new AbortController();
+      try {
+        var response = await global.AIFT_AIClient.chatStream(deps.config, messages, [], {
+          timeout: 90000,
+          maxRetries: 1,
+          signal: state.abortController.signal,
+          onDelta: function(type, content) {
+            if (type === "reasoning") stream("reasoning", content);
+            else if (type === "content") stream("content", content);
+          },
+        });
+        var candidate = parseAiScenarioPlan(response.message && response.message.content);
+        var applied = global.AIFT_TestScheduler.applyAiPlan(state.testCases, candidate);
+        if (!applied) {
+          log("⚠️ AI 用例分组无效，已保留本地保守调度");
+          stream("warning", "AI 分组结果无效，已使用本地保守分组执行。");
+          return;
+        }
+        state.scenarioPlan = applied;
+        log("AI 用例相关性分析完成：" + applied.length + " 个执行场景");
+        stream("info", "📋 用例已按相关性重排为 " + applied.length + " 个执行场景：" + applied.map(function(group) { return group.cases.join(" → "); }).join("；"));
+      } catch (e) {
+        if (state.aborted) return;
+        log("⚠️ AI 用例相关性分析失败，已使用本地保守调度: " + (e.message || e));
+        stream("warning", "AI 用例相关性分析失败，已使用本地保守分组执行。");
+      } finally {
+        state.abortController = null;
+      }
+    }
+
     /**
      * 运行 agent loop
      * @param {Object} params - { requirement, testCases, architecture }
@@ -2388,7 +2691,6 @@
       assignExecutionScenarios(state.testCases);
       state.scenarioPlan = global.AIFT_TestScheduler && global.AIFT_TestScheduler.buildPlan
         ? global.AIFT_TestScheduler.buildPlan(state.testCases) : [];
-      if (deps.onTestCasesParsed) deps.onTestCasesParsed(state.testCases);
 
       // 动态计算步数上限：基础 + 每个用例额外步数
       var tcCount = state.testCases.length || 1;
@@ -2440,8 +2742,10 @@
         log("捕获初始 DOM 快照");
         await getSnapshot();
         log("初始快照: " + state.snapshot.interactiveCount + " 个可交互元素");
+        await planExecutionScenariosWithAi(params);
+        if (!state.aborted && deps.onTestCasesParsed) deps.onTestCasesParsed(state.testCases);
         // 视觉模式：初始截图
-        if (deps.config.visionSupported && global.AIFT_VisualController) {
+        if (!state.aborted && deps.config.visionSupported && global.AIFT_VisualController) {
           try {
             state.screenshot = await global.AIFT_VisualController.captureAnnotatedForAI(deps.evalInPage);
             state.annotatedElements = state.screenshot.elements || [];
@@ -2667,6 +2971,9 @@
             }
           }
 
+          var tools = global.AIFT_PromptBuilder.buildTools({ visionSupported: deps.config.visionSupported });
+          reportContextUsage(messages, tools);
+
           // 流式调用 AI
           state.abortController = new AbortController();
           var aiResult;
@@ -2674,7 +2981,7 @@
             aiResult = await global.AIFT_AIClient.chatStream(
               deps.config,
               messages,
-              global.AIFT_PromptBuilder.buildTools({ visionSupported: deps.config.visionSupported }),
+              tools,
               {
                 timeout: 120000,
                 maxRetries: 3,
@@ -2886,7 +3193,20 @@
           for (var t = 0; t < toolCalls.length; t++) {
             var tc = toolCalls[t];
             stream("action", "执行: " + tc.function.name);
-            var execResult = await executeAction(tc);
+            var execResult;
+            try {
+              var toolTimeout = TOOL_TIMEOUT_MS[tc.function.name] || TOOL_TIMEOUT_MS.default;
+              execResult = await runWithTimeout(executeAction(tc), toolTimeout, tc.function.name);
+            } catch (toolError) {
+              var timedArgs = {};
+              try { timedArgs = JSON.parse(tc.function.arguments || "{}"); } catch (ignore) {}
+              execResult = {
+                action: tc.function.name,
+                args: timedArgs,
+                ok: false,
+                result: "工具执行超时或异常: " + (toolError.message || toolError) + "。请根据当前快照改用更精确的定位或其他工具，不要原样重试。",
+              };
+            }
 
             // 记录历史
             state.history.push({

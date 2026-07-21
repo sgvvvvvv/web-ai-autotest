@@ -75,6 +75,9 @@ const els = {
   resultArea: document.getElementById("resultArea"),
   genTestCasesBtn: document.getElementById("genTestCasesBtn"),
   streamLog: document.getElementById("streamLog"),
+  contextMeter: document.getElementById("contextMeter"),
+  contextMeterLabel: document.getElementById("contextMeterLabel"),
+  contextMeterBar: document.getElementById("contextMeterBar"),
   sourceUpload: document.getElementById("sourceUpload"),
   sourceUploadInfo: document.getElementById("sourceUploadInfo"),
   testProgress: document.getElementById("testProgress"),
@@ -123,14 +126,41 @@ const els = {
 
 loadErrorRecords().catch(function () {});
 
+var PAGE_EVAL_TIMEOUT_MS = 12000;
+var CONTENT_MESSAGE_TIMEOUT_MS = 12000;
+
+function withTimeout(promise, timeoutMs, label) {
+  return new Promise(function(resolve, reject) {
+    var settled = false;
+    var timer = setTimeout(function() {
+      if (settled) return;
+      settled = true;
+      reject(new Error((label || "操作") + "超时（" + timeoutMs + "ms）"));
+    }, timeoutMs);
+    Promise.resolve(promise).then(function(value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, function(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 // ---- 在页面主世界执行 JS（替代 inspectedWindow.eval）----
 // 注意：chrome.scripting.executeScript 使用结构化克隆传输返回值，
 // DOM 对象、Window 对象等无法被克隆，因此必须在页面内序列化为字符串后再返回。
-async function evalInPage(code) {
+async function evalInPage(code, frameId) {
   if (!tabId) return { ok: false, error: "未选择目标标签页" };
   try {
-    var results = await chrome.scripting.executeScript({
-      target: { tabId: tabId },
+    var target = { tabId: tabId };
+    if (frameId !== undefined && frameId !== null) target.frameIds = [Number(frameId)];
+    var results = await withTimeout(chrome.scripting.executeScript({
+      target: target,
       world: "MAIN",
       func: async function (code) {
         // 在页面内将结果序列化为字符串，避免结构化克隆失败
@@ -219,7 +249,7 @@ async function evalInPage(code) {
         }
       },
       args: [code],
-    });
+    }), PAGE_EVAL_TIMEOUT_MS, "页面状态读取");
     if (!results || results.length === 0) {
       return { ok: false, error: "无返回值" };
     }
@@ -296,6 +326,34 @@ function updateButtonStates() {
 // ---- 流式日志 ----
 var streamState = { currentBlock: null, currentType: null, cursor: null, userScrolled: false, textNode: null, textAccum: "" };
 
+function formatContextTokens(tokens) {
+  if (!tokens) return "0";
+  return tokens >= 1000 ? (tokens / 1000).toFixed(tokens >= 10000 ? 0 : 1).replace(/\.0$/, "") + "K" : String(tokens);
+}
+
+function resetContextUsage(config) {
+  var totalTokens = config && config.contextSize ? config.contextSize * 1000 : 0;
+  els.contextMeterLabel.textContent = totalTokens ? "上下文 0 / " + formatContextTokens(totalTokens) : "上下文 --";
+  els.contextMeterBar.style.width = "0%";
+  els.contextMeterBar.parentElement.setAttribute("aria-valuenow", "0");
+  els.contextMeter.classList.remove("is-warning", "is-danger");
+  els.contextMeter.title = "根据本次请求中的文本消息和工具定义估算；图片 token 由模型服务端计算，未计入。";
+}
+
+function updateContextUsage(payload) {
+  if (!payload || !payload.contextTokens) return;
+  var percent = Math.max(0, Math.min(100, Number(payload.percent) || 0));
+  var used = Math.max(0, Number(payload.inputTokens) || 0);
+  var total = Math.max(0, Number(payload.contextTokens) || 0);
+  var reserved = Math.max(0, Number(payload.reservedOutputTokens) || 0);
+  els.contextMeterLabel.textContent = "上下文 " + formatContextTokens(used) + " / " + formatContextTokens(total) + " · " + Math.round(percent) + "%";
+  els.contextMeterBar.style.width = percent + "%";
+  els.contextMeterBar.parentElement.setAttribute("aria-valuenow", String(Math.round(percent)));
+  els.contextMeter.classList.toggle("is-warning", percent >= 75 && percent < 90);
+  els.contextMeter.classList.toggle("is-danger", percent >= 90);
+  els.contextMeter.title = "第 " + (payload.round || 0) + " 轮请求的文本上下文估算。已为模型输出预留 " + formatContextTokens(reserved) + "；图片 token 由模型服务端计算，未计入。";
+}
+
 // 监听用户手动滚动：如果用户往上滚了，停止自动滚动；滚回底部则恢复
 els.streamLog.addEventListener("scroll", function () {
   var atBottom = els.streamLog.scrollHeight - els.streamLog.scrollTop - els.streamLog.clientHeight < 30;
@@ -310,6 +368,7 @@ function streamClear() {
   streamState.userScrolled = false;
   streamState.textNode = null;
   streamState.textAccum = "";
+  resetContextUsage();
   // 清空截图
   screenshotState.history = [];
   if (els.screenshotContainer) els.screenshotContainer.innerHTML = '<div class="screenshot-empty">测试启动后，AI 每次接收到的截图会在此展示</div>';
@@ -328,6 +387,14 @@ function streamEndBlock() {
 }
 
 function streamAppend(type, content) {
+  if (type === "context_usage") {
+    try {
+      updateContextUsage(JSON.parse(content));
+    } catch (e) {
+      console.warn("[AIFT] 上下文占用数据解析失败:", e);
+    }
+    return;
+  }
   if (!content && type !== "round" && type !== "round_end") return;
 
   // 截图类型：渲染到截图展示区域
@@ -583,7 +650,6 @@ function reportConfigValidation(config, requireComplete) {
     setStatus("AI 配置无效");
     return false;
   }
-  if (validation.warning) log("⚠️ " + validation.warning);
   return true;
 }
 
@@ -595,10 +661,7 @@ async function saveConfig() {
   var validation = validateAiConfig(config, false);
   await chrome.storage.local.set({ aift_config: config });
   log("配置已保存");
-  if (validation.warning) {
-    log("⚠️ " + validation.warning);
-    setStatus("配置已保存（注意传输安全）");
-  } else if (!validation.ok) {
+  if (!validation.ok) {
     log("⚠️ " + validation.error);
     setStatus("配置已保存（尚未有效）");
   } else {
@@ -616,11 +679,63 @@ function normalizeTestCasesForCapabilities(text, visionSupported) {
 }
 
 // ---- content script 按需注入 ----
+var observedFrameIds = new Set([0]);
+
 async function ensureContentScript() {
-  await chrome.scripting.executeScript({
-    target: { tabId },
+  var results = await withTimeout(chrome.scripting.executeScript({
+    target: { tabId: tabId, allFrames: true },
     files: ["content/content.js"],
+  }), PAGE_EVAL_TIMEOUT_MS, "注入页面观察器");
+  observedFrameIds = new Set([0]);
+  (results || []).forEach(function(item) {
+    if (item && typeof item.frameId === "number") observedFrameIds.add(item.frameId);
   });
+  return Array.from(observedFrameIds);
+}
+
+async function captureAllFrameSnapshots(tabId) {
+  var frameIds = await ensureContentScript();
+  var snapshots = [];
+  var unavailable = [];
+  await Promise.all(frameIds.map(async function(frameId) {
+    try {
+      var response = await withTimeout(
+        chrome.tabs.sendMessage(tabId, { type: "AIFT_CAPTURE_SNAPSHOT" }, { frameId: frameId }),
+        CONTENT_MESSAGE_TIMEOUT_MS,
+        "iframe 观察器通信"
+      );
+      if (!response || !response.ok || !response.snapshot) throw new Error((response && response.error) || "无快照响应");
+      var snapshot = response.snapshot;
+      snapshot.frameId = frameId;
+      snapshot.frameLabel = frameId === 0 ? "top" : "iframe-" + frameId;
+      snapshot.nodes = (snapshot.nodes || []).map(function(node) {
+        return Object.assign({}, node, { ref: "f" + frameId + ":" + node.ref, frameId: frameId });
+      });
+      snapshots.push(snapshot);
+    } catch (error) {
+      unavailable.push({ frameId: frameId, error: error.message || String(error) });
+    }
+  }));
+  snapshots.sort(function(a, b) { return a.frameId - b.frameId; });
+  var top = snapshots.filter(function(snapshot) { return snapshot.frameId === 0; })[0] || snapshots[0] || {};
+  var pageText = snapshots.map(function(snapshot) {
+    return "[" + snapshot.frameLabel + " " + (snapshot.url || "") + "]\n" + (snapshot.pageText || "");
+  }).join("\n\n");
+  return {
+    ok: true,
+    snapshot: {
+      url: top.url || "",
+      title: top.title || "",
+      timestamp: Date.now(),
+      interactiveCount: snapshots.reduce(function(total, snapshot) { return total + (snapshot.interactiveCount || 0); }, 0),
+      nodes: snapshots.reduce(function(nodes, snapshot) { return nodes.concat(snapshot.nodes || []); }, []),
+      pageText: pageText.substring(0, 12000),
+      frames: snapshots.map(function(snapshot) {
+        return { frameId: snapshot.frameId, label: snapshot.frameLabel, url: snapshot.url || "", title: snapshot.title || "", interactiveCount: snapshot.interactiveCount || 0 };
+      }),
+      unavailableFrames: unavailable,
+    },
+  };
 }
 
 async function preflightTargetTab() {
@@ -662,13 +777,21 @@ async function preflightTargetTab() {
 
 // ---- 发消息给 content script ----
 function sendToContent(tabId, message) {
-  return chrome.tabs.sendMessage(tabId, message);
+  if (message && message.type === "AIFT_CAPTURE_SNAPSHOT" && message.allFrames !== false) {
+    return captureAllFrameSnapshots(tabId);
+  }
+  var frameId = message && message.frameId;
+  var request = frameId !== undefined && frameId !== null
+    ? chrome.tabs.sendMessage(tabId, message, { frameId: Number(frameId) })
+    : chrome.tabs.sendMessage(tabId, message);
+  return withTimeout(request, CONTENT_MESSAGE_TIMEOUT_MS, "页面观察器通信");
 }
 
 // ---- 实时测试结果展示 ----
 var testCasesState = [];
 var expandedCases = new Set(); // 实时结果中已展开的用例 key
 var expandedReportCases = new Set(); // 测试报告中已展开的用例 key
+var reportExtraExpanded = false; // 历史/完成报告中的额外断言默认折叠
 var currentAssertions = []; // 当前断言列表（供折叠/展开重渲染时使用）
 var lastReportResult = null; // 上次测试报告结果
 var lastReportSummary = ""; // 上次测试报告总结
@@ -868,9 +991,14 @@ function showStoredReport(index) {
   currentAssertions = report.assertions || [];
   expandedCases.clear();
   expandedReportCases.clear();
+  reportExtraExpanded = false;
   els.exportTestReportBtn.disabled = false;
   els.resultArea.innerHTML = renderTestReport(lastReportResult, lastReportSummary, testCasesState, currentAssertions);
   setStatus("正在查看历史报告");
+}
+
+function getTestCaseAssertion(testCase) {
+  return testCase && (testCase.assertionDesc || testCase.assertion) || "";
 }
 
 function clearRunHistory() {
@@ -950,8 +1078,9 @@ function renderTestResults(testCases, assertions) {
       if (tc.expected) {
         html += '<span class="test-detail">预期:</span>' + formatExpectedHtml(tc.expected);
       }
-      if (tc.assertionDesc && tc.assertionDesc !== tc.text && tc.assertionDesc !== tc.title) {
-        html += '<span class="test-detail">断言: ' + escapeHtml(tc.assertionDesc) + '</span>';
+      var assertionDesc = getTestCaseAssertion(tc);
+      if (assertionDesc && assertionDesc !== tc.text && assertionDesc !== tc.title) {
+        html += '<span class="test-detail">断言: ' + escapeHtml(assertionDesc) + '</span>';
       }
       html += '</div>';
       html += '</div>';
@@ -963,7 +1092,8 @@ function renderTestResults(testCases, assertions) {
   if (assertions.length > 0) {
     var matchedDescs = {};
     for (var i = 0; i < testCases.length; i++) {
-      if (testCases[i].assertionDesc) matchedDescs[testCases[i].assertionDesc] = true;
+      var caseAssertion = getTestCaseAssertion(testCases[i]);
+      if (caseAssertion) matchedDescs[caseAssertion] = true;
     }
     var unmatched = [];
     for (var i = 0; i < assertions.length; i++) {
@@ -1117,8 +1247,9 @@ function renderTestReport(result, summary, testCases, assertions) {
       if (tc.preconditions) html += '<div class="case-row"><span class="case-label">前置</span><span class="case-value">' + escapeHtml(tc.preconditions) + '</span></div>';
       if (tc.steps) html += '<div class="case-row"><span class="case-label">操作</span><div class="case-value">' + formatStepsHtml(tc.steps) + '</div></div>';
       if (tc.expected) html += '<div class="case-row"><span class="case-label">预期</span><div class="case-value">' + formatExpectedHtml(tc.expected) + '</div></div>';
-      if (tc.assertionDesc && tc.assertionDesc !== tc.text && tc.assertionDesc !== tc.title) {
-        html += '<div class="case-row"><span class="case-label">断言</span><span class="case-value">' + escapeHtml(tc.assertionDesc) + '</span></div>';
+      var assertionDesc = getTestCaseAssertion(tc);
+      if (assertionDesc && assertionDesc !== tc.text && assertionDesc !== tc.title) {
+        html += '<div class="case-row"><span class="case-label">断言</span><span class="case-value">' + escapeHtml(assertionDesc) + '</span></div>';
       }
       html += '</div>';
       html += '</div>';
@@ -1130,7 +1261,8 @@ function renderTestReport(result, summary, testCases, assertions) {
   if (assertions.length > 0) {
     var matchedDescs = {};
     for (var i = 0; i < testCases.length; i++) {
-      if (testCases[i].assertionDesc) matchedDescs[testCases[i].assertionDesc] = true;
+      var caseAssertion = getTestCaseAssertion(testCases[i]);
+      if (caseAssertion) matchedDescs[caseAssertion] = true;
     }
     var unmatched = [];
     for (var i = 0; i < assertions.length; i++) {
@@ -1138,13 +1270,16 @@ function renderTestReport(result, summary, testCases, assertions) {
     }
     if (unmatched.length > 0) {
       html += '<div class="report-extra">';
-      html += '<div class="report-extra-title">额外断言 (' + unmatched.length + ')</div>';
+      html += '<button class="report-extra-toggle" data-action="toggle-report-extra" aria-expanded="' + (reportExtraExpanded ? "true" : "false") + '">';
+      html += '<span class="report-extra-arrow">' + (reportExtraExpanded ? "▼" : "▶") + '</span>额外断言 (' + unmatched.length + ')</button>';
+      html += '<div class="report-extra-content' + (reportExtraExpanded ? "" : " collapsed") + '">';
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
         var uIcon = u.outcome === "inconclusive" ? "⚠️" : (u.passed ? "✅" : "❌");
         var uClass = u.outcome === "inconclusive" ? "extra-inconclusive" : (u.passed ? "extra-passed" : "extra-failed");
         html += '<div class="report-extra-item ' + uClass + '"><span>' + uIcon + '</span> ' + escapeHtml(u.description) + '</div>';
       }
+      html += '</div>';
       html += '</div>';
     }
   }
@@ -1286,6 +1421,7 @@ async function runPlan() {
   els.resultArea.innerHTML = "分析中...";
   els.log.textContent = "";
   streamClear();
+  resetContextUsage(config);
 
   log("启动 Plan 模式（测试策略分析）");
   setStatus("Plan 模式启动中...");
@@ -1375,6 +1511,7 @@ async function runAgent() {
   els.resultArea.innerHTML = "运行中...";
   els.log.textContent = "";
   streamClear();
+  resetContextUsage(config);
   activeErrorRunId = "run_" + Date.now();
 
   log("启动 AI Agent Loop");
@@ -1402,6 +1539,7 @@ async function runAgent() {
       els.exportTestReportBtn.disabled = true;
       expandedCases.clear();
       expandedReportCases.clear();
+      reportExtraExpanded = false;
       renderTestResults(testCases, []);
     },
     onAssertion: function (assertion, allAssertions, testCases) {
@@ -1992,7 +2130,10 @@ function exportErrorRecords() {
 }
 
 function exportTestReport(reportOverride) {
-  var reportToExport = reportOverride || lastTestReport;
+  // DOM click handler 会传入 MouseEvent；它不是报告，不能覆盖当前完整报告。
+  var isReport = reportOverride && typeof reportOverride === "object" &&
+    (Array.isArray(reportOverride.testCases) || typeof reportOverride.result === "string" || typeof reportOverride.generatedAt === "string");
+  var reportToExport = isReport ? reportOverride : lastTestReport;
   if (!reportToExport) {
     setStatus("暂无可导出的测试报告");
     return;
@@ -2904,9 +3045,8 @@ async function generateTestCases() {
       "   - 有没有日期选择器、开关、复选框等控件？",
       "7. 识别需要覆盖的 UI 交互场景（loading、防抖、数据刷新、tooltip、空状态等）",
       "8. 识别筛选项的排列组合情况，判断哪些需要逐个测试、哪些只需取典型值",
-      "9. 【关键】对每个用例，分析该用例执行后会对页面状态造成什么副作用，",
-      "   以及如何恢复到初始状态（如：打开了下拉框需要关闭、输入了文本需要清空、",
-      "   切换了筛选需要重置、跳转了页面需要返回）",
+      "9. 【关键】识别哪些用例可共享页面导航、弹窗、筛选条件或列表定位，",
+      "   并标记只有在切换到不兼容场景或全部相关用例完成后才需要清理的状态",
       "10. 【关键】需求符合性分析（必须完成）：",
       "   a. 逐条对照需求，列出需求中明确要求的所有功能（如创建、编辑、删除、搜索、分页等）",
       "   b. 对每个功能，判断页面上应该存在哪些对应的 UI 入口（按钮、链接、输入框等）",
@@ -2918,6 +3058,8 @@ async function generateTestCases() {
       "",
       "### 用例粒度原则（核心）",
       "- 数据验证用例：以「模块 + 接口」为粒度，同一接口返回的多个字段合并到一个用例中验证。",
+      "- 【字段映射强制】凡是验证表格/列表与 API 数据一致的用例，预期结果必须明确写「字段映射：页面列头「任务名称」← API字段 taskName；页面列头「状态」← API字段 status」；映射必须来自需求、源码或 API 字段语义，严禁把名称相近但业务语义不同的字段强行对应。",
+      "- 若无法从需求、源码或 API 响应确定列头与字段的业务语义，生成「字段映射待确认」用例并要求结果为未完成验证，禁止写成数据一致性通过。",
       "- UI 交互用例：必须细化到每个独立的 UI 元素，每个下拉框、搜索框、按钮、Tab 切换、",
       "  分页器、排序按钮等都应有独立用例或明确覆盖。",
       "- 不同模块或不同接口的数据验证，分别用独立用例。",
@@ -2943,7 +3085,7 @@ async function generateTestCases() {
       "- ✅ 5.检查搜索框是否存在 → 验证搜索功能可用",
       "",
       "步骤格式：序号.动作描述 → 验证内容",
-      "多个步骤用 → 连接。恢复步骤以「恢复：」开头。",
+      "多个步骤用 → 连接。不要在单条用例中写「恢复：」步骤；执行器会在相关用例组完成后统一处理场景切换。",
       "",
       "### 操作准确性原则",
       "1. 【源码验证】步骤描述应基于源码中确认存在的交互行为",
@@ -2960,35 +3102,19 @@ async function generateTestCases() {
       "",
 
       "### 用例完整性原则",
-      "每条测试用例必须是自包含的、完整的、可独立执行的。",
-      "「完整」意味着：操作步骤必须覆盖从「开始操作」到「验证结果」再到「恢复初始状态」的全过程。",
+      "每条测试用例必须包含清晰的前置条件、业务操作和可观察的验证结果。",
+      "相关用例会被执行器编排到同一场景连续执行，不要求每条用例都回到初始状态。",
       "",
       "具体要求：",
-      "1. 每条用例的操作步骤必须包含四个阶段：",
+      "1. 每条用例的操作步骤必须包含三个阶段：",
       "   - 操作阶段：描述要执行的动作（如「点击查询按钮」「选择下拉选项」）",
       "   - 数据验证阶段：描述要验证的数据（如「获取 /api/list 接口响应，验证字段完整性」）",
       config.visionSupported
         ? "   - UI 检查阶段：描述要验证的 UI 状态（如「截图验证列表渲染」「检查按钮禁用状态」）"
         : "   - UI 检查阶段：描述要验证的 UI 状态（如「检查列表文本和行数」「检查按钮禁用状态」）",
-      "   - 恢复阶段：将页面状态还原到测试前",
-      "2. 恢复阶段是强制性的。如果用例的操作阶段改变了页面状态，",
-      "   则必须包含恢复步骤，否则用例不完整。",
-      "3. 恢复步骤的判断标准：该用例执行完后，下一个用例能否直接开始？",
-      "   如果不能（因为下拉框还开着、搜索框还有文字、页面已经跳转了等），",
-      "   则说明缺少恢复步骤，用例不完整。",
-      "4. 恢复步骤的常见场景：",
-      "   - 打开了下拉框 → press('Escape') 或 click 空白处关闭",
-      "   - 输入了搜索关键词 → 清空输入框并重新触发加载",
-      "   - 切换了筛选条件 → 重置为默认值（如「全部」）",
-      "   - 切换了 Tab → 切回默认 Tab",
-      "   - 翻到了其他页 → 翻回第1页",
-      "   - 修改了排序 → 取消排序或恢复默认",
-      "   - 选择了日期范围 → 清空日期选择器",
-      "   - 打开了弹窗/抽屉 → 关闭弹窗（X按钮/ESC/遮罩点击）",
-      "   - 页面发生了跳转 → 导航回原页面",
-      "5. 唯一例外：纯只读验证用例（仅 scroll/get_network_responses/eval_in_page 查看数据，",
-      "   没有任何 click/type/press 操作改变页面状态）可以不包含恢复步骤。",
-      "6. 恢复步骤格式与普通步骤相同，目的说明以「恢复：」开头，便于执行 Agent 识别。",
+      "2. 不要添加「恢复：」或「清空并回到默认状态」等步骤。执行前会先分析用例相关性，",
+      "   相关用例会连续复用当前状态；只有执行器在切换到不兼容场景时才决定是否清理。",
+      "3. 若后续验证依赖当前筛选、弹窗或编辑结果，应在前置条件中写明该状态，而不是要求恢复。",
       "",
       "### UI 检查要求（必须包含）",
       "每条涉及用户操作的用例，在操作后必须包含 UI 检查步骤，验证页面 UI 状态正常。",
@@ -3095,7 +3221,7 @@ async function generateTestCases() {
         "示例：2.[verify_ui]() 检查下拉选项展示是否正确，CSS 无异常",
         "",
         "【视觉验证用例示例】",
-        "TC1,下拉筛选搜索功能,XX页面,已进入XX页面,\"1.点击筛选下拉框，选择「选项A」 → 2.截图验证下拉选项展示是否正确，CSS 无异常 → 3.点击查询按钮 → 4.获取 /api/list 接口响应，验证查询结果 → 5.截图验证列表数据展示是否正确 → 恢复：6.重置筛选条件为「全部」 → 7.点击查询按钮恢复初始状态\",下拉框展开正常，选项展示正确；筛选后列表数据刷新；API返回数据完整",
+        "TC1,下拉筛选搜索功能,XX页面,已进入XX页面,\"1.点击筛选下拉框，选择「选项A」 → 2.截图验证下拉选项展示是否正确，CSS 无异常 → 3.点击查询按钮 → 4.获取 /api/list 接口响应，验证查询结果 → 5.截图验证列表数据展示是否正确\",下拉框展开正常，选项展示正确；筛选后列表数据刷新；API返回数据完整",
         "",
       );
     }
@@ -3150,16 +3276,16 @@ async function generateTestCases() {
       "### 示例",
       "TC1,菜单显示及顺序,运维排障-可观测性菜单,已登录系统,\"1.展开侧边栏运维部署菜单 → 2.等待子菜单展开 → 3.点击可观测性菜单 → 4.等待页面加载 → 5.获取 /api/menu/list 接口响应，验证菜单数据完整\",菜单项数量≥1；API返回菜单数据完整；页面展示菜单文本与API一致",
       "TC2,实例-资源模块数据展示,运营概览页面,已进入运营概览页面,\"1.滚动到实例-资源模块 → 2.等待渲染完成 → 3.获取 /api/resource/overview 接口响应，验证各字段数据有效且页面展示一致\",API各字段（总数/已用/剩余/使用率）须有有效值且页面展示一致；使用率数值=已用/总数×100%",
-      "TC3,漏斗按钮交互与跳转,运营概览页面,已进入运营概览页面,\"1.鼠标悬停漏斗按钮 → 2.等待tooltip出现 → 3.检查tooltip是否出现 → 4.点击漏斗按钮 → 5.等待页面跳转 → 6.获取 /api/resource/stat 接口响应，验证跳转后页面数据 → 恢复：7.点击面包屑返回运营概览页面 → 8.等待页面加载\",hover显示tooltip「下钻分析」；tooltip元素存在；点击后跳转至资源运营统计页面；按钮有权限时可点击",
-      "TC4,资源下钻筛选与数据加载,运营概览页面,已进入运营概览页面,\"1.选择筛选下拉框的第二个选项 → 2.等待数据刷新 → 3.检查当前选中项有高亮 → 4.获取 /api/resource/list 接口响应，验证刷新后列表数据 → 恢复：5.重置筛选为全部 → 6.等待数据恢复\",下拉框默认全部；选中项有.is-active高亮；切换筛选后列表数据刷新；API返回数据完整",
+      "TC3,漏斗按钮交互与跳转,运营概览页面,已进入运营概览页面,\"1.鼠标悬停漏斗按钮 → 2.等待tooltip出现 → 3.检查tooltip是否出现 → 4.点击漏斗按钮 → 5.等待页面跳转 → 6.获取 /api/resource/stat 接口响应，验证跳转后页面数据\",hover显示tooltip「下钻分析」；tooltip元素存在；点击后跳转至资源运营统计页面；按钮有权限时可点击",
+      "TC4,资源下钻筛选与数据加载,资源运营统计页面,已从运营概览下钻至资源运营统计页面,\"1.选择筛选下拉框的第二个选项 → 2.等待数据刷新 → 3.检查当前选中项有高亮 → 4.获取 /api/resource/list 接口响应，验证刷新后列表数据\",下拉框默认全部；选中项有.is-active高亮；切换筛选后列表数据刷新；API返回数据完整",
       "TC5,趋势分析图表展示,运营概览页面,已进入运营概览页面,\"1.滚动到趋势分析模块 → 2.等待图表渲染 → 3.获取 /api/trend/data 接口响应，验证趋势数据 → 4.鼠标悬停图表触发tooltip → 5.等待tooltip出现\",API返回趋势数据各时间点字段须有有效值；图表正确渲染；hover节点显示对应数值tooltip",
-      "TC6,资源类型下拉框筛选,资源运营统计页面,已进入资源运营统计页面,\"1.选择资源类型下拉框的第二个选项 → 2.等待数据刷新 → 3.获取 /api/resource/stat 接口响应，验证刷新后数据 → 恢复：4.重置为全部 → 5.等待数据恢复\",下拉框可展开；选项数量≥2；切换后列表数据刷新；API返回数据完整",
-      "TC7,关键词搜索功能,资源运营统计页面,已进入资源运营统计页面,\"1.在搜索框输入「测试主机」 → 2.点击搜索按钮 → 3.等待搜索结果 → 4.获取 /api/resource/stat 接口响应，验证搜索结果 → 恢复：5.清空搜索框 → 6.点击搜索按钮重新加载全部数据 → 7.等待数据恢复\",搜索后返回匹配结果；API请求参数包含关键词；清空后恢复全部数据",
-      "TC8,分页器翻页功能,资源运营统计页面,已进入资源运营统计页面且数据>1页,\"1.滚动到分页器 → 2.点击第2页 → 3.等待数据加载 → 4.获取 /api/resource/stat 接口响应，验证第2页数据 → 5.点击每页条数选择 → 6.选择50条/页 → 7.等待刷新 → 8.获取 /api/resource/stat 接口响应，验证刷新后数据 → 恢复：9.翻回第1页 → 10.选择默认条数 → 11.等待恢复\",总条数显示正确；翻页后API参数含pageNum=2；切换条数后API参数含pageSize=50；loading状态正确",
-      "TC9,表格排序功能,资源运营统计页面,已进入资源运营统计页面,\"1.点击第3列表头排序 → 2.等待排序完成 → 3.获取排序后第3列数据验证排序 → 4.再次点击切换排序方向 → 5.等待排序 → 6.获取 /api/resource/stat 接口响应，验证排序API参数 → 恢复：7.再次点击取消排序\",第一次点击升序排列；第二次点击降序排列；API请求参数含sortField和sortOrder",
-      "TC10,日期范围选择器,资源运营统计页面,已进入资源运营统计页面,\"1.点击日期选择器 → 2.等待面板展开 → 3.选择开始日期 → 4.选择结束日期 → 5.等待数据刷新 → 6.获取 /api/resource/stat 接口响应，验证日期筛选参数 → 7.点击快捷选项「最近7天」 → 8.等待刷新 → 9.获取 /api/resource/stat 接口响应，验证刷新后数据 → 恢复：10.清空日期选择 → 11.等待数据恢复\",日期面板可展开；选择后API参数含startDate/endDate；快捷选项正确切换日期范围；页面展示日期与选择一致",
+      "TC6,资源类型下拉框筛选,资源运营统计页面,已进入资源运营统计页面,\"1.选择资源类型下拉框的第二个选项 → 2.等待数据刷新 → 3.获取 /api/resource/stat 接口响应，验证刷新后数据\",下拉框可展开；选项数量≥2；切换后列表数据刷新；API返回数据完整",
+      "TC7,关键词搜索功能,资源运营统计页面,已选择资源类型筛选条件,\"1.在搜索框输入「测试主机」 → 2.点击搜索按钮 → 3.等待搜索结果 → 4.获取 /api/resource/stat 接口响应，验证搜索结果\",搜索后返回匹配结果；API请求参数包含关键词",
+      "TC8,分页器翻页功能,资源运营统计页面,当前筛选结果数据>1页,\"1.滚动到分页器 → 2.点击第2页 → 3.等待数据加载 → 4.获取 /api/resource/stat 接口响应，验证第2页数据 → 5.点击每页条数选择 → 6.选择50条/页 → 7.等待刷新 → 8.获取 /api/resource/stat 接口响应，验证刷新后数据\",总条数显示正确；翻页后API参数含pageNum=2；切换条数后API参数含pageSize=50；loading状态正确",
+      "TC9,表格排序功能,资源运营统计页面,当前列表已加载,\"1.点击第3列表头排序 → 2.等待排序完成 → 3.获取排序后第3列数据验证排序 → 4.再次点击切换排序方向 → 5.等待排序 → 6.获取 /api/resource/stat 接口响应，验证排序API参数\",第一次点击升序排列；第二次点击降序排列；API请求参数含sortField和sortOrder",
+      "TC10,日期范围选择器,资源运营统计页面,当前列表已加载,\"1.点击日期选择器 → 2.等待面板展开 → 3.选择开始日期 → 4.选择结束日期 → 5.等待数据刷新 → 6.获取 /api/resource/stat 接口响应，验证日期筛选参数 → 7.点击快捷选项「最近7天」 → 8.等待刷新 → 9.获取 /api/resource/stat 接口响应，验证刷新后数据\",日期面板可展开；选择后API参数含startDate/endDate；快捷选项正确切换日期范围；页面展示日期与选择一致",
       "TC11,导出按钮功能,资源运营统计页面,已进入资源运营统计页面,\"1.点击导出按钮 → 2.等待操作完成 → 3.检查是否出现操作提示消息 → 4.获取 /api/resource/export 接口响应，验证导出请求\",按钮可点击；点击后显示loading；导出成功后显示提示消息；API请求参数正确",
-      "TC12,空数据状态展示,资源运营统计页面,已进入资源运营统计页面,\"1.在搜索框输入「ZZZZZ不存在的数据」 → 2.点击搜索按钮 → 3.等待结果 → 4.检查空状态组件是否显示 → 5.获取 /api/resource/stat 接口响应，验证返回空列表 → 恢复：6.清空搜索框 → 7.点击搜索按钮重新加载全部数据 → 8.等待数据恢复\",搜索无结果时显示空状态；空状态组件.el-empty存在；API返回空数组",
+      "TC12,空数据状态展示,资源运营统计页面,当前筛选结果已加载,\"1.在搜索框输入「ZZZZZ不存在的数据」 → 2.点击搜索按钮 → 3.等待结果 → 4.检查空状态组件是否显示 → 5.获取 /api/resource/stat 接口响应，验证返回空列表\",搜索无结果时显示空状态；空状态组件.el-empty存在；API返回空数组",
       "TC13,需求符合性-功能完整性检查,资源运营统计页面,已进入资源运营统计页面,\"1.获取页面上所有按钮文本列表 → 2.检查搜索框是否存在 → 3.检查分页器是否存在 → 4.检查表格是否存在 → 5.获取表格行内操作按钮列表\",需求要求的「搜索」「分页」「表格展示」功能均存在；表格行内操作按钮包含需求要求的「编辑」「删除」；无功能缺失",
       "TC14,需求符合性-多余功能检查,资源运营统计页面,已进入资源运营统计页面,\"1.检查是否存在导出按钮 → 2.检查是否存在批量操作按钮 → 3.检查是否存在打印按钮 → 4.获取所有按钮文本用于对比\",需求未要求的导出按钮不存在；需求未要求的批量操作按钮不存在；需求未要求的打印按钮不存在；页面上所有功能按钮均在需求范围内",
       "",
@@ -3194,9 +3320,8 @@ async function generateTestCases() {
       "      （交互状态/可见性/样式/布局检查，见上方「UI 检查要求」）",
       "   h. 多个步骤用 → 连接，形成完整操作链",
       "   i. 步骤数量适中（4-15步），含 UI 检查步骤，不要过少也不要过多",
-      "   j. 【完整性强制】操作步骤必须包含恢复阶段（见上方「用例完整性原则」）。",
-      "      生成每条用例后，自检：该用例执行完后页面是否恢复到初始状态？",
-      "      如果没有，补充恢复步骤。不完整的用例视为不合格。",
+      "   j. 【连续执行】严禁在步骤中添加恢复、清空、重置默认值或返回原页等清理动作；",
+      "      除非该动作本身就是当前用例要验证的业务功能。",
       "6. 【预期结果可验证】预期结果必须包含具体的可观察现象：",
       "   a. 页面显示什么文本/数值/图表",
       "   b. 涉及数据的用例，列出需验证的 API 字段名，注明字段值不能为空且页面展示须一致",
@@ -3255,7 +3380,7 @@ async function generateTestCases() {
       "   c. 操作步骤：通过 eval_in_page 检查页面上是否存在对应的功能按钮/入口，",
       "      可用 document.querySelectorAll 获取所有按钮文本列表进行逐一对比",
       "   d. 预期结果：明确列出需求要求的功能清单，以及页面上不应存在的功能清单，逐一对比",
-      "   e. 这类用例通常是只读检查，不需要恢复步骤",
+      "   e. 这类用例通常是只读检查，不需要额外场景清理",
       "10. 【UI 交互用例占比】UI 交互相关验证应占总用例的 50%-60%，",
       "   确保每个 UI 元素都有对应测试覆盖",
       "11. 【严格数据验证】涉及数据展示的用例，预期结果中必须明确：",
@@ -3565,7 +3690,7 @@ els.archFileInput.addEventListener("change", handleArchFileImport);
 els.clearCacheBtn.addEventListener("click", clearArchCache);
 els.exportArchBtn.addEventListener("click", exportArchitecture);
 els.exportTestCasesBtn.addEventListener("click", exportTestCases);
-els.exportTestReportBtn.addEventListener("click", exportTestReport);
+els.exportTestReportBtn.addEventListener("click", function () { exportTestReport(); });
 els.clearRunHistoryBtn.addEventListener("click", clearRunHistory);
 els.runHistoryList.addEventListener("click", function(event) {
   var viewButton = event.target.closest("[data-report-view]");
@@ -3633,6 +3758,13 @@ els.resultArea.addEventListener("click", function (e) {
         expandedReportCases.add(tc.id || tc.title || tc.text);
       });
     }
+    els.resultArea.innerHTML = renderTestReport(lastReportResult, lastReportSummary, testCasesState, currentAssertions);
+    return;
+  }
+
+  var toggleReportExtraBtn = e.target.closest("[data-action='toggle-report-extra']");
+  if (toggleReportExtraBtn) {
+    reportExtraExpanded = !reportExtraExpanded;
     els.resultArea.innerHTML = renderTestReport(lastReportResult, lastReportSummary, testCasesState, currentAssertions);
     return;
   }

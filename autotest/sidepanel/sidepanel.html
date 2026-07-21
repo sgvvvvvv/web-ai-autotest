@@ -132,6 +132,12 @@
       <div class="stream-header">
         <h2>AI 思考与响应</h2>
         <div class="stream-actions">
+          <div id="contextMeter" class="context-meter" title="根据本次请求中的文本消息和工具定义估算；图片 token 由模型服务端计算，未计入。">
+            <span id="contextMeterLabel" class="context-meter-label">上下文 --</span>
+            <span class="context-meter-track" role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span id="contextMeterBar" class="context-meter-bar"></span>
+            </span>
+          </div>
           <button id="abortBtn" class="btn btn-danger btn-abort" disabled>中止</button>
           <button id="continueBtn" class="btn btn-primary btn-abort" disabled style="display:none;">继续</button>
         </div>

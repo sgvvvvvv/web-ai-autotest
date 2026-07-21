@@ -54,9 +54,52 @@
     return Object.keys(groups).map(function (id) { return groups[id]; });
   }
 
+  // 只接受每个 TC 恰好出现一次的 AI 计划，避免模型输出导致漏测或重复执行。
+  function applyAiPlan(testCases, plan) {
+    var cases = testCases || [];
+    var groups = plan && plan.groups;
+    if (!Array.isArray(groups) || groups.length === 0 || cases.length === 0) return null;
+    var byId = {};
+    cases.forEach(function(testCase) { byId[testCase.id] = testCase; });
+    var seen = {};
+    var ordered = [];
+    var normalizedPlan = [];
+    for (var gi = 0; gi < groups.length; gi++) {
+      var group = groups[gi] || {};
+      var caseIds = Array.isArray(group.caseIds) ? group.caseIds : group.cases;
+      if (!Array.isArray(caseIds) || caseIds.length === 0) return null;
+      var scenarioId = "SC" + (gi + 1);
+      var title = String(group.title || group.name || "相关用例组 " + (gi + 1)).trim();
+      var normalizedIds = [];
+      for (var ci = 0; ci < caseIds.length; ci++) {
+        var id = String(caseIds[ci] || "").trim();
+        if (!id || !byId[id] || seen[id]) return null;
+        seen[id] = true;
+        var testCase = byId[id];
+        ordered.push(testCase);
+        normalizedIds.push(id);
+      }
+      normalizedPlan.push({ id: scenarioId, title: title, cases: normalizedIds, rationale: String(group.rationale || "").trim() });
+    }
+    if (ordered.length !== cases.length) return null;
+    // 所有编号已校验完成后才写入，确保无效计划不会污染本地兜底分组。
+    normalizedPlan.forEach(function(group) {
+      group.cases.forEach(function(id) {
+        var testCase = byId[id];
+        testCase.scenarioId = group.id;
+        testCase.scenarioTitle = group.title;
+        testCase.scenarioKey = "ai:" + group.id;
+        testCase.scenarioBaseKey = testCase.scenarioKey;
+      });
+    });
+    cases.splice.apply(cases, [0, cases.length].concat(ordered));
+    return normalizedPlan;
+  }
+
   global.AIFT_TestScheduler = {
     assignScenarios: assignScenarios,
     buildPlan: buildPlan,
+    applyAiPlan: applyAiPlan,
     isStateChanging: isStateChanging,
   };
 })(window);
