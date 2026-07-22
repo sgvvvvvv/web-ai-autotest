@@ -18,6 +18,10 @@ function assertSidePanelDomContract() {
   ids.forEach(function(id) {
     assert.ok(html.indexOf('id="' + id + '"') !== -1, "Side Panel 缺少元素: " + id);
   });
+  assert.ok(/id="archResult"[^>]*hidden/.test(html), "架构分析内容应默认折叠");
+  assert.ok(/id="testCasesContent"[^>]*hidden/.test(html), "测试用例内容应默认折叠");
+  assert.ok(/archSectionToggle[\s\S]*aria-controls="archResult"/.test(html), "架构分析标题应可展开内容");
+  assert.ok(/testCasesSectionToggle[\s\S]*aria-controls="testCasesContent"/.test(html), "测试用例标题应可展开内容");
 }
 
 async function run() {
@@ -30,9 +34,13 @@ async function run() {
   assert.strictEqual(/AI 调用了 finish，对话已暂停/.test(agentLoopSource), false, "finish 不应暂停等待用户手动停止");
   assert.ok(/MAX_REASONING_TIME_MS = 600000/.test(aiClientSource), "推理时间上限应为 600 秒");
   assert.ok(/Math\.max\(options\.timeout \|\| DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS\)/.test(aiClientSource), "短请求超时不能早于推理时间上限");
+  const projectAnalyzerSource = fs.readFileSync(path.join(__dirname, "..", "core", "project-analyzer.js"), "utf8");
+  assert.ok(/var conversation = \[\{ role: "user", content: prompt \}\];[\s\S]*?while \(true\)/.test(projectAnalyzerSource), "单轮架构分析必须在用户输入后保留上下文并重新请求");
+  assert.ok(/state\.userInjecting[\s\S]*?planMessages\.push\(\{ role: "user", content: injectedMsg \}\)/.test(agentLoopSource), "Plan 模式必须在用户输入后保留上下文并重新请求");
   const analyzeArchitectureSource = sidePanelSource.match(/async function analyzeArchitecture\(\) \{([\s\S]*?)\n\}\n\nasync function clearArchCache/);
   assert.ok(analyzeArchitectureSource, "应保留架构分析入口");
   assert.strictEqual(/await showPromptDialog\(/.test(analyzeArchitectureSource[1]), false, "分析架构不能等待可选提示词确认");
+  assert.strictEqual(/当前阶段不支持接续对话/.test(analyzeArchitectureSource[1]), false, "架构分析必须支持用户消息接续上下文");
   const context = vm.createContext({ window: {}, URL: URL });
   loadModule("source-reader.js", context);
   loadModule("interaction-contract.js", context);

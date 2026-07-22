@@ -2158,20 +2158,44 @@
     log("调用 AI 单轮分析...");
     stream("info", "## AI 架构分析（单轮）\n\n");
 
-    var result = await global.AIFT_AIClient.chatStream(
-      config,
-      [{ role: "user", content: prompt }],
-      [],
-      {
-        timeout: 120000,
-        maxRetries: 3,
-        signal: getSignal(),
-        onDelta: function (type, content) {
-          if (type === "content") stream("content", content);
-          else if (type === "reasoning") stream("reasoning", content);
-        },
+    // Keep every user intervention in the conversation and retry until a request completes.
+    // An intervention aborts only the in-flight request; it must not discard this analysis.
+    var conversation = [{ role: "user", content: prompt }];
+    var result;
+    while (true) {
+      try {
+        result = await global.AIFT_AIClient.chatStream(
+          config,
+          conversation,
+          [],
+          {
+            timeout: 120000,
+            maxRetries: 3,
+            signal: getSignal(),
+            onDelta: function (type, content) {
+              if (type === "content") stream("content", content);
+              else if (type === "reasoning") stream("reasoning", content);
+            },
+          }
+        );
+        break;
+      } catch (e) {
+        if (e.name === "UserAbortError" && pauseState && pauseState.userInjecting && !pauseState.aborted) {
+          var injectedMsg = pauseState.consumeUserMessage();
+          if (injectedMsg) {
+            conversation.push({ role: "user", content: "📋 用户补充指令：" + injectedMsg + "\n请立即根据以上指令调整你的分析。" });
+          }
+          stream("info", "💡 用户消息已注入（最高优先级），重新发起请求...\n");
+          continue;
+        }
+        if (e.name === "UserAbortError" && pauseState && pauseState.paused && !pauseState.aborted) {
+          stream("info", "⏸️ 已暂停，点击「继续」恢复执行");
+          await pauseState.waitForResume();
+          if (!pauseState.aborted) continue;
+        }
+        throw e;
       }
-    );
+    }
 
     var text = (result.message.content || "").trim();
     var jsonStart = text.indexOf("{");

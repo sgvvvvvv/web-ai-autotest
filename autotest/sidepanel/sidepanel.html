@@ -79,7 +79,7 @@
 
     <!-- 步骤 3：架构分析 -->
     <section class="card" id="card-step3">
-      <h2>③ 项目架构分析</h2>
+      <h2 id="archSectionToggle" class="collapsible-title" role="button" tabindex="0" aria-expanded="false" aria-controls="archResult">③ 项目架构分析<span class="collapse-indicator" aria-hidden="true"></span></h2>
       <div class="row">
         <span class="btn-tooltip-wrap">
           <button id="analyzeBtn" class="btn btn-primary" disabled>分析架构</button>
@@ -91,16 +91,15 @@
         <span id="archCacheInfo" class="status">未分析</span>
       </div>
       <input id="archFileInput" type="file" accept=".md,.txt,.json" style="display:none;" />
-      <div id="archResult" class="arch-result">
+      <div id="archResult" class="arch-result collapsible-content" hidden>
         <div class="arch-empty">上传源码后点击「分析架构」，或点击「导入架构文档」导入已有的分析结果。</div>
       </div>
     </section>
 
     <!-- 步骤 4：测试用例 -->
     <section class="card" id="card-step4">
-      <h2>④ 测试用例</h2>
+      <h2 id="testCasesSectionToggle" class="collapsible-title" role="button" tabindex="0" aria-expanded="false" aria-controls="testCasesContent">④ 测试用例<span class="collapse-indicator" aria-hidden="true"></span></h2>
       <div class="field">
-        <label for="testCases">测试用例</label>
         <div class="row" style="margin-bottom: 6px;">
           <span class="btn-tooltip-wrap">
             <button id="genTestCasesBtn" class="btn btn-primary btn-sm" disabled>AI 生成（基于需求+架构）</button>
@@ -108,7 +107,10 @@
           </span>
           <button id="exportTestCasesBtn" class="btn btn-secondary btn-sm" disabled>导出用例</button>
         </div>
-        <textarea id="testCases" rows="6" placeholder="点击「AI 生成」自动生成，或手动输入测试用例..."></textarea>
+        <div id="testCasesContent" class="collapsible-content" hidden>
+          <label for="testCases">测试用例</label>
+          <textarea id="testCases" rows="6" placeholder="点击「AI 生成」自动生成，或手动输入测试用例..."></textarea>
+        </div>
       </div>
     </section>
 

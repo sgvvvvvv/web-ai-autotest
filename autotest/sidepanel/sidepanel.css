@@ -32,6 +32,16 @@ body {
   padding: 8px; border: 1px dashed #d9dce1; border-radius: 4px;
   max-height: 400px; overflow-y: auto;
 }
+.collapsible-content[hidden] { display: none; }
+.collapsible-content:not([hidden]) { margin-top: 10px; }
+.collapsible-title { cursor: pointer; display: flex; align-items: center; justify-content: space-between; }
+.collapsible-title:focus-visible { outline: 2px solid #3b47c7; outline-offset: 3px; border-radius: 2px; }
+.collapse-indicator {
+  width: 7px; height: 7px; margin-right: 3px; flex: 0 0 auto;
+  border-right: 1px solid currentColor; border-bottom: 1px solid currentColor;
+  transform: rotate(45deg) translate(-2px, -2px); transition: transform 0.15s ease;
+}
+.collapsible-title[aria-expanded="true"] .collapse-indicator { transform: rotate(225deg) translate(-2px, -2px); }
 .arch-empty { color: #999; font-style: italic; }
 .arch-section { margin-bottom: 10px; }
 .arch-section-title {

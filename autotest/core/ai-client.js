@@ -615,10 +615,9 @@
    * 将文本和图片组合成 OpenAI 兼容的 content 数组格式
    * @param {string} text - 文本部分
    * @param {string} imageDataUrl - data URL 格式的图片（data:image/png;base64,...）
-   * @param {string} imageDetail - 图片细节级别："low" | "high" | "auto"
    * @returns {Array} content 数组
    */
-  function buildVisionContent(text, imageDataUrl, imageDetail) {
+  function buildVisionContent(text, imageDataUrl) {
     var content = [];
     if (text) {
       content.push({ type: "text", text: text });
@@ -628,7 +627,6 @@
         type: "image_url",
         image_url: {
           url: imageDataUrl,
-          detail: imageDetail || "high",
         },
       });
     }
@@ -644,7 +642,7 @@
   function buildVisionMessage(text, imageDataUrl) {
     return {
       role: "user",
-      content: buildVisionContent(text, imageDataUrl, "high"),
+      content: buildVisionContent(text, imageDataUrl),
     };
   }
 

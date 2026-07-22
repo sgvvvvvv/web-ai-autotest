@@ -105,9 +105,12 @@ const els = {
   clearCacheBtn: document.getElementById("clearCacheBtn"),
   archCacheInfo: document.getElementById("archCacheInfo"),
   archResult: document.getElementById("archResult"),
+  archSectionToggle: document.getElementById("archSectionToggle"),
   exportArchBtn: document.getElementById("exportArchBtn"),
   // 测试用例导出
   exportTestCasesBtn: document.getElementById("exportTestCasesBtn"),
+  testCasesContent: document.getElementById("testCasesContent"),
+  testCasesSectionToggle: document.getElementById("testCasesSectionToggle"),
   exportTestReportBtn: document.getElementById("exportTestReportBtn"),
   runHistoryCount: document.getElementById("runHistoryCount"),
   runHistoryList: document.getElementById("runHistoryList"),
@@ -558,6 +561,23 @@ function log(msg) {
 
 function setStatus(s) {
   els.status.textContent = s;
+}
+
+function setContentExpanded(content, trigger, expanded) {
+  content.hidden = !expanded;
+  trigger.setAttribute("aria-expanded", String(expanded));
+}
+
+function bindSectionToggle(trigger, content) {
+  function toggle() {
+    setContentExpanded(content, trigger, content.hidden);
+  }
+  trigger.addEventListener("click", toggle);
+  trigger.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    toggle();
+  });
 }
 
 // ---- 提示词输入弹框 ----
@@ -2013,18 +2033,7 @@ async function analyzeArchitecture() {
     }
     setStatus("架构分析完成");
   } catch (e) {
-    // 用户注入消息 → 单轮分析降级时可能抛出（多轮已内部处理）
-    if (e.name === "UserAbortError" && pauseState.userInjecting && !pauseState.aborted) {
-      log("用户消息已注入，但当前阶段不支持接续对话，请重新执行");
-      pauseState.consumeUserMessage();
-      setStatus("请重新执行当前操作");
-      streamAppend("warning", "⚠️ 用户消息已接收，但当前操作无法接续对话，请重新执行");
-      if (archAnalysis) {
-        renderArchResult(archAnalysis);
-      } else {
-        els.archResult.innerHTML = '<div class="arch-empty">已接收用户消息，请重新点击「分析架构」。</div>';
-      }
-    } else if (e.name === "UserAbortError" || isPhaseAborted()) {
+    if (e.name === "UserAbortError" || isPhaseAborted()) {
       log("架构分析已被用户中止");
       setStatus("已中止");
       streamAppend("warning", "⚠️ 架构分析已被用户中止");
@@ -3718,6 +3727,8 @@ els.chatInput.addEventListener("keydown", function (e) {
 els.genTestCasesBtn.addEventListener("click", generateTestCases);
 els.sourceUpload.addEventListener("change", handleSourceUpload);
 els.analyzeBtn.addEventListener("click", analyzeArchitecture);
+bindSectionToggle(els.archSectionToggle, els.archResult);
+bindSectionToggle(els.testCasesSectionToggle, els.testCasesContent);
 els.importArchBtn.addEventListener("click", function () { els.archFileInput.click(); });
 els.archFileInput.addEventListener("change", handleArchFileImport);
 els.clearCacheBtn.addEventListener("click", clearArchCache);

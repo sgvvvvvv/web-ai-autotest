@@ -2414,32 +2414,43 @@
         setStatus("AI 分析中...");
         stream("info", "📋 Plan 模式：AI 正在分析测试策略...");
 
-        state.abortController = new AbortController();
         var aiResult;
-        try {
-          aiResult = await global.AIFT_AIClient.chatStream(
-            deps.config, planMessages, [],
-            {
-              timeout: 120000,
-              maxRetries: 3,
-              signal: state.abortController.signal,
-              onDelta: function (type, content) {
-                if (type === "reasoning") stream("reasoning", content);
-                else if (type === "content") stream("content", content);
-              },
+        while (true) {
+          state.abortController = new AbortController();
+          try {
+            aiResult = await global.AIFT_AIClient.chatStream(
+              deps.config, planMessages, [],
+              {
+                timeout: 120000,
+                maxRetries: 3,
+                signal: state.abortController.signal,
+                onDelta: function (type, content) {
+                  if (type === "reasoning") stream("reasoning", content);
+                  else if (type === "content") stream("content", content);
+                },
+              }
+            );
+            break;
+          } catch (e) {
+            if (e.name === "UserAbortError" && state.userInjecting && !state.aborted) {
+              var injectedMsg = state.userIntervention;
+              state.userIntervention = null;
+              state.userInjecting = false;
+              if (injectedMsg) planMessages.push({ role: "user", content: injectedMsg });
+              stream("info", "💡 用户消息已注入（最高优先级），重新发起请求...");
+              continue;
             }
-          );
-        } catch (e) {
-          if (e.name === "UserAbortError" || state.aborted) {
-            log("Plan 模式被用户中止");
-            if (deps.onFinish) deps.onFinish("aborted", "Plan 被中止", [], []);
+            if (e.name === "UserAbortError" || state.aborted) {
+              log("Plan 模式被用户中止");
+              if (deps.onFinish) deps.onFinish("aborted", "Plan 被中止", [], []);
+              return;
+            }
+            log("Plan 模式 AI 调用失败: " + (e.message || e));
+            if (deps.onFinish) deps.onFinish("error", "Plan 失败: " + (e.message || e), [], []);
             return;
+          } finally {
+            state.abortController = null;
           }
-          log("Plan 模式 AI 调用失败: " + (e.message || e));
-          if (deps.onFinish) deps.onFinish("error", "Plan 失败: " + (e.message || e), [], []);
-          return;
-        } finally {
-          state.abortController = null;
         }
 
         var planResult = (aiResult.message && aiResult.message.content) || "";
