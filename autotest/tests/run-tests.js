@@ -23,9 +23,16 @@ function assertSidePanelDomContract() {
 async function run() {
   assertSidePanelDomContract();
   const agentLoopSource = fs.readFileSync(path.join(__dirname, "..", "core", "agent-loop.js"), "utf8");
+  const aiClientSource = fs.readFileSync(path.join(__dirname, "..", "core", "ai-client.js"), "utf8");
+  const sidePanelSource = fs.readFileSync(path.join(__dirname, "..", "sidepanel", "sidepanel.js"), "utf8");
   assert.strictEqual(/AIFT_AIClient\.chat\(/.test(agentLoopSource), false, "Agent Loop 的 AI 请求必须使用流式 chatStream");
   assert.ok(/case "finish":\s*[\s\S]*?state\.finished = true;/.test(agentLoopSource), "AI 调用 finish 后必须立即结束测试");
   assert.strictEqual(/AI 调用了 finish，对话已暂停/.test(agentLoopSource), false, "finish 不应暂停等待用户手动停止");
+  assert.ok(/MAX_REASONING_TIME_MS = 600000/.test(aiClientSource), "推理时间上限应为 600 秒");
+  assert.ok(/Math\.max\(options\.timeout \|\| DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS\)/.test(aiClientSource), "短请求超时不能早于推理时间上限");
+  const analyzeArchitectureSource = sidePanelSource.match(/async function analyzeArchitecture\(\) \{([\s\S]*?)\n\}\n\nasync function clearArchCache/);
+  assert.ok(analyzeArchitectureSource, "应保留架构分析入口");
+  assert.strictEqual(/await showPromptDialog\(/.test(analyzeArchitectureSource[1]), false, "分析架构不能等待可选提示词确认");
   const context = vm.createContext({ window: {}, URL: URL });
   loadModule("source-reader.js", context);
   loadModule("interaction-contract.js", context);
@@ -56,6 +63,39 @@ async function run() {
   const analyzer = context.window.AIFT_SourceAnalyzer;
   const promptBuilder = context.window.AIFT_PromptBuilder;
   const visualController = context.window.AIFT_VisualController;
+
+  // 流式响应可能没有结尾换行；最后一个 delta 仍必须被解析。
+  const aiCalls = [];
+  const aiContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function (url, options) {
+      aiCalls.push(JSON.parse(options.body));
+      if (aiCalls.length === 1) {
+        return { ok: false, status: 400, statusText: "Bad Request", json: async function () { return { error: { message: "thinking unsupported" } }; } };
+      }
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "click", arguments: JSON.stringify({ x: 1 }) } }] } }] });
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; } };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", aiContext);
+  const aiConfig = { apiUrl: "https://example.com/v1", apiKey: "key", model: "demo", enableThinking: true };
+  const streamResult = await aiContext.window.AIFT_AIClient.chatStream(aiConfig, [{ role: "user", content: "go" }], [], { maxRetries: 1 });
+  assert.strictEqual(streamResult.message.tool_calls[0].function.arguments, '{"x":1}');
+  assert.strictEqual(aiConfig.enableThinking, true, "thinking 降级不能改写调用方配置");
+  assert.strictEqual(aiCalls[1].thinking, undefined, "降级重试应移除 thinking 参数");
 
   const files = {
     "views/dashboard/Overview.vue": "<template><h1>Overview</h1></template>",

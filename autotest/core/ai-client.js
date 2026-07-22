@@ -5,7 +5,7 @@
 (function (global) {
   "use strict";
 
-  var DEFAULT_TIMEOUT = 60000; // 60s
+  var DEFAULT_TIMEOUT = 600000; // 600s
   var DEFAULT_MAX_RETRIES = 3;
   var RETRY_DELAY_BASE = 2000; // 基础延迟 2s，指数退避
 
@@ -22,7 +22,7 @@
   var FUZZY_SIG_LEN = 100;            // 特征签名长度（更长 = 更严格）
 
   // === 流内总量上限配置 ===
-  var MAX_REASONING_TIME_MS = 300000; // reasoning 阶段最大持续时间 5 分钟，超过后优雅截断
+  var MAX_REASONING_TIME_MS = 600000; // reasoning 阶段最大持续时间 600 秒，超过后优雅截断
 
   /**
    * 检测文本中是否存在重复段落（精确匹配，带滑动窗口）
@@ -100,7 +100,8 @@
    */
   async function chat(config, messages, tools, options) {
     options = options || {};
-    var timeout = options.timeout || DEFAULT_TIMEOUT;
+    // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
+    var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
     var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
 
     var url = config.apiUrl.replace(/\/+$/, "") + "/chat/completions";
@@ -155,7 +156,6 @@
           });
         } finally {
           clearTimeout(timer);
-          if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         }
 
         if (!resp.ok) {
@@ -184,9 +184,11 @@
         if (attempt > 0) {
           console.warn("[AIFT] 第 " + (attempt + 1) + " 次尝试成功（前 " + attempt + " 次失败）");
         }
+        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         return { message: message, raw: data };
 
       } catch (e) {
+        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         // 不可重试的错误直接抛出
         if (e.name === "NonRetryableError") {
           throw new Error(e.message);
@@ -276,7 +278,8 @@
    */
   async function chatStream(config, messages, tools, options) {
     options = options || {};
-    var timeout = options.timeout || DEFAULT_TIMEOUT;
+    // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
+    var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
     var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
     var onDelta = options.onDelta || function () {};
 
@@ -309,7 +312,14 @@
 
         // 合并外部 signal（用户中止）与内部 timeout signal
         var externalSignal = options.signal;
-        var onExternalAbort = function () { controller.abort(); };
+        var reader = null;
+        var onExternalAbort = function () {
+          controller.abort();
+          // fetch 返回后，显式取消 SSE reader，避免服务端继续推送和计费。
+          if (reader) {
+            try { reader.cancel(); } catch (e) {}
+          }
+        };
         if (externalSignal) {
           if (externalSignal.aborted) {
             controller.abort();
@@ -331,7 +341,6 @@
           });
         } finally {
           clearTimeout(timer);
-          if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         }
 
         if (!resp.ok) {
@@ -347,7 +356,6 @@
             console.warn("[AIFT] thinking 模式可能不被支持（" + resp.status + "），降级重试");
             body.thinking = undefined;
             body.temperature = 0.5;
-            config.enableThinking = false;
             continue; // 不计入重试次数
           }
           var apiErr = new Error("API 错误 " + resp.status + ": " + errText);
@@ -359,7 +367,7 @@
         }
 
         // 解析 SSE 流
-        var reader = resp.body.getReader();
+        reader = resp.body.getReader();
         var decoder = new TextDecoder();
         var buffer = "";
         var contentAccum = "";
@@ -373,6 +381,52 @@
         var streamStartTime = Date.now();
         var reasoningStartTime = 0; // reasoning 开始时间
 
+        // SSE 服务端不一定会在最后一条 data 后发送换行，统一通过该函数处理
+        // 完整行，避免流结束时 buffer 中的最后一个 delta 被丢弃。
+        function processSseLine(rawLine) {
+          var line = rawLine.trim();
+          if (!line || line.startsWith(":")) return;
+          if (!line.startsWith("data:")) return;
+          var dataStr = line.slice(5).trim();
+          if (dataStr === "[DONE]") return;
+          try {
+            var chunkData = JSON.parse(dataStr);
+            var delta = chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta;
+            if (!delta) return;
+            if (delta.content) {
+              contentAccum += delta.content;
+              onDelta("content", delta.content);
+            }
+            if (delta.reasoning_content) {
+              if (reasoningStartTime === 0) reasoningStartTime = Date.now();
+              reasoningAccum += delta.reasoning_content;
+              onDelta("reasoning", delta.reasoning_content);
+            }
+            if (delta.tool_calls) {
+              for (var ti = 0; ti < delta.tool_calls.length; ti++) {
+                var tc = delta.tool_calls[ti];
+                var idx = tc.index !== undefined ? tc.index : 0;
+                if (!toolCallsAccum[idx]) {
+                  toolCallsAccum[idx] = {
+                    id: tc.id || "",
+                    type: "function",
+                    function: { name: "", arguments: "" },
+                  };
+                }
+                if (tc.id) toolCallsAccum[idx].id = tc.id;
+                if (tc.type) toolCallsAccum[idx].type = tc.type;
+                if (tc.function) {
+                  if (tc.function.name) toolCallsAccum[idx].function.name += tc.function.name;
+                  if (tc.function.arguments) toolCallsAccum[idx].function.arguments += tc.function.arguments;
+                  if (tc.function.name) onDelta("tool_call", "→ " + tc.function.name);
+                }
+              }
+            }
+          } catch (e) {
+            // JSON 解析失败，跳过当前事件
+          }
+        }
+
         while (true) {
           var chunk = await reader.read();
           if (chunk.done) break;
@@ -382,59 +436,7 @@
           var lines = buffer.split("\n");
           buffer = lines.pop(); // 保留最后不完整的行
 
-          for (var li = 0; li < lines.length; li++) {
-            var line = lines[li].trim();
-            if (!line || line.startsWith(":")) continue; // 空行或注释
-            if (!line.startsWith("data:")) continue;
-            var dataStr = line.slice(5).trim();
-            if (dataStr === "[DONE]") continue;
-
-            try {
-              var chunkData = JSON.parse(dataStr);
-              var delta = chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta;
-              if (!delta) continue;
-
-              // 内容片段
-              if (delta.content) {
-                contentAccum += delta.content;
-                onDelta("content", delta.content);
-              }
-
-              // 推理片段（部分模型如 deepseek-r1 返回 reasoning_content）
-              if (delta.reasoning_content) {
-                if (reasoningStartTime === 0) reasoningStartTime = Date.now();
-                reasoningAccum += delta.reasoning_content;
-                onDelta("reasoning", delta.reasoning_content);
-              }
-
-              // tool_calls 片段
-              if (delta.tool_calls) {
-                for (var ti = 0; ti < delta.tool_calls.length; ti++) {
-                  var tc = delta.tool_calls[ti];
-                  var idx = tc.index !== undefined ? tc.index : 0;
-                  if (!toolCallsAccum[idx]) {
-                   toolCallsAccum[idx] = {
-                     id: tc.id || "",
-                     type: "function",
-                     function: { name: "", arguments: "" },
-                   };
-                 }
-                 if (tc.id) toolCallsAccum[idx].id = tc.id;
-                 if (tc.type) toolCallsAccum[idx].type = tc.type;
-                 if (tc.function) {
-                    if (tc.function.name) toolCallsAccum[idx].function.name += tc.function.name;
-                    if (tc.function.arguments) toolCallsAccum[idx].function.arguments += tc.function.arguments;
-                  }
-                  // 通知 UI 正在构建 tool_call
-                  if (tc.function && tc.function.name) {
-                    onDelta("tool_call", "→ " + tc.function.name);
-                  }
-                }
-              }
-            } catch (e) {
-              // JSON 解析失败，跳过
-            }
-          }
+          for (var li = 0; li < lines.length; li++) processSseLine(lines[li]);
 
           // ===== 流内死循环检测 =====
           // 分两类：
@@ -488,12 +490,39 @@
           }
         }
 
+        // reader.cancel() 在部分浏览器中会以 done=true 结束读取而不抛异常，
+        // 这里必须再次检查外部终止信号，避免把已取消的半截响应当作成功。
+        if (externalSignal && externalSignal.aborted) {
+          var streamAbortErr = new Error("用户中止");
+          streamAbortErr.name = "UserAbortError";
+          throw streamAbortErr;
+        }
+
+        // 处理没有以换行结尾的最后一条 SSE data 行。
+        if (buffer) processSseLine(buffer);
+
         // 如果是优雅截断（超限），保留已有内容，不抛错
         if (gracefulCutoff) {
           onDelta("content", "\n\n[系统：" + loopBreakReason + "]");
           try { reader.cancel(); } catch (e) {}
           console.warn("[AIFT] 优雅截断: " + loopBreakReason + "，保留已有内容继续");
-          // 不抛错，直接走到下面的 message 组装逻辑
+          // 超时不能被调用方当作成功响应，否则上层会结束当前阶段，
+          // 用户后续输入也就没有机会触发下一次请求。携带部分结果，
+          // 由上层决定等待继续/用户指令后重新发起请求。
+          var timeoutToolCalls = Object.keys(toolCallsAccum).sort(function (a, b) {
+            return parseInt(a) - parseInt(b);
+          }).map(function (k, i) {
+            var tc = toolCallsAccum[k];
+            if (!tc.id) tc.id = "call_" + i;
+            return tc;
+          });
+          var timeoutErr = new Error("AI 推理超时，已保留部分结果");
+          timeoutErr.name = "ReasoningTimeoutError";
+          timeoutErr.breakReason = loopBreakReason;
+          timeoutErr.partialContent = contentAccum || null;
+          timeoutErr.partialReasoning = reasoningAccum || null;
+          timeoutErr.partialToolCalls = timeoutToolCalls;
+          throw timeoutErr;
         }
 
         // 如果是死循环检测，中断流并抛出错误
@@ -539,15 +568,21 @@
           message.reasoning_content = reasoningAccum;
         }
 
+        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         return { message: message, raw: { content: contentAccum, tool_calls: toolCallsArr } };
 
       } catch (e) {
+        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         // 不可重试的错误直接抛出
         if (e.name === "NonRetryableError") {
           throw new Error(e.message);
         }
         // 推理重复循环错误不重试，直接抛出
         if (e.name === "ReasoningLoopError") {
+          throw e;
+        }
+        // 推理超时需要由上层进入可恢复暂停态，不能自动按网络错误重试。
+        if (e.name === "ReasoningTimeoutError") {
           throw e;
         }
 

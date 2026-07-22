@@ -1806,12 +1806,8 @@ async function analyzeArchitecture() {
   }
   if (!await preflightTargetTab()) return;
 
-  var extraPrompt = await showPromptDialog(
-    "架构分析 - 额外提示词",
-    "可输入额外提示词来引导 AI 架构分析（可选）：",
-    "如：重点关注路由配置、状态管理、API 层设计..."
-  );
-  if (extraPrompt === null) return;
+  // 架构分析应在点击后立即启动；额外提示词不能阻塞主操作。
+  var extraPrompt = "";
 
   var config = getAiConfig();
   var hasAIConfig = config.apiUrl && config.apiKey && config.model && reportConfigValidation(config, true);
@@ -3469,6 +3465,7 @@ async function generateTestCases() {
     var tcRetryCount = 0;
     var result = null;
     var tcMessages = [{ role: "user", content: prompt }];
+    var tcOutputParts = [];
 
     while (tcRetryCount <= MAX_TC_RETRY) {
       try {
@@ -3489,6 +3486,9 @@ async function generateTestCases() {
             },
           }
         );
+        if (result && result.message && result.message.content) {
+          tcOutputParts.push(result.message.content);
+        }
         break; // 成功则退出重试循环
       } catch (e) {
         // 用户注入消息 → 中止当前请求，注入用户消息后重试（最高优先级）
@@ -3511,6 +3511,39 @@ async function generateTestCases() {
           streamAppend("info", "▶️ 继续执行");
           setStatus("AI 生成测试用例中...");
           continue; // 重新发起请求
+        }
+        // 推理时间过长：保留已生成内容并暂停，等待继续按钮或用户补充指令。
+        // 不能把截断响应当作最终结果，否则 finally 会结束 testcases 阶段，
+        // 后续输入无法再找到活动的 currentPhase。
+        if (e.name === "ReasoningTimeoutError" && !pauseState.aborted) {
+          var partialContent = e.partialContent || "";
+          if (partialContent) {
+            tcOutputParts.push(partialContent);
+            tcMessages.push({ role: "assistant", content: partialContent });
+          }
+          tcMessages.push({
+            role: "user",
+            content: "上一次响应因推理时间过长被截断。请从已完成的位置继续生成剩余测试用例，" +
+              "不要重复已经输出的用例；只输出尚未完成的 CSV 用例行。",
+          });
+          pauseState.paused = true;
+          els.abortBtn.textContent = "停止";
+          els.continueBtn.disabled = false;
+          streamAppend("warning", "⏸️ AI 推理时间过长，已暂停测试用例生成，点击「继续」或输入消息恢复");
+          setStatus("已暂停，等待继续生成测试用例");
+          await pauseState.waitForResume();
+          if (pauseState.aborted) throw e;
+          var timeoutInjectedMsg = pauseState.consumeUserMessage();
+          if (timeoutInjectedMsg) {
+            tcMessages.push({
+              role: "user",
+              content: "📋 用户补充指令：" + timeoutInjectedMsg + "\n请结合当前已生成内容继续输出剩余测试用例。",
+            });
+          }
+          pauseState.paused = false;
+          streamAppend("info", "▶️ 继续生成测试用例");
+          setStatus("AI 生成测试用例中...");
+          continue;
         }
         if (e.name === "ReasoningLoopError" && tcRetryCount < MAX_TC_RETRY) {
           tcRetryCount++;
@@ -3535,7 +3568,7 @@ async function generateTestCases() {
 
     streamEndBlock();
 
-    var rawText = result.message.content || "";
+    var rawText = tcOutputParts.join("\n").trim();
     var text = normalizeTestCasesForCapabilities(rawText, config.visionSupported);
     if (text !== rawText) {
       log("已将非视觉模型输出中的视觉验证步骤改为 DOM 状态验证");
