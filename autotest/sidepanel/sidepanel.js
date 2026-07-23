@@ -267,6 +267,51 @@ async function evalInPage(code, frameId) {
   }
 }
 
+// Injects only generated test data into a file input. This is deliberately separate
+// from evalInPage so arbitrary page JavaScript remains observation-only.
+async function injectTestFile(options) {
+  if (!tabId) return { ok: false, error: "未选择目标标签页" };
+  options = options || {};
+  var target = { tabId: tabId };
+  if (options.frameId !== undefined && options.frameId !== null) target.frameIds = [Number(options.frameId)];
+  try {
+    var results = await withTimeout(chrome.scripting.executeScript({
+      target: target,
+      world: "MAIN",
+      func: function (selector, fileName, sizeBytes, content, mimeType) {
+        var input = document.querySelector(selector);
+        if (!(input instanceof HTMLInputElement) || input.type.toLowerCase() !== "file") {
+          return { ok: false, error: "目标不是 input[type=file]: " + selector };
+        }
+        var encoder = new TextEncoder();
+        var textBytes = encoder.encode(content || "");
+        var finalSize = sizeBytes === undefined || sizeBytes === null ? textBytes.length : sizeBytes;
+        if (!Number.isInteger(finalSize) || finalSize < 0 || finalSize > 52428800) {
+          return { ok: false, error: "文件大小必须是 0 到 52428800 字节之间的整数" };
+        }
+        var bytes = new Uint8Array(finalSize);
+        bytes.set(textBytes.subarray(0, finalSize));
+        var file = new File([bytes], fileName, { type: mimeType || "application/octet-stream" });
+        var transfer = new DataTransfer();
+        transfer.items.add(file);
+        try {
+          input.files = transfer.files;
+        } catch (error) {
+          return { ok: false, error: "浏览器拒绝设置文件列表: " + (error.message || error) };
+        }
+        input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        return { ok: true, fileName: input.files[0].name, sizeBytes: input.files[0].size, fileCount: input.files.length };
+      },
+      args: [options.selector, options.fileName, options.sizeBytes, options.content, options.mimeType],
+    }), PAGE_EVAL_TIMEOUT_MS, "测试文件注入");
+    var value = results && results[0] && results[0].result;
+    return value || { ok: false, error: "文件注入没有返回结果" };
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+}
+
 // ---- 按钮状态管理（条件禁用 + tooltip 提示）----
 function updateButtonStates() {
   var hasSource = Object.keys(uploadedSourceFiles).length > 0;
@@ -1452,6 +1497,7 @@ async function runPlan() {
     ensureContentScript: ensureContentScript,
     sendMessage: sendToContent,
     evalInPage: evalInPage,
+    injectFile: injectTestFile,
     onLog: function (msg) { log(msg); },
     onStatus: function (s) { setStatus(s); },
     onStream: function (type, content) {
@@ -1543,6 +1589,7 @@ async function runAgent() {
     ensureContentScript: ensureContentScript,
     sendMessage: sendToContent,
     evalInPage: evalInPage,
+    injectFile: injectTestFile,
     onLog: function (msg) { log(msg); },
     onStatus: function (s) { setStatus(s); },
     onStream: function (type, content) {
@@ -3316,9 +3363,10 @@ async function generateTestCases() {
         : "   c. 验证方式标注（API 验证 / 元素状态检查）",
       "   c. eval_in_page 仅用于读取页面状态（获取文本、检查 class、获取属性值等），",
       "      严禁用于模拟用户操作（dispatchEvent、修改 value、调用 .click() 等）",
-      "   d. get_network_responses 必须给出 URL 匹配模式",
-      "   e. 涉及异步操作后必须加 wait 步骤",
-      "   f. 数据验证主要通过 get_network_responses 获取 API 响应，",
+      "   d. 文件上传使用 upload_file 向已观察到的 input[type=file] 注入受控测试文件；不要点击 input 唤起原生文件选择器；",
+      "   e. get_network_responses 必须给出 URL 匹配模式",
+      "   f. 涉及异步操作后必须加 wait 步骤",
+      "   g. 数据验证主要通过 get_network_responses 获取 API 响应，",
       "      Agent 会自动从 DOM 快照中观察页面展示值进行对比，",
       "      仅当需要获取快照中无法直接观察的特定值时才使用 eval_in_page（每条用例≤2次）",
       "   g. 【UI 检查强制】涉及用户操作的用例必须包含 1-3 个 UI 检查步骤",

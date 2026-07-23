@@ -124,7 +124,7 @@ flowchart TB
 
 关键约束：
 
-- AI 不允许通过 `eval_in_page` 模拟用户操作。
+- AI 不允许通过 `eval_in_page` 模拟用户操作；文件上传通过专用 `upload_file` 注入生成的受控测试 `File`，目标必须是已观察到的 `input[type=file]`。
 - 基础 `click/type/press/scroll/hover` 均走 CDP。
 - Agent 默认在测试环境执行。用例要求的 CRUD、保存、提交、删除和二次确认均是必须执行的真实 CDP 操作，不会因数据影响顾虑自动跳过。
 - `select_option/select_multi/fill_input/click_button/toggle_switch` 等模板内部先只读定位，再用 CDP 操作，最后验证结果。

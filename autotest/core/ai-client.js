@@ -25,6 +25,43 @@
   var MAX_REASONING_TIME_MS = 600000; // reasoning 阶段最大持续时间 600 秒，超过后优雅截断
 
   /**
+   * 部分 OpenAI 兼容服务不接受工具参数根层仅用于“字段二选一”的 anyOf。
+   * 展平这类约束，保留字段和已有 required；真正的联合类型保持原样。
+   */
+  function normalizeToolParameters(parameters) {
+    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) return parameters;
+
+    var variants = parameters.anyOf;
+    if (!Array.isArray(variants) || variants.length === 0) return parameters;
+
+    for (var i = 0; i < variants.length; i++) {
+      var variant = variants[i];
+      if (!variant || typeof variant !== "object" || Array.isArray(variant)) return parameters;
+      var keys = Object.keys(variant);
+      if (keys.length !== 1 || keys[0] !== "required" || !Array.isArray(variant.required)) return parameters;
+    }
+
+    var normalized = {};
+    Object.keys(parameters).forEach(function (key) {
+      if (key !== "anyOf") normalized[key] = parameters[key];
+    });
+    if (normalized.additionalProperties === undefined) normalized.additionalProperties = false;
+    return normalized;
+  }
+
+  function normalizeToolsForCompatibility(tools) {
+    if (!Array.isArray(tools)) return tools;
+    return tools.map(function (tool) {
+      if (!tool || !tool.function || !tool.function.parameters) return tool;
+      var parameters = normalizeToolParameters(tool.function.parameters);
+      if (parameters === tool.function.parameters) return tool;
+      return Object.assign({}, tool, {
+        function: Object.assign({}, tool.function, { parameters: parameters }),
+      });
+    });
+  }
+
+  /**
    * 检测文本中是否存在重复段落（精确匹配，带滑动窗口）
    * 
    * 优化点（减少误报）：
@@ -118,8 +155,8 @@
     }
 
     if (tools && tools.length > 0) {
-      body.tools = tools;
-      body.tool_choice = "auto";
+      body.tools = normalizeToolsForCompatibility(tools);
+      body.tool_choice = "required";
     }
 
     // 标记不可重试的错误，避免对 4xx（非 429）做无意义重试
@@ -300,8 +337,8 @@
     }
 
     if (tools && tools.length > 0) {
-      body.tools = tools;
-      body.tool_choice = "auto";
+      body.tools = normalizeToolsForCompatibility(tools);
+      body.tool_choice = "required";
     }
 
     var lastError;
@@ -650,6 +687,7 @@
     chat: chat,
     chatStream: chatStream,
     extractToolCalls: extractToolCalls,
+    normalizeToolsForCompatibility: normalizeToolsForCompatibility,
     buildVisionContent: buildVisionContent,
     buildVisionMessage: buildVisionMessage,
   };

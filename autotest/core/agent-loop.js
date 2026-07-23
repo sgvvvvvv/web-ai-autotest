@@ -13,6 +13,7 @@
     press: 150, visual_press: 150,
     scroll: 150, visual_scroll: 150,
     hover: 80,
+    upload_file: 500,
     visual_drag: 200,
     smart_click: 300, smart_type: 200,
     // 预设模板：内部已有等待逻辑，外部只需短暂等待
@@ -32,6 +33,7 @@
   var TOOL_TIMEOUT_MS = {
     find_element: 12000,
     eval_in_page: 12000,
+    upload_file: 30000,
     read_source: 10000,
     get_network_responses: 12000,
     screenshot: 30000,
@@ -247,6 +249,7 @@
    * @param {function} deps.onStream - 流式回调(type, content)
    * @param {function} deps.onFinish - 完成回调(result, summary)
    * @param {function} deps.evalInPage - 在页面上下文执行 JS
+   * @param {function} deps.injectFile - 向已观察到的 file input 注入受控测试文件
    * @param {function} deps.onAssertion - 断言回调(assertion, assertions, testCases)
    * @param {function} deps.onTestCasesParsed - 测试用例解析完成回调
    * @param {function} deps.onAutoPause - 自动暂停回调(reason)，用于通知 UI 同步暂停状态
@@ -1245,6 +1248,44 @@
           result.ok = evalResult.ok;
           result.result = evalResult.ok ? (evalResult.result || "无返回值：请在 eval_in_page 代码中显式 return 一个字符串/数组/对象，不要只写 console.log。") : ("执行失败: " + evalResult.error);
           log("eval_in_page: " + (args.code || "").substring(0, 80) + " → " + (evalResult.ok ? "成功" : "失败"));
+          break;
+
+        case "upload_file":
+          var fileTarget = resolveObservedTarget(args);
+          if (!fileTarget.ok) {
+            result.ok = false;
+            result.result = fileTarget.error;
+            break;
+          }
+          if (!deps.injectFile) {
+            result.ok = false;
+            result.result = "文件注入不可用（需要 chrome.scripting 权限）";
+            break;
+          }
+          var requestedSize = args.sizeBytes;
+          if (requestedSize !== undefined && (!Number.isInteger(requestedSize) || requestedSize < 0 || requestedSize > 52428800)) {
+            result.ok = false;
+            result.result = "sizeBytes 必须是 0 到 52428800 之间的整数";
+            break;
+          }
+          try {
+            var fileResult = await deps.injectFile({
+              selector: fileTarget.selector,
+              frameId: fileTarget.frameId,
+              fileName: args.fileName || "test-file.txt",
+              sizeBytes: requestedSize,
+              content: args.content || "",
+              mimeType: args.mimeType || "application/octet-stream",
+            });
+            result.ok = !!(fileResult && fileResult.ok);
+            result.args = Object.assign({}, args, { selector: fileTarget.selector, frameId: fileTarget.frameId });
+            result.result = result.ok
+              ? "已注入测试文件 " + fileResult.fileName + "（" + fileResult.sizeBytes + " bytes）并触发 input/change"
+              : ((fileResult && fileResult.error) || "文件注入失败");
+          } catch (e) {
+            result.ok = false;
+            result.result = "文件注入异常: " + (e.message || e);
+          }
           break;
 
         case "find_element":

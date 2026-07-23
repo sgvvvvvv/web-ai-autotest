@@ -105,6 +105,33 @@ async function run() {
   assert.strictEqual(aiConfig.enableThinking, true, "thinking 降级不能改写调用方配置");
   assert.strictEqual(aiCalls[1].thinking, undefined, "降级重试应移除 thinking 参数");
 
+  const toolsForCompatibility = [
+    {
+      type: "function",
+      function: {
+        name: "click",
+        parameters: {
+          type: "object",
+          properties: { elementRef: { type: "string" }, selector: { type: "string" } },
+          anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "union",
+        parameters: { anyOf: [{ type: "string" }, { type: "number" }] },
+      },
+    },
+  ];
+  const compatibleTools = aiContext.window.AIFT_AIClient.normalizeToolsForCompatibility(toolsForCompatibility);
+  assert.strictEqual(toolsForCompatibility[0].function.parameters.anyOf.length, 2, "转换不能改写原始工具定义");
+  assert.strictEqual(compatibleTools[0].function.parameters.anyOf, undefined, "字段二选一 anyOf 应在出站前展平");
+  assert.strictEqual(compatibleTools[0].function.parameters.additionalProperties, false);
+  assert.deepStrictEqual(compatibleTools[0].function.parameters.properties, toolsForCompatibility[0].function.parameters.properties);
+  assert.deepStrictEqual(compatibleTools[1], toolsForCompatibility[1], "真正的联合类型不能被展平");
+
   const files = {
     "views/dashboard/Overview.vue": "<template><h1>Overview</h1></template>",
     "views/host/statistical/components/FailureDetailDialog.vue": "<template><input placeholder=\"用户标签筛选\"></template><TagPicker /></template><script>import TagPicker from '@/components/TagPicker.vue'</script>",
@@ -349,6 +376,14 @@ async function run() {
   });
   assert.ok(observedMessages[1].content.indexOf("[ref:e7]") !== -1);
   assert.ok(promptBuilder.buildTools({ visionSupported: false }).some(function(tool) { return tool.function.name === "surface_interact"; }));
+  const uploadTool = promptBuilder.buildTools({ visionSupported: false }).filter(function(tool) { return tool.function.name === "upload_file"; })[0];
+  assert.ok(uploadTool, "应向 Agent 暴露受控文件注入工具");
+  assert.ok(uploadTool.function.description.indexOf("10485761") !== -1, "文件工具应说明 10MiB 边界测试方式");
+  assert.ok(/case "upload_file":/.test(agentLoopSource), "Agent Loop 必须执行文件注入工具");
+  assert.ok(/async function injectTestFile\(options\)/.test(sidePanelSource), "Side Panel 必须实现受控文件注入");
+  assert.strictEqual((sidePanelSource.match(/injectFile: injectTestFile/g) || []).length, 2, "规划和执行入口都必须提供文件注入能力");
+  assert.ok(/new File\(\[bytes\], fileName/.test(sidePanelSource), "文件注入必须创建真实 File 对象");
+  assert.ok(/input\.dispatchEvent\(new Event\("change"/.test(sidePanelSource), "文件注入必须触发 change 事件");
   const systemPrompt = promptBuilder.buildMessages({ requirement: "编辑并删除测试脚本", testCases: "TC1,编辑脚本,脚本管理,列表有数据,编辑保存并删除,接口成功", sourceFiles: [], snapshot: { nodes: [] }, visionSupported: false })[0].content;
   assert.ok(systemPrompt.indexOf("避免修改后端数据") !== -1);
   assert.ok(systemPrompt.indexOf("默认测试环境") !== -1);

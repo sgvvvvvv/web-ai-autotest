@@ -52,6 +52,7 @@
       "- 预设模板：select_option（含普通下拉与级联选择）/select_multi/fill_input/click_button/fill_form/table_action/switch_tab/close_dialog/confirm_dialog/toggle_switch",
       "- 基础操作：click(selector)/type(selector,text)/press(key)/scroll(selector?)/hover(selector) — 默认通过 CDP 真实鼠标/键盘执行。弹框内关闭下拉浮层时不要主动使用 Escape，应点击浮层外的弹框安全区域。",
       "- 查找元素：find_element(findBy,value) — 找不到元素时用这个获取准确坐标和 selector",
+      "- 文件上传：upload_file(elementRef|selector,fileName,sizeBytes?,content?,mimeType?) — 向已观察到的 input[type=file] 注入受控测试文件并触发 input/change；用于文件大小、类型和失败态校验。不要点击文件输入框来打开原生选择器。",
       "- 页面 JS：eval_in_page(code) — 读取页面状态（不要用来模拟操作）",
       "- iframe：快照中的 [ref:f<frameId>:e<编号>] 表示该元素位于对应 iframe。跨域 iframe 必须使用这个 elementRef，并使用 click/type/scroll/hover 基础操作；不要用预设模板或尝试从父页面读取它的 DOM。",
     );
@@ -68,7 +69,7 @@
       "FAILED 条件（任一）：已直接观察到 API 字段为空/null/缺失、页面展示不一致、功能异常或 UI 异常。",
       "PASSED 条件（全部）：当前 TC 的每项预期均已通过真实页面、网络响应、截图或源码与运行时证据交叉直接验证。",
       "数据展示类 PASSED 额外条件：用例预期必须定义「字段映射：页面列头 <- API字段」；assert 必须提交至少 2 条 fieldMappings，每条包含 uiLabel、apiField、pageValue、apiValue，且页面列头和网络响应字段均已观察到。没有映射或映射语义不明确时只能 inconclusive。",
-      "INCONCLUSIVE 条件：因权限、浏览器限制、缺少可控测试数据、原生文件选择器等原因，至少一项预期未能直接验证。此时绝不能写 passed；调用 assert(outcome='inconclusive') 并明确列出未验证项。",
+      "INCONCLUSIVE 条件：因权限、浏览器限制、缺少可控测试数据或受控文件注入也无法被页面接受等原因，至少一项预期未能直接验证。文件上传场景应先使用 upload_file，不能仅以原生文件选择器为由跳过。此时绝不能写 passed；调用 assert(outcome='inconclusive') 并明确列出未验证项。",
       "",
       "# 表格数据提取",
       "按行提取，不要扁平化：",
@@ -754,6 +755,26 @@
               },
             },
             required: ["action", "start"],
+            anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "upload_file",
+          description: "向已观察到的 input[type=file] 注入一个受控测试文件，并派发标准 input/change 事件。用于验证文件类型、大小限制、上传失败提示和文件状态，不会打开操作系统文件选择器。sizeBytes 是实际文件大小（默认 content 的 UTF-8 字节数；未传 content 时默认 0 字节）；可用 10485761 测试超过 10MiB。目标必须是最新快照的 elementRef，或先由 find_element 观察到的 selector。",
+          parameters: {
+            type: "object",
+            properties: {
+              elementRef: { type: "string", description: "最新 DOM 快照中 file input 的引用，如 e12。优先使用。" },
+              selector: { type: "string", description: "已通过快照或 find_element 观察到的 file input CSS selector。" },
+              fileName: { type: "string", description: "测试文件名，需包含扩展名，例如 oversized.sh。" },
+              sizeBytes: { type: "integer", description: "可选。注入文件的实际字节数，范围 0 到 52428800；例如 10485761 表示超过 10MiB。" },
+              content: { type: "string", description: "可选。小型测试文件文本内容；当指定 sizeBytes 时会以 0 字节填充到该精确大小。" },
+              mimeType: { type: "string", description: "可选 MIME 类型，默认 application/octet-stream。" },
+            },
+            required: ["fileName"],
             anyOf: [{ required: ["elementRef"] }, { required: ["selector"] }],
           },
         },

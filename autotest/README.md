@@ -142,12 +142,13 @@ AI 在测试过程中可调用的工具主要包括：
 - 基础操作：`click`、`type`、`press`、`scroll`、`hover`。`click`/`type`/元素滚动/悬停优先使用 DOM 快照中的 `elementRef`，也只接受已观察到的 selector。
 - 视觉/坐标操作：`screenshot`、`verify_ui`、`visual_click`、`visual_type`、`visual_scroll`、`visual_drag`、`visual_press`
 - 自绘交互：`surface_interact`，对 Canvas、SVG、视频或其他自绘表面按实时元素边界执行相对坐标点击或拖拽。
+- 文件上传：`upload_file`，向已观察到的 `input[type=file]` 注入受控测试文件并派发标准 `input/change` 事件；可指定精确字节数以覆盖大小边界（最大 50 MiB）。
 - 智能定位：`find_element`、`smart_click`、`smart_type`
 - 预设模板：`select_option`、`select_multi`、`fill_input`、`fill_form`、`click_button`、`close_dialog`、`table_action`、`switch_tab`、`confirm_dialog`、`toggle_switch`
 - 状态读取：`eval_in_page`、`read_source`、`get_network_responses`
 - 测试结果：`assert`、`finish`、`wait`
 
-其中 `eval_in_page` 只用于读取页面状态，不能用于模拟用户操作。
+其中 `eval_in_page` 只用于读取页面状态，不能用于模拟用户操作。文件注入是唯一例外，但必须通过专用的 `upload_file` 工具完成，不能执行任意 JS。
 
 ## 安全与边界
 
@@ -164,7 +165,7 @@ AI 在测试过程中可调用的工具主要包括：
 ## 已知限制
 
 - Chrome 同一 tab 只能有一个 debugger 连接。打开 DevTools 或其他自动化工具时可能导致 CDP attach 失败。
-- 原生文件选择器、系统级弹窗、真实硬件输入等场景仍需要额外能力。
+- 系统级弹窗、真实硬件输入等场景仍需要额外能力。文件上传可通过 `upload_file` 注入生成的受控测试文件；依赖 `isTrusted` 文件选择事件或操作系统路径的第三方控件仍可能不兼容。
 - 跨域 iframe 会由扩展分别注入观察器并以 frame 专属元素引用执行基础操作；`sandbox` 禁止脚本、浏览器内部页面及主动反自动化控件仍可能不可访问。
 - 封闭 Shadow DOM、Canvas/WebGL 内部对象通常需要视觉坐标或业务源码辅助；可用 `surface_interact` 以相对坐标执行真实输入，结果仍需通过 DOM、截图或网络响应验证。
 - 视觉能力依赖所配置模型是否真正支持图片输入。
