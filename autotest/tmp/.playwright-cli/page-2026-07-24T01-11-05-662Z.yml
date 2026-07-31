@@ -1,0 +1,86 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "AI 前端自动化测试" [level=1] [ref=e3]
+    - generic [ref=e4]: Vision + CDP
+  - generic [ref=e5]:
+    - heading "目标标签页" [level=2] [ref=e6]
+    - generic [ref=e7]:
+      - combobox [ref=e8]:
+        - option "商品管理 - 管理后台" [selected]
+        - option "订单列表 - 管理后台"
+      - button "刷新" [ref=e9] [cursor=pointer]
+      - generic [ref=e10]: 已连接
+  - generic [ref=e11]:
+    - heading "AI 配置" [level=2] [ref=e12]
+    - generic [ref=e13]:
+      - generic [ref=e14]: API URL
+      - textbox [ref=e15]: https://api.openai.com/v1
+    - generic [ref=e16]:
+      - generic [ref=e17]: API Key
+      - textbox [ref=e18]: sk-xxxxxxxxxxxxxxxxxxxx
+    - generic [ref=e19]:
+      - generic [ref=e20]: 模型
+      - textbox [ref=e21]: gpt-4o
+    - generic [ref=e22]:
+      - generic [ref=e23]: 上下文大小 (K)
+      - spinbutton [ref=e24]: "128"
+      - text: 模型上下文窗口大小，以 K 为单位。如 128K = 128000 tokens
+    - generic [ref=e25]:
+      - generic [ref=e26] [cursor=pointer]:
+        - checkbox "模型支持图片（视觉能力）" [checked] [ref=e27]
+        - generic [ref=e28]: 模型支持图片（视觉能力）
+      - generic [ref=e29]: 勾选后启用截图理解与视觉验证
+    - generic [ref=e30]:
+      - generic [ref=e31] [cursor=pointer]:
+        - checkbox "启用深度思考模式" [ref=e32]
+        - generic [ref=e33]: 启用深度思考模式
+      - generic [ref=e34]: 勾选后启用模型的 thinking 能力
+    - button "保存配置" [ref=e35] [cursor=pointer]
+  - generic [ref=e36]:
+    - heading "① 原始需求" [level=2] [ref=e37]
+    - generic [ref=e38]:
+      - generic [ref=e39]: 描述要测试的功能需求
+      - textbox [ref=e40]: 测试商品管理页面的 CRUD 功能： 1. 新增商品，填写名称、价格、库存、分类 2. 编辑已有商品信息并保存 3. 删除商品并确认弹窗 4. 验证列表数据更新正确
+  - generic [ref=e41]:
+    - heading "② 上传项目源码（一般仅上传 src 目录即可）" [level=2] [ref=e42]
+    - generic [ref=e43]:
+      - generic [ref=e44]: 选择项目根目录（支持 .js .vue .ts .jsx .tsx .css .json）
+      - button "Choose File" [ref=e45]
+      - text: 已上传 42 个文件（1.2 MB）
+  - generic [ref=e46]:
+    - heading "③ 项目架构分析" [level=2] [ref=e47] [cursor=pointer]
+    - generic [ref=e49]:
+      - button "分析架构" [ref=e50] [cursor=pointer]
+      - button "导入架构文档" [ref=e51] [cursor=pointer]
+      - button "清除缓存" [ref=e52] [cursor=pointer]
+      - button "导出架构" [ref=e53] [cursor=pointer]
+      - generic [ref=e54]: 分析完成（2 分钟前）
+  - generic [ref=e55]:
+    - heading "④ 测试用例" [level=2] [ref=e56] [cursor=pointer]
+    - generic [ref=e58]:
+      - button "AI 生成（基于需求+架构）" [ref=e59] [cursor=pointer]
+      - button "导出用例" [ref=e60] [cursor=pointer]
+  - generic [ref=e61]:
+    - heading "⑤ 执行测试" [level=2] [ref=e62]
+    - generic [ref=e63]:
+      - button "运行 AI 测试" [ref=e64] [cursor=pointer]
+      - button "测试策略分析" [ref=e65] [cursor=pointer]
+      - generic [ref=e66]: 就绪
+  - generic [ref=e67]:
+    - generic [ref=e68]:
+      - heading "AI 思考与响应" [level=2] [ref=e69]
+      - generic [ref=e70]:
+        - generic [ref=e71]: 上下文 --
+        - button "中止" [disabled] [ref=e74]
+    - generic [ref=e75]: 运行 AI 测试后，AI 的思考与响应将在此实时显示...
+    - generic [ref=e76]:
+      - textbox "输入内容接续当前对话（如：跳过当前用例、检查弹窗、换一种方式...）" [ref=e77]
+      - button "发送" [ref=e78] [cursor=pointer]
+  - generic [ref=e79]:
+    - generic [ref=e80]:
+      - heading "测试结果" [level=2] [ref=e81]
+      - button "导出报告" [disabled] [ref=e84]
+    - generic [ref=e85]: 尚未运行
+  - generic [ref=e86]:
+    - heading "日志" [level=2] [ref=e87]
+    - generic [ref=e88]: "[10:00:01] 扩展已加载 [10:00:02] 配置已保存 [10:00:05] 已选择目标标签页: 商品管理 - 管理后台 [10:00:12] 源码上传完成: 42 个文件 [10:00:15] 架构分析完成"

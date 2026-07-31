@@ -103,7 +103,56 @@ async function run() {
   const streamResult = await aiContext.window.AIFT_AIClient.chatStream(aiConfig, [{ role: "user", content: "go" }], [], { maxRetries: 1 });
   assert.strictEqual(streamResult.message.tool_calls[0].function.arguments, '{"x":1}');
   assert.strictEqual(aiConfig.enableThinking, true, "thinking 降级不能改写调用方配置");
-  assert.strictEqual(aiCalls[1].thinking, undefined, "降级重试应移除 thinking 参数");
+  assert.strictEqual(aiCalls[1].thinking, undefined, "GLM 格式失败后应移除 thinking 参数");
+  assert.strictEqual(aiCalls[1].enable_thinking, true, "GLM 格式失败后应改用 enable_thinking 格式重试");
+  assert.strictEqual(aiCalls[1].temperature, undefined, "深度思考模式下任何请求都不应携带 temperature");
+
+  // 深度思考：两种 thinking 格式均被拒绝时禁用并缓存结论，全程不得发送 temperature
+  const thCalls = [];
+  const thContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function (url, options) {
+      thCalls.push(JSON.parse(options.body));
+      if (thCalls.length === 1) {
+        return { ok: false, status: 400, statusText: "Bad Request", json: async function () { return { error: { message: "Unrecognized request argument supplied: thinking" } }; } };
+      }
+      if (thCalls.length === 2) {
+        return { ok: false, status: 400, statusText: "Bad Request", json: async function () { return { error: { message: "enable_thinking is not supported for this model" } }; } };
+      }
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { content: "ok" } }] });
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; } };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", thContext);
+  const thConfig = { apiUrl: "https://example.com/v1", apiKey: "key", model: "no-think-model", enableThinking: true };
+  await thContext.window.AIFT_AIClient.chatStream(thConfig, [{ role: "user", content: "go" }], [], { maxRetries: 1 });
+  assert.strictEqual(thCalls.length, 3, "两种 thinking 格式各尝试一次后应降级为不带 thinking 参数");
+  assert.deepStrictEqual(thCalls[0].thinking, { type: "enabled" }, "首次应使用 GLM 格式");
+  assert.strictEqual(thCalls[1].enable_thinking, true, "第二次应改用 enable_thinking 格式");
+  assert.strictEqual(thCalls[2].thinking, undefined, "两种格式均被拒后不应再发送 thinking");
+  assert.strictEqual(thCalls[2].enable_thinking, undefined, "两种格式均被拒后不应再发送 enable_thinking");
+  thCalls.forEach(function (call, i) {
+    assert.strictEqual(call.temperature, undefined, "第 " + (i + 1) + " 次请求不应携带 temperature（已勾选深度思考）");
+  });
+  // 能力缓存：后续调用直接不带 thinking 参数，不再重复探测
+  await thContext.window.AIFT_AIClient.chatStream(thConfig, [{ role: "user", content: "go" }], [], { maxRetries: 1 });
+  assert.strictEqual(thCalls.length, 4, "缓存命中后不应再触发降级重试");
+  assert.strictEqual(thCalls[3].thinking, undefined, "缓存命中后不应发送 thinking");
+  assert.strictEqual(thCalls[3].enable_thinking, undefined, "缓存命中后不应发送 enable_thinking");
+  assert.strictEqual(thCalls[3].temperature, undefined, "缓存命中后也不应补发 temperature");
 
   const toolsForCompatibility = [
     {
@@ -131,6 +180,167 @@ async function run() {
   assert.strictEqual(compatibleTools[0].function.parameters.additionalProperties, false);
   assert.deepStrictEqual(compatibleTools[0].function.parameters.properties, toolsForCompatibility[0].function.parameters.properties);
   assert.deepStrictEqual(compatibleTools[1], toolsForCompatibility[1], "真正的联合类型不能被展平");
+
+  // models.dev 静态能力表（借鉴 OpenCode）：temperature/reasoning/toolcall 门控 + 家族采样调优
+  const mdCalls = [];
+  const mdContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function (url, options) {
+      if (!options) {
+        // models.dev 能力表请求（无 body）
+        return { ok: true, json: async function () { return {
+          "alibaba-cn": { models: {
+            "caps-model": { temperature: false, reasoning: false, tool_call: false, modalities: { input: ["text"] } },
+            "temp-model": { temperature: true, reasoning: true, tool_call: true, modalities: { input: ["text"] } },
+          } },
+        }; } };
+      }
+      mdCalls.push(JSON.parse(options.body));
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { content: "ok" } }] });
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; } };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", mdContext);
+  await mdContext.window.AIFT_AIClient.loadModelCaps();
+  const mdTools = [{ type: "function", function: { name: "click", description: "点击", parameters: { type: "object", properties: {} } } }];
+  // 能力表不支持 temperature/reasoning/toolcall：对应参数都不应出现在请求里
+  await mdContext.window.AIFT_AIClient.chatStream(
+    { apiUrl: "https://example.com/v1", apiKey: "key", model: "caps-model", enableThinking: true },
+    [{ role: "user", content: "go" }], mdTools, { maxRetries: 0 });
+  const capsBody = mdCalls[0];
+  assert.strictEqual(capsBody.temperature, undefined, "能力表不支持 temperature 时不应发送");
+  assert.strictEqual(capsBody.thinking, undefined, "能力表不支持 reasoning 时不应发送 thinking");
+  assert.strictEqual(capsBody.enable_thinking, undefined, "能力表不支持 reasoning 时不应发送 enable_thinking");
+  assert.strictEqual(capsBody.tools, undefined, "能力表不支持 toolcall 时不应发送 tools");
+  assert.strictEqual(capsBody.messages[capsBody.messages.length - 1].role, "system", "toolcall 不支持时应注入文本协议");
+  // qwen 家族：勾选深度思考应直接使用 enable_thinking 格式（避免先挨 400 再降级）
+  await mdContext.window.AIFT_AIClient.chatStream(
+    { apiUrl: "https://example.com/v1", apiKey: "key", model: "qwen-plus", enableThinking: true },
+    [{ role: "user", content: "go" }], [], { maxRetries: 0 });
+  assert.strictEqual(mdCalls[1].enable_thinking, true, "qwen 系应直接使用 enable_thinking 格式");
+  assert.strictEqual(mdCalls[1].thinking, undefined, "qwen 系不应发送 GLM 格式 thinking");
+  // qwen 家族未勾选深度思考：使用家族调优采样值
+  await mdContext.window.AIFT_AIClient.chatStream(
+    { apiUrl: "https://example.com/v1", apiKey: "key", model: "qwen-plus", enableThinking: false },
+    [{ role: "user", content: "go" }], [], { maxRetries: 0 });
+  assert.strictEqual(mdCalls[2].temperature, 0.55, "qwen 家族应使用调优 temperature 0.55");
+  assert.strictEqual(mdCalls[2].top_p, 1, "qwen 家族应使用调优 top_p 1");
+  // 能力表支持 temperature 但无家族调优值：保持 0.5 默认
+  await mdContext.window.AIFT_AIClient.chatStream(
+    { apiUrl: "https://example.com/v1", apiKey: "key", model: "temp-model", enableThinking: false },
+    [{ role: "user", content: "go" }], [], { maxRetries: 0 });
+  assert.strictEqual(mdCalls[3].temperature, 0.5, "能力表支持且无家族调优时应保持 0.5");
+
+  // 模型不支持 function calling（如 qwen3.7-plus 网关 400）：自动降级为文本协议，并缓存能力结论
+  const fcCalls = [];
+  const fcContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function (url, options) {
+      fcCalls.push(JSON.parse(options.body));
+      if (fcCalls.length === 1) {
+        return { ok: false, status: 400, statusText: "Bad Request", json: async function () { return { error: { message: "当前模型不支持函数调用", type: "None", param: "None", code: "400" } }; } };
+      }
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { content: '[{"action":"click","elementRef":"e1"}]' } }] });
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; } };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", fcContext);
+  const fcConfig = { apiUrl: "https://example.com/v1", apiKey: "key", model: "qwen3.7-plus" };
+  const fcTools = [{ type: "function", function: { name: "click", description: "点击元素", parameters: { type: "object", properties: { elementRef: { type: "string" } }, required: ["elementRef"] } } }];
+  const fcResult = await fcContext.window.AIFT_AIClient.chatStream(fcConfig, [{ role: "user", content: "go" }], fcTools, { maxRetries: 1 });
+  assert.strictEqual(fcCalls.length, 2, "函数调用不支持时应自动降级重试且不消耗重试次数");
+  assert.ok(fcCalls[0].tools, "首次请求应携带 tools");
+  assert.strictEqual(fcCalls[0].tool_choice, "auto", "tool_choice 应为 auto（DashScope 系不支持 required）");
+  assert.strictEqual(fcCalls[1].tools, undefined, "降级重试应移除 tools");
+  assert.strictEqual(fcCalls[1].tool_choice, undefined, "降级重试应移除 tool_choice");
+  const protocolMsg = fcCalls[1].messages[fcCalls[1].messages.length - 1];
+  assert.strictEqual(protocolMsg.role, "system", "降级后应注入文本协议 system 消息");
+  assert.ok(protocolMsg.content.indexOf("click(elementRef)") !== -1, "文本协议应包含工具签名说明");
+  const fcToolCalls = fcContext.window.AIFT_AIClient.extractToolCalls(fcResult.message);
+  assert.strictEqual(fcToolCalls[0].function.name, "click", "文本协议响应应解析出工具动作");
+  assert.strictEqual(JSON.parse(fcToolCalls[0].function.arguments).elementRef, "e1");
+  // 能力缓存：后续请求直接走文本协议，不再发送 tools
+  await fcContext.window.AIFT_AIClient.chatStream(fcConfig, [{ role: "user", content: "go" }], fcTools, { maxRetries: 1 });
+  assert.strictEqual(fcCalls.length, 3);
+  assert.strictEqual(fcCalls[2].tools, undefined, "已缓存不支持结论的模型不应再发送 tools");
+  assert.strictEqual(fcCalls[2].messages[fcCalls[2].messages.length - 1].role, "system", "缓存命中时也应注入文本协议");
+  // extractToolCalls：兼容 Markdown 代码块包裹与正文内嵌 JSON
+  const fenced = fcContext.window.AIFT_AIClient.extractToolCalls({ content: "```json\n[{\"action\":\"press\",\"key\":\"Enter\"}]\n```" });
+  assert.strictEqual(fenced[0].function.name, "press", "应解析 Markdown 代码块包裹的 JSON 动作");
+  const embedded = fcContext.window.AIFT_AIClient.extractToolCalls({ content: "好的，执行点击：\n[{\"action\":\"click\",\"elementRef\":\"e2\"}]" });
+  assert.strictEqual(embedded[0].function.name, "click", "应解析正文中内嵌的 JSON 动作");
+
+  // “深度思考 + 函数调用”组合被网关拒绝（报“当前模型不支持函数调用”）：
+  // 应先剥离 thinking 参数保留 tools 重试，并缓存结论；后续带 tools 的请求不再携带 thinking 参数
+  const cbCalls = [];
+  const cbContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function (url, options) {
+      cbCalls.push(JSON.parse(options.body));
+      if (cbCalls.length === 1) {
+        return { ok: false, status: 400, statusText: "Bad Request", json: async function () { return { error: { message: "当前模型不支持函数调用", type: "None", param: "None", code: "400" } }; } };
+      }
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "click", arguments: "{\"elementRef\":\"e1\"}" } }] } }] });
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; } };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", cbContext);
+  const cbConfig = { apiUrl: "https://example.com/v1", apiKey: "key", model: "zhanlu/qwen3.7-plus", enableThinking: true };
+  const cbTools = [{ type: "function", function: { name: "click", description: "点击", parameters: { type: "object", properties: {} } } }];
+  const cbResult = await cbContext.window.AIFT_AIClient.chatStream(cbConfig, [{ role: "user", content: "go" }], cbTools, { maxRetries: 1 });
+  assert.strictEqual(cbCalls.length, 2, "组合拒绝后应重试一次即成功");
+  assert.strictEqual(cbCalls[0].enable_thinking, true, "首次请求应携带 enable_thinking");
+  assert.ok(cbCalls[0].tools, "首次请求应携带 tools");
+  assert.strictEqual(cbCalls[1].enable_thinking, undefined, "重试应移除 enable_thinking");
+  assert.strictEqual(cbCalls[1].thinking, undefined, "重试不应携带 thinking");
+  assert.ok(cbCalls[1].tools, "重试应保留 tools（组合拒绝不等于模型不支持函数调用）");
+  assert.strictEqual(cbCalls[1].messages.length, 1, "组合拒绝重试不应注入文本协议消息");
+  assert.strictEqual(cbCalls[1].temperature, undefined, "深度思考模式下任何请求都不应携带 temperature");
+  assert.strictEqual(cbResult.message.tool_calls[0].function.name, "click", "保留 tools 后应正常返回原生 tool_calls");
+  // 组合结论缓存：后续带 tools 的请求直接跳过 thinking 参数
+  await cbContext.window.AIFT_AIClient.chatStream(cbConfig, [{ role: "user", content: "go" }], cbTools, { maxRetries: 1 });
+  assert.strictEqual(cbCalls.length, 3, "缓存命中后不应再触发组合降级重试");
+  assert.strictEqual(cbCalls[2].enable_thinking, undefined, "缓存命中后带 tools 的请求不应携带 enable_thinking");
+  assert.ok(cbCalls[2].tools, "缓存命中后应继续携带 tools");
 
   const files = {
     "views/dashboard/Overview.vue": "<template><h1>Overview</h1></template>",

@@ -61,6 +61,349 @@
     });
   }
 
+  // === 模型 function calling 能力处理（借鉴 OpenCode 按模型能力决定是否发送 tools）===
+  // 用户可填写任意模型，无法静态维护能力表，因此运行时探测：
+  // 网关返回“模型不支持函数调用”类 400 时缓存该能力结论，降级为文本协议：
+  // 不再发送 tools/tool_choice，改为要求模型在正文输出 JSON 动作数组（由 extractToolCalls 解析）。
+  var modelToolSupport = {}; // key: apiUrl::model → false 表示该模型不支持 function calling
+
+  function modelCapabilityKey(config) {
+    return (config.apiUrl || "") + "::" + (config.model || "");
+  }
+
+  /**
+   * 判断 4xx 错误是否为“模型不支持函数调用/工具调用”
+   * 兼容中英文网关报错，如：当前模型不支持函数调用 / does not support function calling / tools is not supported
+   */
+  function isToolCallUnsupportedError(errText) {
+    var t = String(errText || "").toLowerCase();
+    if (!t) return false;
+    if (t.indexOf("不支持函数调用") !== -1 || t.indexOf("不支持工具调用") !== -1) return true;
+    var hasToolWord = t.indexOf("function call") !== -1 || t.indexOf("function_call") !== -1 ||
+                      t.indexOf("tool call") !== -1 || t.indexOf("tool_call") !== -1 ||
+                      t.indexOf("tool_choice") !== -1 || t.indexOf("tools") !== -1;
+    if (!hasToolWord) return false;
+    return t.indexOf("not support") !== -1 || t.indexOf("unsupported") !== -1 ||
+           t.indexOf("doesn't support") !== -1 || t.indexOf("not allowed") !== -1 ||
+           t.indexOf("not enabled") !== -1 || t.indexOf("unavailable") !== -1;
+  }
+
+  /**
+   * 文本协议降级：把工具 schema 转为文本说明注入消息末尾，
+   * 要求模型在正文直接输出 JSON 动作数组，格式与 extractToolCalls 的解析对应。
+   */
+  function buildTextProtocolMessage(tools) {
+    var lines = [
+      "⚠️ 当前模型不支持 function calling，你必须直接在回复正文中输出 JSON 来表达动作，严格遵守：",
+      "1. 整个回复只是一个 JSON 数组，不要输出任何解释、分析或 Markdown 代码块标记",
+      "2. 格式：[{\"action\": \"工具名\", \"参数名\": \"参数值\"}]，每轮数组中只放一个动作对象",
+      "3. 可用工具及参数如下（参数名带 ? 表示可选）：",
+    ];
+    for (var i = 0; i < tools.length; i++) {
+      var fn = tools[i] && tools[i].function;
+      if (!fn || !fn.name) continue;
+      var properties = (fn.parameters && fn.parameters.properties) || {};
+      var required = (fn.parameters && fn.parameters.required) || [];
+      var paramStr = Object.keys(properties).map(function (p) {
+        return required.indexOf(p) === -1 ? p + "?" : p;
+      }).join(", ");
+      lines.push("- " + fn.name + "(" + paramStr + "): " + (fn.description || ""));
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * 为请求应用 tools 或文本协议降级。
+   * @returns {Array} 实际发送的 messages（降级时会在末尾追加文本协议 system 消息）
+   */
+  function applyToolsToBody(body, config, messages, tools) {
+    if (!tools || tools.length === 0) return messages;
+    var key = modelCapabilityKey(config);
+    // 静态能力表门控（借鉴 OpenCode capabilities.toolcall）：明确不支持时直接走文本协议，避免白挨一个 400
+    var caps = lookupStaticCaps(config.model);
+    if (caps && caps.toolcall === false) modelToolSupport[key] = false;
+    if (modelToolSupport[key] === false) {
+      // 已知该模型不支持 function calling：直接走文本协议
+      return messages.concat([{ role: "system", content: buildTextProtocolMessage(tools) }]);
+    }
+    body.tools = normalizeToolsForCompatibility(tools);
+    // 借鉴 OpenCode（prompt.ts：正常流程不发送 tool_choice，等效 auto）：
+    // DashScope 系网关仅支持 auto/none，发送 "required" 会被模板错误误报为“模型不支持函数调用”
+    body.tool_choice = "auto";
+    return messages;
+  }
+
+  // 标记“thinking + tools 组合被网关拒绝”的模型：后续带 tools 的请求不再携带 thinking 参数
+  var modelThinkingWithTools = {}; // key → false 表示组合被拒
+
+  /**
+   * 4xx 错误降级处理：识别“模型不支持函数调用”类错误，分两段降级。
+   * 第一段：body 同时带 thinking 参数时，先剥离 thinking 保留 tools 重试——
+   *         部分网关不接受“深度思考 + 函数调用”组合，却统一报“模型不支持函数调用”。
+   * 第二段：仍失败才确认模型不支持函数调用，缓存能力结论并切换为文本协议。
+   * @returns {Array|null} 降级后的 messages；不可降级返回 null
+   */
+  function downgradeFunctionCallError(body, config, messages, tools, status, errText) {
+    if (!body.tools) return null; // 未发送 tools，与函数调用无关
+    if (!(status >= 400 && status < 500) || status === 429) return null;
+    if (!isToolCallUnsupportedError(errText)) return null;
+    if (body.thinking !== undefined || body.enable_thinking !== undefined) {
+      console.warn("[AIFT] 疑似“深度思考 + 函数调用”组合被拒（" + status + "），移除 thinking 参数保留 tools 重试");
+      body.thinking = undefined;
+      body.enable_thinking = undefined;
+      modelThinkingWithTools[modelCapabilityKey(config)] = false;
+      return messages;
+    }
+    console.warn("[AIFT] 模型不支持函数调用（" + status + ": " + errText + "），降级为文本协议");
+    modelToolSupport[modelCapabilityKey(config)] = false;
+    body.tools = undefined;
+    body.tool_choice = undefined;
+    return messages.concat([{ role: "system", content: buildTextProtocolMessage(tools) }]);
+  }
+
+  // === thinking（深度思考）参数能力处理 ===
+  // 不同厂商的 thinking 参数格式不同：GLM 系用 thinking: {type:"enabled"}，
+  // qwen/DashScope 系用 enable_thinking: true。运行时按 glm → qwen → none 级联探测并缓存结论。
+  // 原则：用户勾选深度思考后，任何请求都不得携带 temperature。
+  var modelThinkingMode = {}; // key → "glm" | "qwen" | "none"
+
+  /**
+   * 判断 4xx 错误是否与 thinking 参数相关（避免无关 400 误关深度思考）
+   */
+  function isThinkingRelatedError(errText) {
+    var t = String(errText || "").toLowerCase();
+    if (!t) return false;
+    return t.indexOf("thinking") !== -1 || t.indexOf("enable_thinking") !== -1 ||
+           t.indexOf("思考") !== -1 || t.indexOf("reasoning") !== -1;
+  }
+
+  /**
+   * 按能力为请求应用 thinking 参数。
+   * 勾选深度思考时不发送 temperature；未勾选时按 OpenCode 规则应用采样参数。
+   * @param {boolean} willSendTools 本次请求是否携带 tools（组合被拒的模型需跳过 thinking 参数）
+   * @returns {string} 本次使用的模式 "glm" | "qwen" | "none" | "none-skip" | "off"
+   */
+  function applyThinkingToBody(body, config, willSendTools) {
+    if (!config.enableThinking) {
+      applySamplingParams(body, config);
+      return "off";
+    }
+    var mode = resolveInitialThinkingMode(config);
+    // 已知该模型“thinking + tools”组合被拒：带 tools 时跳过 thinking 参数（不污染模型级 thinking 结论）
+    if (willSendTools && mode !== "none" && modelThinkingWithTools[modelCapabilityKey(config)] === false) {
+      return "none-skip";
+    }
+    if (mode === "glm") {
+      body.thinking = { type: "enabled" };
+    } else if (mode === "qwen") {
+      body.enable_thinking = true;
+    }
+    // "none"：已知模型不支持深度思考，不带任何 thinking 参数，也不补 temperature
+    return mode;
+  }
+
+  /**
+   * 4xx 时的 thinking 降级：glm → qwen → none 级联切换，缓存探测结论。
+   * 与 thinking 无关的 4xx：保底移除 thinking 参数重试一次（不缓存，避免误关深度思考）。
+   * 任何情况下都不添加 temperature。
+   * @returns {string|null} 降级后的新模式；不可降级返回 null
+   */
+  function downgradeThinking(body, config, status, errText, currentMode) {
+    if (!config.enableThinking) return null;
+    if (currentMode !== "glm" && currentMode !== "qwen") return null;
+    if (!(status >= 400 && status < 500) || status === 429) return null;
+    if (isThinkingRelatedError(errText)) {
+      if (currentMode === "glm") {
+        console.warn("[AIFT] thinking(GLM 格式) 不被接受（" + status + "），改用 enable_thinking 格式重试");
+        body.thinking = undefined;
+        body.enable_thinking = true;
+        modelThinkingMode[modelCapabilityKey(config)] = "qwen";
+        return "qwen";
+      }
+      console.warn("[AIFT] 模型不支持深度思考（" + status + "），后续请求不再发送 thinking 参数");
+      body.thinking = undefined;
+      body.enable_thinking = undefined;
+      modelThinkingMode[modelCapabilityKey(config)] = "none";
+      return "none";
+    }
+    // 与 thinking 无关的 4xx：body 中还有 thinking 参数时才值得重试，否则交给上层抛错
+    if (body.thinking === undefined && body.enable_thinking === undefined) return null;
+    console.warn("[AIFT] 4xx（" + status + "），移除 thinking 参数后重试");
+    body.thinking = undefined;
+    body.enable_thinking = undefined;
+    return "none";
+  }
+
+  // === 模型静态能力表（借鉴 OpenCode：models.dev capabilities + ProviderTransform 家族默认）===
+  // OpenCode 的做法（provider.ts / transform.ts / request.ts）：
+  //   1. 每个模型有静态 capabilities（temperature/reasoning/tool_call/modalities），来自 models.dev；
+  //   2. temperature 默认不发送（capabilities.temperature ?? false），支持时也按模型家族给调优值；
+  //   3. reasoning 为 false 时不发送任何 thinking 参数；DashScope 系用 enable_thinking: true。
+  // 这里做轻量化移植：运行时拉取 models.dev 扁平化为能力表，拉取失败则用家族规则 + 运行时探测兜底。
+  var MODELS_DEV_URL = "https://models.dev/api.json";
+  var MODELS_DEV_CACHE_KEY = "aift_models_dev_caps";
+  var MODELS_DEV_TTL = 24 * 3600 * 1000; // 缓存 24 小时
+  var MODELS_DEV_RETRY_COOLDOWN = 30 * 60 * 1000; // 失败后 30 分钟冷却，避免内网环境反复打不可达请求
+  var modelsDevById = null;   // { [modelIdLower]: { temperature, reasoning, toolcall, vision } }
+  var modelsDevPromise = null;
+  var modelsDevFailedAt = 0;
+
+  function flattenModelsDev(json) {
+    var byId = {};
+    Object.keys(json || {}).forEach(function (providerId) {
+      var models = json[providerId] && json[providerId].models;
+      if (!models) return;
+      Object.keys(models).forEach(function (modelId) {
+        var m = models[modelId] || {};
+        var key = modelId.toLowerCase();
+        var caps = {
+          temperature: m.temperature === true,
+          reasoning: m.reasoning === true,
+          toolcall: m.tool_call !== false, // 与 OpenCode 一致：缺省视为支持
+          vision: !!(m.modalities && Array.isArray(m.modalities.input) && m.modalities.input.indexOf("image") !== -1),
+        };
+        var existing = byId[key];
+        if (!existing) {
+          byId[key] = caps;
+        } else {
+          // 同一模型多个 provider 都有记录时合并：能力取并集，toolcall 取交集（宁可少走 tools 也不多踩 400）
+          byId[key] = {
+            temperature: existing.temperature || caps.temperature,
+            reasoning: existing.reasoning || caps.reasoning,
+            toolcall: existing.toolcall && caps.toolcall,
+            vision: existing.vision || caps.vision,
+          };
+        }
+      });
+    });
+    return byId;
+  }
+
+  function readModelsDevCache() {
+    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return Promise.resolve(null);
+    return chrome.storage.local.get(MODELS_DEV_CACHE_KEY).then(function (cached) {
+      var entry = cached && cached[MODELS_DEV_CACHE_KEY];
+      if (entry && entry.byId && Date.now() - entry.fetchedAt < MODELS_DEV_TTL) return entry.byId;
+      return null;
+    }).catch(function () { return null; });
+  }
+
+  function writeModelsDevCache(byId) {
+    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return;
+    var entry = {};
+    entry[MODELS_DEV_CACHE_KEY] = { fetchedAt: Date.now(), byId: byId };
+    chrome.storage.local.set(entry).catch(function () {});
+  }
+
+  /**
+   * 加载 models.dev 能力表（每次会话只拉取一次，失败静默降级为内置规则）
+   * 内网等不可达环境下失败是预期行为：冷却后重试，日志降级为 info 避免误解为故障。
+   */
+  function loadModelsDevCaps() {
+    if (modelsDevPromise) return modelsDevPromise;
+    // 失败冷却期内直接跳过，不再发起请求
+    if (modelsDevFailedAt && Date.now() - modelsDevFailedAt < MODELS_DEV_RETRY_COOLDOWN) {
+      return Promise.resolve(modelsDevById || {});
+    }
+    modelsDevPromise = readModelsDevCache().then(function (cached) {
+      if (cached) {
+        modelsDevById = cached;
+        return modelsDevById;
+      }
+      return fetch(MODELS_DEV_URL).then(function (resp) {
+        if (!resp.ok) throw new Error("models.dev " + resp.status);
+        return resp.json();
+      }).then(function (json) {
+        modelsDevById = flattenModelsDev(json);
+        writeModelsDevCache(modelsDevById);
+        return modelsDevById;
+      });
+    }).catch(function (e) {
+      console.info("[AIFT] models.dev 能力表暂不可用（不影响使用，将以内置规则 + 运行时探测兜底）：" + (e && e.message || e));
+      modelsDevById = {};
+      modelsDevFailedAt = Date.now();
+      modelsDevPromise = null; // 冷却后允许重试
+      return modelsDevById;
+    });
+    return modelsDevPromise;
+  }
+
+  /**
+   * 查询模型的静态能力。网关常在模型名上加前缀（如 openai/qwen-plus），取最后一段兜底匹配。
+   * @returns {Object|null} { temperature, reasoning, toolcall, vision }
+   */
+  function lookupStaticCaps(model) {
+    if (!modelsDevById || !model) return null;
+    var id = String(model).toLowerCase();
+    if (modelsDevById[id]) return modelsDevById[id];
+    var lastSegment = id.split("/").pop();
+    if (modelsDevById[lastSegment]) return modelsDevById[lastSegment];
+    return null;
+  }
+
+  /**
+   * 家族采样参数默认值（移植自 OpenCode ProviderTransform.temperature/topP）。
+   * 仅对已知模型家族给出调优值；未知家族返回空对象（调用方决定兜底）。
+   */
+  function familySamplingParams(model) {
+    var id = String(model || "").toLowerCase();
+    var result = {};
+    if (id.indexOf("qwen") !== -1) {
+      result.temperature = 0.55;
+      result.top_p = 1;
+    } else if (id.indexOf("glm-4.6") !== -1 || id.indexOf("glm-4.7") !== -1) {
+      result.temperature = 1.0;
+    } else if (id.indexOf("kimi-k2") !== -1) {
+      if (id.indexOf("thinking") !== -1 || id.indexOf("k2.") !== -1 || id.indexOf("k2p") !== -1 || id.indexOf("k2-5") !== -1) {
+        result.temperature = 1.0;
+      } else {
+        result.temperature = 0.6;
+      }
+    } else if (id.indexOf("minimax-m2") !== -1) {
+      result.temperature = 1.0;
+      result.top_p = 0.95;
+    }
+    return result;
+  }
+
+  /**
+   * 为请求应用采样参数（借鉴 OpenCode request.ts：capabilities.temperature 为 false 时不发送）。
+   * 能力表明确不支持 temperature 时不带该参数；已知家族用调优值；其余保持 0.5 默认。
+   */
+  function applySamplingParams(body, config) {
+    var caps = lookupStaticCaps(config.model);
+    var family = familySamplingParams(config.model);
+    if (caps && caps.temperature === false) {
+      // 能力表明确不支持 temperature：不发送
+    } else if (family.temperature !== undefined) {
+      body.temperature = family.temperature;
+    } else {
+      body.temperature = 0.5;
+    }
+    if (family.top_p !== undefined) body.top_p = family.top_p;
+  }
+
+  /**
+   * 决定 thinking 参数的初始格式（运行时缓存 > 静态能力表 > 启发式）。
+   * qwen/DashScope 系直接用 enable_thinking，避免每次都先挨一个 400 再降级。
+   */
+  function resolveInitialThinkingMode(config) {
+    var key = modelCapabilityKey(config);
+    if (modelThinkingMode[key]) return modelThinkingMode[key];
+    var caps = lookupStaticCaps(config.model);
+    if (caps && caps.reasoning === false) {
+      // 能力表明确不支持推理：不发送 thinking 参数（与 OpenCode 的 capabilities.reasoning 门控一致）
+      modelThinkingMode[key] = "none";
+      return "none";
+    }
+    var hint = (String(config.apiUrl || "") + " " + String(config.model || "")).toLowerCase();
+    if (hint.indexOf("dashscope") !== -1 || hint.indexOf("alibaba") !== -1 ||
+        hint.indexOf("qwen") !== -1 || hint.indexOf("qwq") !== -1) {
+      return "qwen";
+    }
+    return "glm";
+  }
+
   /**
    * 检测文本中是否存在重复段落（精确匹配，带滑动窗口）
    * 
@@ -137,6 +480,8 @@
    */
   async function chat(config, messages, tools, options) {
     options = options || {};
+    // 后台加载 models.dev 能力表（不阻塞当前请求，加载成功后对后续请求生效）
+    try { loadModelsDevCaps(); } catch (e) {}
     // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
     var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
     var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
@@ -148,16 +493,11 @@
       messages: messages,
     };
 
-    if (config.enableThinking) {
-      body.thinking = { type: "enabled" };
-    } else {
-      body.temperature = 0.5;
-    }
+    // thinking 参数按模型能力缓存选择格式；勾选深度思考时不发送 temperature
+    var thinkingMode = applyThinkingToBody(body, config, !!(tools && tools.length));
 
-    if (tools && tools.length > 0) {
-      body.tools = normalizeToolsForCompatibility(tools);
-      body.tool_choice = "required";
-    }
+    // 按模型能力决定发送 tools 还是走文本协议（能力结论在运行时探测并缓存）
+    body.messages = applyToolsToBody(body, config, messages, tools);
 
     // 标记不可重试的错误，避免对 4xx（非 429）做无意义重试
     var NonRetryableError = function (msg) { this.name = "NonRetryableError"; this.message = msg; };
@@ -202,6 +542,20 @@
             errText = (errJson.error && errJson.error.message) ? errJson.error.message : JSON.stringify(errJson);
           } catch (e) {
             errText = resp.statusText;
+          }
+          // 模型不支持函数调用：缓存能力结论，降级为文本协议重试（不计入重试次数）
+          var downgradedMessages = downgradeFunctionCallError(body, config, messages, tools, resp.status, errText);
+          if (downgradedMessages) {
+            body.messages = downgradedMessages;
+            attempt--; // 降级重试不消耗重试次数
+            continue;
+          }
+          // thinking 参数不被接受：级联降级（不添加 temperature，不计入重试次数）
+          var downgradedThinkingMode = downgradeThinking(body, config, resp.status, errText, thinkingMode);
+          if (downgradedThinkingMode) {
+            thinkingMode = downgradedThinkingMode;
+            attempt--; // 降级重试不消耗重试次数
+            continue;
           }
           var apiErr = new Error("API 错误 " + resp.status + ": " + errText);
           // 4xx 不重试（除 429）
@@ -258,6 +612,30 @@
   }
 
   /**
+   * 从正文中提取内嵌的 JSON 动作（文本协议模式下模型可能在 JSON 前后夹杂说明文字）
+   * 取第一个 [/{ 到最后一个 ]/} 的子串尝试解析，要求包含 "action"/"name" 字段避免误判
+   */
+  function extractEmbeddedActionJson(content) {
+    var bracketIdx = content.indexOf("[");
+    var braceIdx = content.indexOf("{");
+    var startIdx;
+    if (bracketIdx === -1) startIdx = braceIdx;
+    else if (braceIdx === -1) startIdx = bracketIdx;
+    else startIdx = Math.min(bracketIdx, braceIdx);
+    if (startIdx === -1) return null;
+    var closeChar = content.charAt(startIdx) === "[" ? "]" : "}";
+    var endIdx = content.lastIndexOf(closeChar);
+    if (endIdx <= startIdx) return null;
+    var candidate = content.substring(startIdx, endIdx + 1);
+    if (candidate.indexOf('"action"') === -1 && candidate.indexOf('"name"') === -1) return null;
+    try {
+      return JSON.parse(candidate);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
    * 从 AI message 中提取 tool_calls
    * @param {Object} message
    * @returns {Array}
@@ -268,35 +646,35 @@
     // 有些模型不返回 tool_calls 而是直接在 content 里返回 JSON
     if (message.content) {
       var content = message.content.trim();
-      // 尝试解析 JSON 数组
-      if (content.startsWith("[")) {
+      // 文本协议下模型常用 Markdown 代码块包裹 JSON，先剥离
+      var fence = content.match(/^```[a-zA-Z]*\s*\n?([\s\S]*?)```\s*$/);
+      if (fence) content = fence[1].trim();
+      // 严格解析：整个正文是 JSON
+      var parsed = null;
+      if (content.startsWith("[") || content.startsWith("{")) {
         try {
-          var parsed = JSON.parse(content);
-          if (Array.isArray(parsed)) {
-            return parsed.map(function (action, i) {
-              return {
-                id: "inline_" + i,
-               type: "function",
-               function: { name: action.action || action.name || "unknown", arguments: JSON.stringify(action) },
-              };
-            });
-          }
+          parsed = JSON.parse(content);
         } catch (e) {
-          // 不是 JSON，忽略
+          parsed = null;
         }
       }
-      // 尝试解析单个 JSON 对象
-      if (content.startsWith("{")) {
-        try {
-          var obj = JSON.parse(content);
-          return [{
-           id: "inline_0",
-           type: "function",
-           function: { name: obj.action || obj.name || "unknown", arguments: JSON.stringify(obj) },
-         }];
-        } catch (e) {
-          // 不是 JSON，忽略
-        }
+      // 宽松解析：正文中内嵌 JSON 动作
+      if (!parsed) parsed = extractEmbeddedActionJson(content);
+      if (Array.isArray(parsed)) {
+        return parsed.map(function (action, i) {
+          return {
+            id: "inline_" + i,
+            type: "function",
+            function: { name: action.action || action.name || "unknown", arguments: JSON.stringify(action) },
+          };
+        });
+      }
+      if (parsed && typeof parsed === "object") {
+        return [{
+          id: "inline_0",
+          type: "function",
+          function: { name: parsed.action || parsed.name || "unknown", arguments: JSON.stringify(parsed) },
+        }];
       }
     }
     return [];
@@ -315,6 +693,8 @@
    */
   async function chatStream(config, messages, tools, options) {
     options = options || {};
+    // 后台加载 models.dev 能力表（不阻塞当前请求，加载成功后对后续请求生效）
+    try { loadModelsDevCaps(); } catch (e) {}
     // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
     var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
     var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
@@ -328,18 +708,11 @@
       stream: true,
     };
 
-    // thinking 模式：GLM 等模型需要显式开启深度思考
-    // 开启时 temperature 由模型自行管理（部分模型要求不设或设特定值）
-    if (config.enableThinking) {
-      body.thinking = { type: "enabled" };
-    } else {
-      body.temperature = 0.5;
-    }
+    // thinking 参数按模型能力缓存选择格式；勾选深度思考时不发送 temperature
+    var thinkingMode = applyThinkingToBody(body, config, !!(tools && tools.length));
 
-    if (tools && tools.length > 0) {
-      body.tools = normalizeToolsForCompatibility(tools);
-      body.tool_choice = "required";
-    }
+    // 按模型能力决定发送 tools 还是走文本协议（能力结论在运行时探测并缓存）
+    body.messages = applyToolsToBody(body, config, messages, tools);
 
     var lastError;
     for (var attempt = 0; attempt <= maxRetries; attempt++) {
@@ -388,12 +761,20 @@
           } catch (e) {
             errText = resp.statusText;
           }
-          // 如果 thinking 参数导致报错，自动降级重试（去掉 thinking）
-          if (config.enableThinking && resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
-            console.warn("[AIFT] thinking 模式可能不被支持（" + resp.status + "），降级重试");
-            body.thinking = undefined;
-            body.temperature = 0.5;
-            continue; // 不计入重试次数
+          // 模型不支持函数调用：缓存能力结论，降级为文本协议重试（不计入重试次数）
+          // 放在 thinking 降级之前：该错误更具体，避免被 thinking 降级抢先消耗一次无效重试
+          var downgradedMessages = downgradeFunctionCallError(body, config, messages, tools, resp.status, errText);
+          if (downgradedMessages) {
+            body.messages = downgradedMessages;
+            attempt--; // 降级重试不消耗重试次数
+            continue;
+          }
+          // thinking 参数不被接受：级联降级（不添加 temperature，不计入重试次数）
+          var downgradedThinkingMode = downgradeThinking(body, config, resp.status, errText, thinkingMode);
+          if (downgradedThinkingMode) {
+            thinkingMode = downgradedThinkingMode;
+            attempt--; // 降级重试不消耗重试次数
+            continue;
           }
           var apiErr = new Error("API 错误 " + resp.status + ": " + errText);
           // 4xx 不重试（除 429）
@@ -690,5 +1071,7 @@
     normalizeToolsForCompatibility: normalizeToolsForCompatibility,
     buildVisionContent: buildVisionContent,
     buildVisionMessage: buildVisionMessage,
+    loadModelCaps: loadModelsDevCaps,
+    lookupStaticCaps: lookupStaticCaps,
   };
 })(window);

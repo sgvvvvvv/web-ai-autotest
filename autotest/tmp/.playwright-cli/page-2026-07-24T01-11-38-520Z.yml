@@ -1,0 +1,69 @@
+- generic [active] [ref=f1e1]:
+  - banner [ref=f1e2]:
+    - heading "AI 前端自动化测试" [level=1] [ref=f1e3]
+    - generic [ref=f1e4]: Vision + CDP
+  - generic [ref=f1e5]:
+    - heading "⑤ 执行测试" [level=2] [ref=f1e6]
+    - generic [ref=f1e7]:
+      - button "运行 AI 测试" [disabled] [ref=f1e8] [cursor=pointer]
+      - button "测试策略分析" [disabled] [ref=f1e9] [cursor=pointer]
+      - generic [ref=f1e10]: 正在运行 TC-003...
+  - generic [ref=f1e11]:
+    - generic [ref=f1e12]:
+      - heading "AI 思考与响应" [level=2] [ref=f1e13]
+      - generic [ref=f1e14]:
+        - generic [ref=f1e15]: 上下文 82K
+        - button "中止" [ref=f1e19] [cursor=pointer]
+    - generic [ref=f1e20]:
+      - generic [ref=f1e21]: ── Round 12 ──
+      - generic [ref=f1e22]: "💭 当前页面显示商品列表，共 15 条记录。需要点击\"新增商品\"按钮来创建新商品。按钮位于页面右上角，elementRef: btn-add-product..."
+      - generic [ref=f1e23]: "⚡ click(elementRef: \"btn-add-product\")"
+      - generic [ref=f1e24]: ✓ 点击成功，页面跳转到商品编辑表单
+      - generic [ref=f1e25]: ── Round 13 ──
+      - generic [ref=f1e26]: 💭 已进入新增商品表单页面。需要填写：商品名称、价格、库存、分类。先填写商品名称字段...
+      - generic [ref=f1e27]: "⚡ fill_input(elementRef: \"input-product-name\", value: \"测试商品-无线蓝牙耳机\")"
+      - generic [ref=f1e28]: ✓ 输入成功，字段值已更新
+      - generic [ref=f1e29]: "⚡ fill_input(elementRef: \"input-price\", value: \"299.00\")"
+      - generic [ref=f1e30]: ✓ 输入成功，字段值已更新
+      - generic [ref=f1e31]: "⚡ select_option(elementRef: \"select-category\", option: \"数码电子\")"
+      - generic [ref=f1e32]: ✓ 下拉选择成功
+      - generic [ref=f1e33]: 💬 表单填写完成，准备点击保存按钮提交
+    - generic [ref=f1e35]:
+      - textbox "输入内容接续当前对话（如：跳过当前用例、检查弹窗、换一种方式...）" [ref=f1e36]
+      - button "发送" [ref=f1e37] [cursor=pointer]
+  - generic [ref=f1e38]:
+    - generic [ref=f1e39]:
+      - heading "AI 视觉截图 (Round 13)" [level=2] [ref=f1e40]
+      - button "收起" [ref=f1e42] [cursor=pointer]
+    - generic [ref=f1e44]:
+      - generic [ref=f1e45]: 当前截图（标注模式）
+      - generic [ref=f1e46]: "[商品编辑表单页面截图 - 带元素编号标注]"
+  - generic [ref=f1e47]:
+    - generic [ref=f1e48]:
+      - heading "测试结果 3/6 通过" [level=2] [ref=f1e49]
+      - button "导出报告" [disabled] [ref=f1e51] [cursor=pointer]
+    - generic [ref=f1e52]:
+      - generic [ref=f1e54] [cursor=pointer]:
+        - generic [ref=f1e55]: ✓
+        - generic [ref=f1e56]: TC-001
+        - generic [ref=f1e57]: 验证商品列表页面正常加载，展示商品数据
+      - generic [ref=f1e59] [cursor=pointer]:
+        - generic [ref=f1e60]: ✓
+        - generic [ref=f1e61]: TC-002
+        - generic [ref=f1e62]: 新增商品：填写完整信息并保存成功
+      - generic [ref=f1e64] [cursor=pointer]:
+        - generic [ref=f1e65]: ⟳
+        - generic [ref=f1e66]: TC-003
+        - generic [ref=f1e67]: 编辑商品：修改价格和库存，保存后验证更新
+      - generic [ref=f1e69] [cursor=pointer]:
+        - generic [ref=f1e70]: ○
+        - generic [ref=f1e71]: TC-004
+        - generic [ref=f1e72]: 删除商品：确认弹窗后删除，验证列表移除
+      - generic [ref=f1e74] [cursor=pointer]:
+        - generic [ref=f1e75]: ○
+        - generic [ref=f1e76]: TC-005
+        - generic [ref=f1e77]: 搜索功能：输入关键词筛选商品列表
+      - generic [ref=f1e79] [cursor=pointer]:
+        - generic [ref=f1e80]: ○
+        - generic [ref=f1e81]: TC-006
+        - generic [ref=f1e82]: 分页功能：翻页后数据正确加载

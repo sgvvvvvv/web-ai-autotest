@@ -3154,6 +3154,10 @@
 
           // 从 tool_calls 推断当前测试用例
           var toolCalls = global.AIFT_AIClient.extractToolCalls(message);
+          // 文本协议模式（模型不支持 function calling，ai-client 已自动降级）：
+          // 动作从 content JSON 解析，无原生 tool_calls，工具结果必须以 user 消息回传，
+          // 否则 role:tool 无前置 tool_calls 会被网关以 400 拒绝
+          var hasNativeToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
           state.lastReasoning = message.reasoning_content || message.content || "";
           recordTrace({
             type: "ai_decision",
@@ -3371,28 +3375,42 @@
                 visionPrefix + annoListText,
                 execResult.screenshot.dataUrl
               );
-              state.conversationHistory.push({
-                role: "tool",
-                tool_call_id: tc.id || ("call_" + t),
-                name: tc.function.name,
-                content: JSON.stringify({
-                  text: toolResultContent,
-                  image: true,
-                  width: execResult.screenshot.width,
-                  height: execResult.screenshot.height,
-                }),
-              });
+              if (hasNativeToolCalls) {
+                state.conversationHistory.push({
+                  role: "tool",
+                  tool_call_id: tc.id || ("call_" + t),
+                  name: tc.function.name,
+                  content: JSON.stringify({
+                    text: toolResultContent,
+                    image: true,
+                    width: execResult.screenshot.width,
+                    height: execResult.screenshot.height,
+                  }),
+                });
+              } else {
+                // 文本协议：以 user 消息回传工具结果
+                state.conversationHistory.push({
+                  role: "user",
+                  content: "[工具执行结果] " + tc.function.name + ":\n" + toolResultContent,
+                });
+              }
               // 额外注入一条 user 消息携带图片，因为 tool 消息不支持 image_url
               state.conversationHistory.push({
                 role: "user",
                 content: visionContent,
               });
-            } else {
+            } else if (hasNativeToolCalls) {
               state.conversationHistory.push({
                 role: "tool",
                 tool_call_id: tc.id || ("call_" + t),
                 name: tc.function.name,
                 content: toolResultContent,
+              });
+            } else {
+              // 文本协议：以 user 消息回传工具结果
+              state.conversationHistory.push({
+                role: "user",
+                content: "[工具执行结果] " + tc.function.name + " → " + toolResultContent,
               });
             }
 
