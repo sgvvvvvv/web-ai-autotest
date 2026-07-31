@@ -3075,16 +3075,33 @@
             }
             // 推理重复循环 → 中止当前请求，保留上下文，注入提示后继续下一轮
             if (e.name === "ReasoningLoopError") {
-              state.reasoningLoopCount++;
-              stream("warning", "⚠️ 检测到 AI 推理内容重复循环，已自动中断（第 " + state.reasoningLoopCount + " 次）");
+              var noActionReasoning = String(e.breakReason || "").indexOf("未调用工具且未产生新证据") !== -1;
+              if (noActionReasoning) {
+                // 长推理不是错误。中断当前流以打断可能的空转，再基于相同快照
+                // 自动续跑；只有多次扰动仍无进展才交给常规循环守卫暂停。
+                state.reasoningLoopCount++;
+                stream("warning", "⚠️ AI 长时间未调用工具，已注入扰动并继续执行（第 " + state.reasoningLoopCount + " 次）");
+                state.conversationHistory.push({
+                  role: "user",
+                  content: "⚠️ [系统扰动] 你刚才进行了较长推理但尚未调用工具，当前页面快照没有变化。" +
+                    "不要复述已有分析；保留已有判断，直接选择一个能获取新证据或推进当前 TC 的工具调用。" +
+                    "若两种不同策略均已失败，调用 assert 标记 inconclusive/failed 并继续下一用例。",
+                });
+                state.loopWarning = null;
+                log("💡 已对无动作长推理注入扰动，自动继续下一轮");
+                if (state.reasoningLoopCount < 3) continue;
+              }
+              if (!noActionReasoning) state.reasoningLoopCount++;
+              var loopLabel = noActionReasoning ? "连续长推理未调用工具" : "AI 推理内容重复循环";
+              stream("warning", "⚠️ 检测到" + loopLabel + "，已自动中断（第 " + state.reasoningLoopCount + " 次）");
 
               // 连续 3 次推理死循环 → 暂停等待用户介入
               if (state.reasoningLoopCount >= 3) {
-                log("⛔ 连续 " + state.reasoningLoopCount + " 次推理死循环，暂停等待用户介入");
-                stream("warning", "⛔ 连续推理死循环 " + state.reasoningLoopCount + " 次，已暂停");
+                log("⛔ 连续 " + state.reasoningLoopCount + " 次" + loopLabel + "，暂停等待用户介入");
+                stream("warning", "⛔ 连续 " + loopLabel + " " + state.reasoningLoopCount + " 次，已暂停");
                 state.paused = true;
                 notifyAutoPause("reasoning_loop");
-                state.loopWarning = "⛔ AI 推理连续陷入重复循环（" + state.reasoningLoopCount + " 次），已暂停。\n" +
+                state.loopWarning = "⛔ AI " + loopLabel + "（" + state.reasoningLoopCount + " 次），已暂停。\n" +
                   "测试已暂停，请检查当前页面状态。你可以：\n" +
                   "1. 输入指令引导 AI 换一种思路\n" +
                   "2. 点击「继续」重试\n" +
@@ -3203,7 +3220,7 @@
             }
 
             if (state.noToolCallCount >= 2) {
-              // 连续 2 次无 tool_calls，暂停等待用户介入
+              // 允许一次纯文本回复后的扰动续跑，避免把需要较长规划的模型过早暂停。
               log("AI 连续 " + state.noToolCallCount + " 轮未返回动作，暂停等待用户介入");
               stream("warning", "⚠️ AI 连续 " + state.noToolCallCount + " 轮未返回动作，已暂停");
               state.paused = true;
@@ -3218,16 +3235,13 @@
               continue; // 跳过本轮剩余处理，下一轮顶部暂停检查会触发等待
             }
 
-            // 首次无 tool_calls：注入提示，要求 AI 继续执行或显式 finish
-            log("AI 未返回动作（第 " + state.noToolCallCount + " 次），注入提示要求继续");
-            stream("warning", "⚠️ AI 未返回工具调用，已注入提示要求继续执行");
+            // 首次无 tool_calls：注入扰动，让模型保留已有判断并直接产生动作。
+            log("AI 未返回动作（第 " + state.noToolCallCount + " 次），注入扰动后继续");
+            stream("warning", "⚠️ AI 未返回工具调用，已注入扰动并继续执行");
             state.conversationHistory.push({
               role: "user",
-              content: "你刚才没有调用任何工具。请继续执行测试任务：\n" +
-                "1. 如果测试用例尚未全部完成，请继续调用工具执行下一步操作\n" +
-                "2. 如果所有用例已处理完毕，请显式调用 finish 工具结束测试\n" +
-                "3. 不要只输出文本分析，必须通过工具调用来执行操作\n" +
-                "请立即调用工具继续。",
+              content: "⚠️ [系统扰动] 保留刚才的判断，不要重复解释当前页面。" +
+                "请直接调用一个工具获取新证据或推进当前测试；若当前 TC 已经无法验证，调用 assert(outcome='inconclusive' 或 'failed')。",
             });
             continue;
           }

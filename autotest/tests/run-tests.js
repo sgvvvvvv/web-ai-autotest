@@ -30,6 +30,10 @@ async function run() {
   const aiClientSource = fs.readFileSync(path.join(__dirname, "..", "core", "ai-client.js"), "utf8");
   const sidePanelSource = fs.readFileSync(path.join(__dirname, "..", "sidepanel", "sidepanel.js"), "utf8");
   assert.strictEqual(/AIFT_AIClient\.chat\(/.test(agentLoopSource), false, "Agent Loop 的 AI 请求必须使用流式 chatStream");
+  assert.ok(/MAX_NO_ACTION_RESPONSE_CHARS = 12000/.test(aiClientSource), "流式执行应以宽松预算限制未产生动作的长篇推理");
+  assert.ok(/未调用工具且未产生新证据的长篇推理/.test(aiClientSource), "无动作长篇推理必须以明确原因中断");
+  assert.ok(/if \(state\.noToolCallCount >= 2\)/.test(agentLoopSource), "执行 Agent 应在首次纯文本回复后先注入扰动再暂停");
+  assert.ok(/系统扰动/.test(agentLoopSource), "无动作长篇推理必须注入扰动后自动续跑");
   assert.ok(/case "finish":\s*[\s\S]*?state\.finished = true;/.test(agentLoopSource), "AI 调用 finish 后必须立即结束测试");
   assert.strictEqual(/AI 调用了 finish，对话已暂停/.test(agentLoopSource), false, "finish 不应暂停等待用户手动停止");
   assert.ok(/MAX_REASONING_TIME_MS = 600000/.test(aiClientSource), "推理时间上限应为 600 秒");
@@ -285,6 +289,40 @@ async function run() {
   const fcToolCalls = fcContext.window.AIFT_AIClient.extractToolCalls(fcResult.message);
   assert.strictEqual(fcToolCalls[0].function.name, "click", "文本协议响应应解析出工具动作");
   assert.strictEqual(JSON.parse(fcToolCalls[0].function.arguments).elementRef, "e1");
+
+  // 工具可用时，模型若只持续输出 reasoning 而没有动作，必须在单次响应内熔断。
+  const noActionContext = vm.createContext({
+    window: {},
+    AbortController,
+    TextDecoder,
+    TextEncoder,
+    setTimeout,
+    clearTimeout,
+    console,
+    fetch: async function () {
+      const payload = 'data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: "r".repeat(12000) } }] }) + "\n\n";
+      const bytes = new TextEncoder().encode(payload);
+      return {
+        ok: true,
+        body: { getReader: function () {
+          let sent = false;
+          return { read: async function () { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; }, cancel: function () {} };
+        } },
+      };
+    },
+  });
+  loadModule("ai-client.js", noActionContext);
+  await assert.rejects(
+    noActionContext.window.AIFT_AIClient.chatStream(
+      { apiUrl: "https://example.com/v1", apiKey: "key", model: "demo" },
+      [{ role: "user", content: "go" }], fcTools, { maxRetries: 0 }
+    ),
+    function (error) {
+      return error && error.name === "ReasoningLoopError" &&
+        error.breakReason === "未调用工具且未产生新证据的长篇推理";
+    },
+    "长篇无动作 reasoning 必须在流内中断"
+  );
   // 能力缓存：后续请求直接走文本协议，不再发送 tools
   await fcContext.window.AIFT_AIClient.chatStream(fcConfig, [{ role: "user", content: "go" }], fcTools, { maxRetries: 1 });
   assert.strictEqual(fcCalls.length, 3);

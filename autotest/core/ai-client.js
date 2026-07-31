@@ -21,6 +21,11 @@
   var FUZZY_REPEAT_THRESHOLD = 4;     // 模糊重复阈值更高
   var FUZZY_SIG_LEN = 100;            // 特征签名长度（更长 = 更严格）
 
+  // 执行 Agent 已具备工具时，极长时间没有动作可能是空转。
+  // reasoning 很长本身并非错误，因此采用宽松预算；触发后由上层注入扰动并自动续跑。
+  // 具体重复仍由精确/模糊段落检测优先处理。
+  var MAX_NO_ACTION_RESPONSE_CHARS = 12000;
+
   // === 流内总量上限配置 ===
   var MAX_REASONING_TIME_MS = 600000; // reasoning 阶段最大持续时间 600 秒，超过后优雅截断
 
@@ -863,6 +868,16 @@
           if (!reasoningLoopDetected && !gracefulCutoff) {
 
             // ---- A 类：死循环检测（抛错重试）----
+
+            // 检测 0: 有工具可用但持续只输出推理/文本。精确和模糊段落检测
+            // 无法覆盖同义改写，因此以“无动作 + 长输出”作为独立的进展守卫。
+            if (tools && tools.length > 0 && Object.keys(toolCallsAccum).length === 0 &&
+                reasoningAccum.length + contentAccum.length >= MAX_NO_ACTION_RESPONSE_CHARS) {
+              reasoningLoopDetected = true;
+              loopBreakReason = "未调用工具且未产生新证据的长篇推理";
+              console.warn("[AIFT] 检测到无动作长篇推理，中断流。");
+              break;
+            }
 
             // 检测 1: 精确段落重复检测
             if (reasoningAccum.length - lastReasoningCheckLen >= REASONING_CHECK_INTERVAL) {
