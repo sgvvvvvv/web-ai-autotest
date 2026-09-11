@@ -27,17 +27,23 @@ function assertSidePanelDomContract() {
 async function run() {
   assertSidePanelDomContract();
   const agentLoopSource = fs.readFileSync(path.join(__dirname, "..", "core", "agent-loop.js"), "utf8");
+  const networkRecorderSource = fs.readFileSync(path.join(__dirname, "..", "core", "network-recorder.js"), "utf8");
   const aiClientSource = fs.readFileSync(path.join(__dirname, "..", "core", "ai-client.js"), "utf8");
   const sidePanelSource = fs.readFileSync(path.join(__dirname, "..", "sidepanel", "sidepanel.js"), "utf8");
   assert.strictEqual(/AIFT_AIClient\.chat\(/.test(agentLoopSource), false, "Agent Loop 的 AI 请求必须使用流式 chatStream");
-  assert.ok(/MAX_NO_ACTION_RESPONSE_CHARS = 12000/.test(aiClientSource), "流式执行应以宽松预算限制未产生动作的长篇推理");
-  assert.ok(/未调用工具且未产生新证据的长篇推理/.test(aiClientSource), "无动作长篇推理必须以明确原因中断");
-  assert.ok(/if \(state\.noToolCallCount >= 2\)/.test(agentLoopSource), "执行 Agent 应在首次纯文本回复后先注入扰动再暂停");
-  assert.ok(/系统扰动/.test(agentLoopSource), "无动作长篇推理必须注入扰动后自动续跑");
+  assert.strictEqual(/MAX_NO_ACTION_RESPONSE_CHARS/.test(aiClientSource), false, "不应以无动作字符数作为循环判断标准");
+  assert.strictEqual(/未调用工具且未产生新证据的长篇推理/.test(aiClientSource), false, "不应以无工具调用作为死循环原因");
+  assert.strictEqual(/noToolCallCount/.test(agentLoopSource), false, "不应以无工具调用次数作为暂停依据");
+  assert.strictEqual(/系统扰动/.test(agentLoopSource), false, "不应在无工具调用时注入系统扰动");
   assert.ok(/case "finish":\s*[\s\S]*?state\.finished = true;/.test(agentLoopSource), "AI 调用 finish 后必须立即结束测试");
   assert.strictEqual(/AI 调用了 finish，对话已暂停/.test(agentLoopSource), false, "finish 不应暂停等待用户手动停止");
+  assert.ok(/installEventListener\(\);\s*await enableNetwork\(tabId\);\s*startHeartbeat\(\);/.test(networkRecorderSource), "网络录制必须先订阅事件再启用 Network 域，并启动心跳");
+  assert.ok(/return resourceType === "XHR" \|\| resourceType === "Fetch";/.test(networkRecorderSource), "网络录制必须覆盖全部 Fetch/XHR 请求");
+  assert.ok(/Network\.getCookies/.test(networkRecorderSource), "网络录制必须通过 CDP 心跳检查连接状态");
+  assert.ok(/AIFT_NetworkRecorder\.stop\(\);\s*global\.AIFT_NetworkRecorder\.clear\(\);/.test(agentLoopSource), "测试结束后必须清空本轮网络缓存");
+  assert.ok(/read_source 命中[\s\S]*matchedPaths\.join/.test(agentLoopSource), "read_source 结果必须回显命中的文件路径");
   assert.ok(/MAX_REASONING_TIME_MS = 600000/.test(aiClientSource), "推理时间上限应为 600 秒");
-  assert.ok(/Math\.max\(options\.timeout \|\| DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS\)/.test(aiClientSource), "短请求超时不能早于推理时间上限");
+  assert.ok(/Math\.max\(\s*options\.timeout \|\| DEFAULT_TIMEOUT,\s*MAX_REASONING_TIME_MS,?\s*\)/.test(aiClientSource), "短请求超时不能早于推理时间上限");
   const projectAnalyzerSource = fs.readFileSync(path.join(__dirname, "..", "core", "project-analyzer.js"), "utf8");
   assert.ok(/var conversation = \[\{ role: "user", content: prompt \}\];[\s\S]*?while \(true\)/.test(projectAnalyzerSource), "单轮架构分析必须在用户输入后保留上下文并重新请求");
   assert.ok(/state\.userInjecting[\s\S]*?planMessages\.push\(\{ role: "user", content: injectedMsg \}\)/.test(agentLoopSource), "Plan 模式必须在用户输入后保留上下文并重新请求");
@@ -290,8 +296,8 @@ async function run() {
   assert.strictEqual(fcToolCalls[0].function.name, "click", "文本协议响应应解析出工具动作");
   assert.strictEqual(JSON.parse(fcToolCalls[0].function.arguments).elementRef, "e1");
 
-  // 工具可用时，模型若只持续输出 reasoning 而没有动作，必须在单次响应内熔断。
-  const noActionContext = vm.createContext({
+  // 工具可用时，模型即使长时间只输出 reasoning，只要内容不重复也应正常完成。
+  const longReasoningContext = vm.createContext({
     window: {},
     AbortController,
     TextDecoder,
@@ -311,18 +317,13 @@ async function run() {
       };
     },
   });
-  loadModule("ai-client.js", noActionContext);
-  await assert.rejects(
-    noActionContext.window.AIFT_AIClient.chatStream(
-      { apiUrl: "https://example.com/v1", apiKey: "key", model: "demo" },
-      [{ role: "user", content: "go" }], fcTools, { maxRetries: 0 }
-    ),
-    function (error) {
-      return error && error.name === "ReasoningLoopError" &&
-        error.breakReason === "未调用工具且未产生新证据的长篇推理";
-    },
-    "长篇无动作 reasoning 必须在流内中断"
+  loadModule("ai-client.js", longReasoningContext);
+  const longReasoningResult = await longReasoningContext.window.AIFT_AIClient.chatStream(
+    { apiUrl: "https://example.com/v1", apiKey: "key", model: "demo" },
+    [{ role: "user", content: "go" }], fcTools, { maxRetries: 0 }
   );
+  assert.strictEqual(longReasoningResult.message.reasoning_content.length, 12000, "无工具调用的长推理不应被当作死循环中断");
+  assert.strictEqual(longReasoningResult.message.tool_calls, undefined, "无工具调用的长推理应保留为普通响应");
   // 能力缓存：后续请求直接走文本协议，不再发送 tools
   await fcContext.window.AIFT_AIClient.chatStream(fcConfig, [{ role: "user", content: "go" }], fcTools, { maxRetries: 1 });
   assert.strictEqual(fcCalls.length, 3);
@@ -483,6 +484,28 @@ async function run() {
   assert.ok(continuousObservation.indexOf("选择筛选条件") !== -1);
   assert.strictEqual(continuousObservation.indexOf("恢复："), -1);
 
+  // formatHistory 应取最近 20 条记录，而非最早 20 条
+  const longHistory = [];
+  for (let i = 0; i < 25; i++) {
+    longHistory.push({ action: "action_" + i, result: "ok" });
+  }
+  const longHistoryMessages = promptBuilder.buildMessages({
+    requirement: "历史记录测试",
+    testCases: "TC1,测试,页面,已进入,操作,验证",
+    sourceFiles: [],
+    snapshot: { url: "http://localhost", title: "测试页", nodes: [] },
+    conversationHistory: [{ role: "user", content: "开始" }],
+    testCasesState: [{ id: "TC1", title: "测试", status: "testing", steps: "操作", expected: "验证" }],
+    history: longHistory,
+    visionSupported: false,
+  });
+  const historyObservation = longHistoryMessages[longHistoryMessages.length - 1].content;
+  assert.ok(historyObservation.indexOf("action_24") !== -1, "formatHistory 应包含最新记录 action_24");
+  assert.ok(historyObservation.indexOf("action_0") === -1, "formatHistory 不应包含最早记录 action_0");
+  assert.ok(historyObservation.indexOf("已省略 5 条更早记录") !== -1, "formatHistory 应显示省略提示");
+  assert.ok(historyObservation.indexOf("action_5") !== -1, "formatHistory 应包含第 6 条记录 action_5");
+  assert.strictEqual(historyObservation.indexOf("action_4"), -1, "formatHistory 不应包含第 5 条记录 action_4");
+
   const safe = redaction.redact({ password: "secret", message: "Bearer abcdefghijklmnopqrstuvwxyz", apiKey: "sk-abcdefghijklmnop" });
   assert.strictEqual(safe.password, "[REDACTED]");
   assert.strictEqual(safe.apiKey, "[REDACTED]");
@@ -578,18 +601,31 @@ async function run() {
     { uiLabel: "下发时间", apiField: "createdTime", pageValue: "2026-01-01", apiValue: "2026-01-01" },
     { uiLabel: "状态", apiField: "status", pageValue: "下发中", apiValue: "下发中" },
   ], { pageText: "下发时间 状态" }, '{"createdTime":"2026-01-01","status":"下发中"}').ok, false);
-  const incompleteOutcome = agentGuard.resolveAssertionOutcome({ passed: true }, "TC5: ⚠️ 部分通过 - 无法在自动化环境中触发真实文件校验，未能完整验证");
+  const emptyRecordEvidence = agentGuard.validateRecordEvidence({
+    title: "登录安全风控展示",
+    expected: "展示用户账号、设备 ID、登录时间；展示值与 API 一致；无数据展示空态",
+  }, "TC6:\n1. ✅ 通过 - 接口返回 records:[] total:0，暂无数据", "GET /login/security/uncommonDevice 200 {\"records\":[],\"total\":0}");
+  assert.strictEqual(emptyRecordEvidence.ok, false);
+  assert.ok(emptyRecordEvidence.reason.indexOf("无法验证记录字段展示") !== -1);
+  assert.strictEqual(agentGuard.validateRecordEvidence({
+    title: "登录安全风控空态",
+    expected: "无数据时展示暂无数据",
+  }, "TC7:\n1. ✅ 通过 - records:[] total:0，显示暂无数据", "{\"records\":[],\"total\":0}").ok, true);
+  const incompleteOutcome = agentGuard.resolveAssertionOutcome({ passed: true }, "TC5:\n1. ✅ 通过 - 文件上传入口可见\n2. ❕ 待确认 - 无法在自动化环境中触发真实文件校验");
   assert.strictEqual(incompleteOutcome.outcome, "inconclusive");
   assert.strictEqual(incompleteOutcome.downgraded, true);
   assert.strictEqual(agentGuard.resolveAssertionOutcome({ outcome: "failed" }, "TC5: ❌ 已观察到错误提示不一致").outcome, "failed");
+  assert.strictEqual(agentGuard.resolveAssertionOutcome({ outcome: "passed" }, "TC5:\n1. ✅ 通过 - 列表已加载\n2. ❌ 不通过 - 筛选结果未更新").outcome, "failed");
+  assert.strictEqual(agentGuard.formatAssertionDescription("TC5: 列表已加载", "passed"), "TC5:\n1. ✅ 通过 - 列表已加载");
+  assert.strictEqual(agentGuard.formatAssertionDescription("TC5:\n1. ✅ 通过 - 列表已加载\n2. ⚠️ 未完成验证 - 文件校验", "inconclusive"), "TC5:\n1. ✅ 通过 - 列表已加载\n2. ❕ 待确认 - 文件校验");
   assert.deepStrictEqual(
     JSON.parse(JSON.stringify(agentGuard.reconcileRunResult("pass", [{ status: "passed" }, { status: "inconclusive" }]))),
     { result: "unknown", adjusted: true, reason: "至少一个测试用例未完成验证或未执行" }
   );
 
   const inconclusiveReport = testReport.buildReport({
-    testCases: [{ id: "TC3", title: "原生文件选择", status: "inconclusive", assertionDesc: "⚠️ 未完成验证" }],
-    assertions: [{ description: "TC3: ⚠️ 未完成验证", outcome: "inconclusive", passed: false }],
+    testCases: [{ id: "TC3", title: "原生文件选择", status: "inconclusive", assertionDesc: "TC3:\n1. ❕ 待确认 - 文件选择" }],
+    assertions: [{ description: "TC3:\n1. ❕ 待确认 - 文件选择", outcome: "inconclusive", passed: false }],
   });
   assert.strictEqual(inconclusiveReport.stats.inconclusive, 1);
   assert.strictEqual(inconclusiveReport.stats.passRate, 0);

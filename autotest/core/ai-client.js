@@ -11,46 +11,53 @@
 
   // === 流内重复检测配置 ===
   var REASONING_CHECK_INTERVAL = 800; // 每累积 800 字符检查一次
-  var REASONING_MIN_BLOCK_LEN = 80;   // 参与精确检测的段落最短长度（提高：短段落易合理重复）
+  var REASONING_MIN_BLOCK_LEN = 80; // 参与精确检测的段落最短长度（提高：短段落易合理重复）
   var REASONING_REPEAT_THRESHOLD = 4; // 同一段落精确重复出现 N 次即判定为死循环（3→4 降低误报）
-  var CONTENT_REPEAT_THRESHOLD = 5;   // content 重复阈值（略高，因为短回复可能合理重复）
-  var REPEAT_WINDOW_SIZE = 4000;       // 滑动窗口大小：只统计最近 N 字符内的重复，避免长文本中合理引用被误判
+  var CONTENT_REPEAT_THRESHOLD = 5; // content 重复阈值（略高，因为短回复可能合理重复）
+  var REPEAT_WINDOW_SIZE = 4000; // 滑动窗口大小：只统计最近 N 字符内的重复，避免长文本中合理引用被误判
 
   // === 模糊重复检测配置（更保守，避免误报） ===
-  var FUZZY_MIN_BLOCK_LEN = 120;      // 模糊检测要求段落更长（短段落结构相似是正常的）
-  var FUZZY_REPEAT_THRESHOLD = 4;     // 模糊重复阈值更高
-  var FUZZY_SIG_LEN = 100;            // 特征签名长度（更长 = 更严格）
-
-  // 执行 Agent 已具备工具时，极长时间没有动作可能是空转。
-  // reasoning 很长本身并非错误，因此采用宽松预算；触发后由上层注入扰动并自动续跑。
-  // 具体重复仍由精确/模糊段落检测优先处理。
-  var MAX_NO_ACTION_RESPONSE_CHARS = 12000;
+  var FUZZY_MIN_BLOCK_LEN = 120; // 模糊检测要求段落更长（短段落结构相似是正常的）
+  var FUZZY_REPEAT_THRESHOLD = 4; // 模糊重复阈值更高
+  var FUZZY_SIG_LEN = 100; // 特征签名长度（更长 = 更严格）
 
   // === 流内总量上限配置 ===
   var MAX_REASONING_TIME_MS = 600000; // reasoning 阶段最大持续时间 600 秒，超过后优雅截断
 
   /**
-   * 部分 OpenAI 兼容服务不接受工具参数根层仅用于“字段二选一”的 anyOf。
+   * 部分 OpenAI 兼容服务不接受工具参数根层仅用于"字段二选一"的 anyOf。
    * 展平这类约束，保留字段和已有 required；真正的联合类型保持原样。
    */
   function normalizeToolParameters(parameters) {
-    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) return parameters;
+    if (
+      !parameters ||
+      typeof parameters !== "object" ||
+      Array.isArray(parameters)
+    )
+      return parameters;
 
     var variants = parameters.anyOf;
     if (!Array.isArray(variants) || variants.length === 0) return parameters;
 
     for (var i = 0; i < variants.length; i++) {
       var variant = variants[i];
-      if (!variant || typeof variant !== "object" || Array.isArray(variant)) return parameters;
+      if (!variant || typeof variant !== "object" || Array.isArray(variant))
+        return parameters;
       var keys = Object.keys(variant);
-      if (keys.length !== 1 || keys[0] !== "required" || !Array.isArray(variant.required)) return parameters;
+      if (
+        keys.length !== 1 ||
+        keys[0] !== "required" ||
+        !Array.isArray(variant.required)
+      )
+        return parameters;
     }
 
     var normalized = {};
     Object.keys(parameters).forEach(function (key) {
       if (key !== "anyOf") normalized[key] = parameters[key];
     });
-    if (normalized.additionalProperties === undefined) normalized.additionalProperties = false;
+    if (normalized.additionalProperties === undefined)
+      normalized.additionalProperties = false;
     return normalized;
   }
 
@@ -68,7 +75,7 @@
 
   // === 模型 function calling 能力处理（借鉴 OpenCode 按模型能力决定是否发送 tools）===
   // 用户可填写任意模型，无法静态维护能力表，因此运行时探测：
-  // 网关返回“模型不支持函数调用”类 400 时缓存该能力结论，降级为文本协议：
+  // 网关返回"模型不支持函数调用"类 400 时缓存该能力结论，降级为文本协议：
   // 不再发送 tools/tool_choice，改为要求模型在正文输出 JSON 动作数组（由 extractToolCalls 解析）。
   var modelToolSupport = {}; // key: apiUrl::model → false 表示该模型不支持 function calling
 
@@ -77,20 +84,33 @@
   }
 
   /**
-   * 判断 4xx 错误是否为“模型不支持函数调用/工具调用”
+   * 判断 4xx 错误是否为"模型不支持函数调用/工具调用"
    * 兼容中英文网关报错，如：当前模型不支持函数调用 / does not support function calling / tools is not supported
    */
   function isToolCallUnsupportedError(errText) {
     var t = String(errText || "").toLowerCase();
     if (!t) return false;
-    if (t.indexOf("不支持函数调用") !== -1 || t.indexOf("不支持工具调用") !== -1) return true;
-    var hasToolWord = t.indexOf("function call") !== -1 || t.indexOf("function_call") !== -1 ||
-                      t.indexOf("tool call") !== -1 || t.indexOf("tool_call") !== -1 ||
-                      t.indexOf("tool_choice") !== -1 || t.indexOf("tools") !== -1;
+    if (
+      t.indexOf("不支持函数调用") !== -1 ||
+      t.indexOf("不支持工具调用") !== -1
+    )
+      return true;
+    var hasToolWord =
+      t.indexOf("function call") !== -1 ||
+      t.indexOf("function_call") !== -1 ||
+      t.indexOf("tool call") !== -1 ||
+      t.indexOf("tool_call") !== -1 ||
+      t.indexOf("tool_choice") !== -1 ||
+      t.indexOf("tools") !== -1;
     if (!hasToolWord) return false;
-    return t.indexOf("not support") !== -1 || t.indexOf("unsupported") !== -1 ||
-           t.indexOf("doesn't support") !== -1 || t.indexOf("not allowed") !== -1 ||
-           t.indexOf("not enabled") !== -1 || t.indexOf("unavailable") !== -1;
+    return (
+      t.indexOf("not support") !== -1 ||
+      t.indexOf("unsupported") !== -1 ||
+      t.indexOf("doesn't support") !== -1 ||
+      t.indexOf("not allowed") !== -1 ||
+      t.indexOf("not enabled") !== -1 ||
+      t.indexOf("unavailable") !== -1
+    );
   }
 
   /**
@@ -101,7 +121,7 @@
     var lines = [
       "⚠️ 当前模型不支持 function calling，你必须直接在回复正文中输出 JSON 来表达动作，严格遵守：",
       "1. 整个回复只是一个 JSON 数组，不要输出任何解释、分析或 Markdown 代码块标记",
-      "2. 格式：[{\"action\": \"工具名\", \"参数名\": \"参数值\"}]，每轮数组中只放一个动作对象",
+      '2. 格式：[{"action": "工具名", "参数名": "参数值"}]，每轮数组中只放一个动作对象',
       "3. 可用工具及参数如下（参数名带 ? 表示可选）：",
     ];
     for (var i = 0; i < tools.length; i++) {
@@ -109,10 +129,14 @@
       if (!fn || !fn.name) continue;
       var properties = (fn.parameters && fn.parameters.properties) || {};
       var required = (fn.parameters && fn.parameters.required) || [];
-      var paramStr = Object.keys(properties).map(function (p) {
-        return required.indexOf(p) === -1 ? p + "?" : p;
-      }).join(", ");
-      lines.push("- " + fn.name + "(" + paramStr + "): " + (fn.description || ""));
+      var paramStr = Object.keys(properties)
+        .map(function (p) {
+          return required.indexOf(p) === -1 ? p + "?" : p;
+        })
+        .join(", ");
+      lines.push(
+        "- " + fn.name + "(" + paramStr + "): " + (fn.description || ""),
+      );
     }
     return lines.join("\n");
   }
@@ -129,41 +153,62 @@
     if (caps && caps.toolcall === false) modelToolSupport[key] = false;
     if (modelToolSupport[key] === false) {
       // 已知该模型不支持 function calling：直接走文本协议
-      return messages.concat([{ role: "system", content: buildTextProtocolMessage(tools) }]);
+      return messages.concat([
+        { role: "system", content: buildTextProtocolMessage(tools) },
+      ]);
     }
     body.tools = normalizeToolsForCompatibility(tools);
     // 借鉴 OpenCode（prompt.ts：正常流程不发送 tool_choice，等效 auto）：
-    // DashScope 系网关仅支持 auto/none，发送 "required" 会被模板错误误报为“模型不支持函数调用”
+    // DashScope 系网关仅支持 auto/none，发送 "required" 会被模板错误误报为"模型不支持函数调用"
     body.tool_choice = "auto";
     return messages;
   }
 
-  // 标记“thinking + tools 组合被网关拒绝”的模型：后续带 tools 的请求不再携带 thinking 参数
+  // 标记"thinking + tools 组合被网关拒绝"的模型：后续带 tools 的请求不再携带 thinking 参数
   var modelThinkingWithTools = {}; // key → false 表示组合被拒
 
   /**
-   * 4xx 错误降级处理：识别“模型不支持函数调用”类错误，分两段降级。
+   * 4xx 错误降级处理：识别"模型不支持函数调用"类错误，分两段降级。
    * 第一段：body 同时带 thinking 参数时，先剥离 thinking 保留 tools 重试——
-   *         部分网关不接受“深度思考 + 函数调用”组合，却统一报“模型不支持函数调用”。
+   *         部分网关不接受"深度思考 + 函数调用"组合，却统一报"模型不支持函数调用"。
    * 第二段：仍失败才确认模型不支持函数调用，缓存能力结论并切换为文本协议。
    * @returns {Array|null} 降级后的 messages；不可降级返回 null
    */
-  function downgradeFunctionCallError(body, config, messages, tools, status, errText) {
+  function downgradeFunctionCallError(
+    body,
+    config,
+    messages,
+    tools,
+    status,
+    errText,
+  ) {
     if (!body.tools) return null; // 未发送 tools，与函数调用无关
     if (!(status >= 400 && status < 500) || status === 429) return null;
     if (!isToolCallUnsupportedError(errText)) return null;
     if (body.thinking !== undefined || body.enable_thinking !== undefined) {
-      console.warn("[AIFT] 疑似“深度思考 + 函数调用”组合被拒（" + status + "），移除 thinking 参数保留 tools 重试");
+      console.warn(
+        "[AIFT] 疑似‘深度思考 + 函数调用’组合被拒（" +
+          status +
+          "），移除 thinking 参数保留 tools 重试",
+      );
       body.thinking = undefined;
       body.enable_thinking = undefined;
       modelThinkingWithTools[modelCapabilityKey(config)] = false;
       return messages;
     }
-    console.warn("[AIFT] 模型不支持函数调用（" + status + ": " + errText + "），降级为文本协议");
+    console.warn(
+      "[AIFT] 模型不支持函数调用（" +
+        status +
+        ": " +
+        errText +
+        "），降级为文本协议",
+    );
     modelToolSupport[modelCapabilityKey(config)] = false;
     body.tools = undefined;
     body.tool_choice = undefined;
-    return messages.concat([{ role: "system", content: buildTextProtocolMessage(tools) }]);
+    return messages.concat([
+      { role: "system", content: buildTextProtocolMessage(tools) },
+    ]);
   }
 
   // === thinking（深度思考）参数能力处理 ===
@@ -178,8 +223,12 @@
   function isThinkingRelatedError(errText) {
     var t = String(errText || "").toLowerCase();
     if (!t) return false;
-    return t.indexOf("thinking") !== -1 || t.indexOf("enable_thinking") !== -1 ||
-           t.indexOf("思考") !== -1 || t.indexOf("reasoning") !== -1;
+    return (
+      t.indexOf("thinking") !== -1 ||
+      t.indexOf("enable_thinking") !== -1 ||
+      t.indexOf("思考") !== -1 ||
+      t.indexOf("reasoning") !== -1
+    );
   }
 
   /**
@@ -194,8 +243,12 @@
       return "off";
     }
     var mode = resolveInitialThinkingMode(config);
-    // 已知该模型“thinking + tools”组合被拒：带 tools 时跳过 thinking 参数（不污染模型级 thinking 结论）
-    if (willSendTools && mode !== "none" && modelThinkingWithTools[modelCapabilityKey(config)] === false) {
+    // 已知该模型"thinking + tools"组合被拒：带 tools 时跳过 thinking 参数（不污染模型级 thinking 结论）
+    if (
+      willSendTools &&
+      mode !== "none" &&
+      modelThinkingWithTools[modelCapabilityKey(config)] === false
+    ) {
       return "none-skip";
     }
     if (mode === "glm") {
@@ -219,20 +272,29 @@
     if (!(status >= 400 && status < 500) || status === 429) return null;
     if (isThinkingRelatedError(errText)) {
       if (currentMode === "glm") {
-        console.warn("[AIFT] thinking(GLM 格式) 不被接受（" + status + "），改用 enable_thinking 格式重试");
+        console.warn(
+          "[AIFT] thinking(GLM 格式) 不被接受（" +
+            status +
+            "），改用 enable_thinking 格式重试",
+        );
         body.thinking = undefined;
         body.enable_thinking = true;
         modelThinkingMode[modelCapabilityKey(config)] = "qwen";
         return "qwen";
       }
-      console.warn("[AIFT] 模型不支持深度思考（" + status + "），后续请求不再发送 thinking 参数");
+      console.warn(
+        "[AIFT] 模型不支持深度思考（" +
+          status +
+          "），后续请求不再发送 thinking 参数",
+      );
       body.thinking = undefined;
       body.enable_thinking = undefined;
       modelThinkingMode[modelCapabilityKey(config)] = "none";
       return "none";
     }
     // 与 thinking 无关的 4xx：body 中还有 thinking 参数时才值得重试，否则交给上层抛错
-    if (body.thinking === undefined && body.enable_thinking === undefined) return null;
+    if (body.thinking === undefined && body.enable_thinking === undefined)
+      return null;
     console.warn("[AIFT] 4xx（" + status + "），移除 thinking 参数后重试");
     body.thinking = undefined;
     body.enable_thinking = undefined;
@@ -249,7 +311,7 @@
   var MODELS_DEV_CACHE_KEY = "aift_models_dev_caps";
   var MODELS_DEV_TTL = 24 * 3600 * 1000; // 缓存 24 小时
   var MODELS_DEV_RETRY_COOLDOWN = 30 * 60 * 1000; // 失败后 30 分钟冷却，避免内网环境反复打不可达请求
-  var modelsDevById = null;   // { [modelIdLower]: { temperature, reasoning, toolcall, vision } }
+  var modelsDevById = null; // { [modelIdLower]: { temperature, reasoning, toolcall, vision } }
   var modelsDevPromise = null;
   var modelsDevFailedAt = 0;
 
@@ -265,7 +327,11 @@
           temperature: m.temperature === true,
           reasoning: m.reasoning === true,
           toolcall: m.tool_call !== false, // 与 OpenCode 一致：缺省视为支持
-          vision: !!(m.modalities && Array.isArray(m.modalities.input) && m.modalities.input.indexOf("image") !== -1),
+          vision: !!(
+            m.modalities &&
+            Array.isArray(m.modalities.input) &&
+            m.modalities.input.indexOf("image") !== -1
+          ),
         };
         var existing = byId[key];
         if (!existing) {
@@ -285,16 +351,36 @@
   }
 
   function readModelsDevCache() {
-    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return Promise.resolve(null);
-    return chrome.storage.local.get(MODELS_DEV_CACHE_KEY).then(function (cached) {
-      var entry = cached && cached[MODELS_DEV_CACHE_KEY];
-      if (entry && entry.byId && Date.now() - entry.fetchedAt < MODELS_DEV_TTL) return entry.byId;
-      return null;
-    }).catch(function () { return null; });
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.storage ||
+      !chrome.storage.local
+    )
+      return Promise.resolve(null);
+    return chrome.storage.local
+      .get(MODELS_DEV_CACHE_KEY)
+      .then(function (cached) {
+        var entry = cached && cached[MODELS_DEV_CACHE_KEY];
+        if (
+          entry &&
+          entry.byId &&
+          Date.now() - entry.fetchedAt < MODELS_DEV_TTL
+        )
+          return entry.byId;
+        return null;
+      })
+      .catch(function () {
+        return null;
+      });
   }
 
   function writeModelsDevCache(byId) {
-    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return;
+    if (
+      typeof chrome === "undefined" ||
+      !chrome.storage ||
+      !chrome.storage.local
+    )
+      return;
     var entry = {};
     entry[MODELS_DEV_CACHE_KEY] = { fetchedAt: Date.now(), byId: byId };
     chrome.storage.local.set(entry).catch(function () {});
@@ -307,29 +393,39 @@
   function loadModelsDevCaps() {
     if (modelsDevPromise) return modelsDevPromise;
     // 失败冷却期内直接跳过，不再发起请求
-    if (modelsDevFailedAt && Date.now() - modelsDevFailedAt < MODELS_DEV_RETRY_COOLDOWN) {
+    if (
+      modelsDevFailedAt &&
+      Date.now() - modelsDevFailedAt < MODELS_DEV_RETRY_COOLDOWN
+    ) {
       return Promise.resolve(modelsDevById || {});
     }
-    modelsDevPromise = readModelsDevCache().then(function (cached) {
-      if (cached) {
-        modelsDevById = cached;
-        return modelsDevById;
-      }
-      return fetch(MODELS_DEV_URL).then(function (resp) {
-        if (!resp.ok) throw new Error("models.dev " + resp.status);
-        return resp.json();
-      }).then(function (json) {
-        modelsDevById = flattenModelsDev(json);
-        writeModelsDevCache(modelsDevById);
+    modelsDevPromise = readModelsDevCache()
+      .then(function (cached) {
+        if (cached) {
+          modelsDevById = cached;
+          return modelsDevById;
+        }
+        return fetch(MODELS_DEV_URL)
+          .then(function (resp) {
+            if (!resp.ok) throw new Error("models.dev " + resp.status);
+            return resp.json();
+          })
+          .then(function (json) {
+            modelsDevById = flattenModelsDev(json);
+            writeModelsDevCache(modelsDevById);
+            return modelsDevById;
+          });
+      })
+      .catch(function (e) {
+        console.info(
+          "[AIFT] models.dev 能力表暂不可用（不影响使用，将以内置规则 + 运行时探测兜底）：" +
+            ((e && e.message) || e),
+        );
+        modelsDevById = {};
+        modelsDevFailedAt = Date.now();
+        modelsDevPromise = null; // 冷却后允许重试
         return modelsDevById;
       });
-    }).catch(function (e) {
-      console.info("[AIFT] models.dev 能力表暂不可用（不影响使用，将以内置规则 + 运行时探测兜底）：" + (e && e.message || e));
-      modelsDevById = {};
-      modelsDevFailedAt = Date.now();
-      modelsDevPromise = null; // 冷却后允许重试
-      return modelsDevById;
-    });
     return modelsDevPromise;
   }
 
@@ -359,7 +455,12 @@
     } else if (id.indexOf("glm-4.6") !== -1 || id.indexOf("glm-4.7") !== -1) {
       result.temperature = 1.0;
     } else if (id.indexOf("kimi-k2") !== -1) {
-      if (id.indexOf("thinking") !== -1 || id.indexOf("k2.") !== -1 || id.indexOf("k2p") !== -1 || id.indexOf("k2-5") !== -1) {
+      if (
+        id.indexOf("thinking") !== -1 ||
+        id.indexOf("k2.") !== -1 ||
+        id.indexOf("k2p") !== -1 ||
+        id.indexOf("k2-5") !== -1
+      ) {
         result.temperature = 1.0;
       } else {
         result.temperature = 0.6;
@@ -401,9 +502,17 @@
       modelThinkingMode[key] = "none";
       return "none";
     }
-    var hint = (String(config.apiUrl || "") + " " + String(config.model || "")).toLowerCase();
-    if (hint.indexOf("dashscope") !== -1 || hint.indexOf("alibaba") !== -1 ||
-        hint.indexOf("qwen") !== -1 || hint.indexOf("qwq") !== -1) {
+    var hint = (
+      String(config.apiUrl || "") +
+      " " +
+      String(config.model || "")
+    ).toLowerCase();
+    if (
+      hint.indexOf("dashscope") !== -1 ||
+      hint.indexOf("alibaba") !== -1 ||
+      hint.indexOf("qwen") !== -1 ||
+      hint.indexOf("qwq") !== -1
+    ) {
       return "qwen";
     }
     return "glm";
@@ -411,13 +520,13 @@
 
   /**
    * 检测文本中是否存在重复段落（精确匹配，带滑动窗口）
-   * 
+   *
    * 优化点（减少误报）：
    * 1. 滑动窗口：只统计最近 REPEAT_WINDOW_SIZE 字符内的段落重复，而非全量文本
    *    → 长文本分析中早期引用的数据在后期再次出现是合理的，不应算死循环
    * 2. 跳过数字密集段落：数据分析中反复引用相同数字是正常的
    * 3. 更高的最短长度要求（由调用方传入，已从 40 提升到 80）
-   * 
+   *
    * @param {string} text - 累积的文本
    * @param {number} minBlockLen - 参与检测的段落最短长度
    * @param {number} threshold - 重复阈值
@@ -426,9 +535,10 @@
   function detectRepeatedBlock(text, minBlockLen, threshold) {
     if (!text || text.length < minBlockLen * threshold) return null;
     // 滑动窗口：只检查最近 REPEAT_WINDOW_SIZE 字符
-    var windowText = text.length > REPEAT_WINDOW_SIZE
-      ? text.substring(text.length - REPEAT_WINDOW_SIZE)
-      : text;
+    var windowText =
+      text.length > REPEAT_WINDOW_SIZE
+        ? text.substring(text.length - REPEAT_WINDOW_SIZE)
+        : text;
     // 按换行分段
     var paragraphs = windowText.split(/\n/);
     var counts = {};
@@ -447,32 +557,68 @@
 
   /**
    * 模糊重复检测：检测 AI 是否在反复输出"几乎相同"的长段落
-   * 
+   *
    * 设计原则（避免误报）：
    * 1. 只检测长段落（>= FUZZY_MIN_BLOCK_LEN），短段落结构相似是正常的
    * 2. 使用完整段落做签名（不是前 30/60 字符），避免同前缀不同内容的误报
    * 3. 阈值更高（FUZZY_REPEAT_THRESHOLD = 4），需要 4 次高度相似才算死循环
    * 4. 签名提取：去掉标点/空格/数字序号后，取完整内容做比对
-   * 
+   *
    * @param {string} text - 累积的文本
    * @returns {string|null} - 返回重复的段落文本，无重复返回 null
    */
   function detectFuzzyRepeatedBlock(text) {
-    if (!text || text.length < FUZZY_MIN_BLOCK_LEN * FUZZY_REPEAT_THRESHOLD) return null;
+    if (!text || text.length < FUZZY_MIN_BLOCK_LEN * FUZZY_REPEAT_THRESHOLD)
+      return null;
     var paragraphs = text.split(/\n/);
     var sigCounts = {};
     for (var i = 0; i < paragraphs.length; i++) {
       var p = paragraphs[i].trim();
       if (p.length < FUZZY_MIN_BLOCK_LEN) continue;
       // 提取特征签名：去掉空格、标点、数字序号，保留完整内容
-      var sig = p.replace(/[\s\u3000，。、；：！？""''（）()【】\[\]{}.,;:!?'"\-—…·0-9]/g, "");
+      var sig = p.replace(
+        /[\s\u3000，。、；：！？""''（）()【】\[\]{}.,;:!?'"\-—…·0-9]/g,
+        "",
+      );
       if (sig.length < FUZZY_SIG_LEN) continue; // 过滤后太短的不参与（说明原文主要是符号/数字）
       // 使用完整签名做比对（不截断）
       if (!sigCounts[sig]) sigCounts[sig] = { count: 0, raw: p };
       sigCounts[sig].count++;
-      if (sigCounts[sig].count >= FUZZY_REPEAT_THRESHOLD) return sigCounts[sig].raw;
+      if (sigCounts[sig].count >= FUZZY_REPEAT_THRESHOLD)
+        return sigCounts[sig].raw;
     }
     return null;
+  }
+
+  /**
+   * 归一化 API 返回的 usage 字段，统一不同厂商的缓存命中字段名。
+   * 支持：prompt_cache_hit_tokens (Anthropic/DeepSeek)、cached_tokens (OpenAI/其他)
+   * @param {Object} usage - 原始 usage 对象
+   * @returns {Object|null} { promptTokens, completionTokens, totalTokens, cachedTokens, cacheHitRate }
+   */
+  function normalizeUsage(usage) {
+    if (!usage || typeof usage !== "object") return null;
+    var promptTokens = Number(usage.prompt_tokens) || 0;
+    var completionTokens = Number(usage.completion_tokens) || 0;
+    var totalTokens =
+      Number(usage.total_tokens) || promptTokens + completionTokens;
+    // 不同厂商的缓存命名字段
+    var cachedTokens = Number(
+      usage.prompt_cache_hit_tokens ||
+        usage.cached_tokens ||
+        (usage.prompt_tokens_details &&
+          usage.prompt_tokens_details.cached_tokens) ||
+        0,
+    );
+    var cacheHitRate =
+      promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 100) : 0;
+    return {
+      promptTokens: promptTokens,
+      completionTokens: completionTokens,
+      totalTokens: totalTokens,
+      cachedTokens: cachedTokens,
+      cacheHitRate: cacheHitRate,
+    };
   }
 
   /**
@@ -481,15 +627,23 @@
    * @param {Array} messages - [{ role, content }]
    * @param {Array} tools - function calling tools schema
    * @param {Object} options - { timeout, maxRetries, signal, onThinking }
-   * @returns {Promise<{message: Object, raw: Object}>}
+   * @returns {Promise<{message: Object, raw: Object, usage: Object|null}>}
    */
   async function chat(config, messages, tools, options) {
     options = options || {};
     // 后台加载 models.dev 能力表（不阻塞当前请求，加载成功后对后续请求生效）
-    try { loadModelsDevCaps(); } catch (e) {}
+    try {
+      loadModelsDevCaps();
+    } catch (e) {}
     // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
-    var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
-    var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
+    var timeout = Math.max(
+      options.timeout || DEFAULT_TIMEOUT,
+      MAX_REASONING_TIME_MS,
+    );
+    var maxRetries =
+      options.maxRetries !== undefined
+        ? options.maxRetries
+        : DEFAULT_MAX_RETRIES;
 
     var url = config.apiUrl.replace(/\/+$/, "") + "/chat/completions";
 
@@ -499,29 +653,42 @@
     };
 
     // thinking 参数按模型能力缓存选择格式；勾选深度思考时不发送 temperature
-    var thinkingMode = applyThinkingToBody(body, config, !!(tools && tools.length));
+    var thinkingMode = applyThinkingToBody(
+      body,
+      config,
+      !!(tools && tools.length),
+    );
 
     // 按模型能力决定发送 tools 还是走文本协议（能力结论在运行时探测并缓存）
     body.messages = applyToolsToBody(body, config, messages, tools);
 
     // 标记不可重试的错误，避免对 4xx（非 429）做无意义重试
-    var NonRetryableError = function (msg) { this.name = "NonRetryableError"; this.message = msg; };
+    var NonRetryableError = function (msg) {
+      this.name = "NonRetryableError";
+      this.message = msg;
+    };
     NonRetryableError.prototype = Object.create(Error.prototype);
 
     var lastError;
     for (var attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         var controller = new AbortController();
-        var timer = setTimeout(function () { controller.abort(); }, timeout);
+        var timer = setTimeout(function () {
+          controller.abort();
+        }, timeout);
 
         // 合并外部 signal（用户中止）与内部 timeout signal
         var externalSignal = options.signal;
-        var onExternalAbort = function () { controller.abort(); };
+        var onExternalAbort = function () {
+          controller.abort();
+        };
         if (externalSignal) {
           if (externalSignal.aborted) {
             controller.abort();
           } else {
-            externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+            externalSignal.addEventListener("abort", onExternalAbort, {
+              once: true,
+            });
           }
         }
 
@@ -531,7 +698,7 @@
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "Authorization": "Bearer " + config.apiKey,
+              Authorization: "Bearer " + config.apiKey,
             },
             body: JSON.stringify(body),
             signal: controller.signal,
@@ -544,19 +711,35 @@
           var errText = "";
           try {
             var errJson = await resp.json();
-            errText = (errJson.error && errJson.error.message) ? errJson.error.message : JSON.stringify(errJson);
+            errText =
+              errJson.error && errJson.error.message
+                ? errJson.error.message
+                : JSON.stringify(errJson);
           } catch (e) {
             errText = resp.statusText;
           }
           // 模型不支持函数调用：缓存能力结论，降级为文本协议重试（不计入重试次数）
-          var downgradedMessages = downgradeFunctionCallError(body, config, messages, tools, resp.status, errText);
+          var downgradedMessages = downgradeFunctionCallError(
+            body,
+            config,
+            messages,
+            tools,
+            resp.status,
+            errText,
+          );
           if (downgradedMessages) {
             body.messages = downgradedMessages;
             attempt--; // 降级重试不消耗重试次数
             continue;
           }
           // thinking 参数不被接受：级联降级（不添加 temperature，不计入重试次数）
-          var downgradedThinkingMode = downgradeThinking(body, config, resp.status, errText, thinkingMode);
+          var downgradedThinkingMode = downgradeThinking(
+            body,
+            config,
+            resp.status,
+            errText,
+            thinkingMode,
+          );
           if (downgradedThinkingMode) {
             thinkingMode = downgradedThinkingMode;
             attempt--; // 降级重试不消耗重试次数
@@ -565,26 +748,40 @@
           var apiErr = new Error("API 错误 " + resp.status + ": " + errText);
           // 4xx 不重试（除 429）
           if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
-            var nrErr = new NonRetryableError("API 错误 " + resp.status + ": " + errText);
+            var nrErr = new NonRetryableError(
+              "API 错误 " + resp.status + ": " + errText,
+            );
             throw nrErr;
           }
           throw apiErr;
         }
 
         var data = await resp.json();
-        var message = data.choices && data.choices[0] && data.choices[0].message;
+        var message =
+          data.choices && data.choices[0] && data.choices[0].message;
         if (!message) {
           throw new Error("AI 返回格式异常：无 choices[0].message");
         }
 
         if (attempt > 0) {
-          console.warn("[AIFT] 第 " + (attempt + 1) + " 次尝试成功（前 " + attempt + " 次失败）");
+          console.warn(
+            "[AIFT] 第 " +
+              (attempt + 1) +
+              " 次尝试成功（前 " +
+              attempt +
+              " 次失败）",
+          );
         }
-        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
-        return { message: message, raw: data };
-
+        if (externalSignal)
+          externalSignal.removeEventListener("abort", onExternalAbort);
+        return {
+          message: message,
+          raw: data,
+          usage: normalizeUsage(data && data.usage),
+        };
       } catch (e) {
-        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+        if (externalSignal)
+          externalSignal.removeEventListener("abort", onExternalAbort);
         // 不可重试的错误直接抛出
         if (e.name === "NonRetryableError") {
           throw new Error(e.message);
@@ -602,13 +799,22 @@
           lastError = new Error("AI 请求超时 (" + timeout + "ms)");
         }
 
-        console.warn("[AIFT] chat 第 " + (attempt + 1) + "/" + (maxRetries + 1) + " 次失败: " + (e.message || e));
+        console.warn(
+          "[AIFT] chat 第 " +
+            (attempt + 1) +
+            "/" +
+            (maxRetries + 1) +
+            " 次失败: " +
+            (e.message || e),
+        );
 
         // 最后一次不等待
         if (attempt < maxRetries) {
           var delay = RETRY_DELAY_BASE * Math.pow(2, attempt); // 指数退避: 2s, 4s, 8s...
           console.warn("[AIFT] " + delay + "ms 后重试...");
-          await new Promise(function (r) { setTimeout(r, delay); });
+          await new Promise(function (r) {
+            setTimeout(r, delay);
+          });
         }
       }
     }
@@ -632,7 +838,11 @@
     var endIdx = content.lastIndexOf(closeChar);
     if (endIdx <= startIdx) return null;
     var candidate = content.substring(startIdx, endIdx + 1);
-    if (candidate.indexOf('"action"') === -1 && candidate.indexOf('"name"') === -1) return null;
+    if (
+      candidate.indexOf('"action"') === -1 &&
+      candidate.indexOf('"name"') === -1
+    )
+      return null;
     try {
       return JSON.parse(candidate);
     } catch (e) {
@@ -647,7 +857,8 @@
    */
   function extractToolCalls(message) {
     if (!message) return [];
-    if (message.tool_calls && message.tool_calls.length > 0) return message.tool_calls;
+    if (message.tool_calls && message.tool_calls.length > 0)
+      return message.tool_calls;
     // 有些模型不返回 tool_calls 而是直接在 content 里返回 JSON
     if (message.content) {
       var content = message.content.trim();
@@ -670,16 +881,24 @@
           return {
             id: "inline_" + i,
             type: "function",
-            function: { name: action.action || action.name || "unknown", arguments: JSON.stringify(action) },
+            function: {
+              name: action.action || action.name || "unknown",
+              arguments: JSON.stringify(action),
+            },
           };
         });
       }
       if (parsed && typeof parsed === "object") {
-        return [{
-          id: "inline_0",
-          type: "function",
-          function: { name: parsed.action || parsed.name || "unknown", arguments: JSON.stringify(parsed) },
-        }];
+        return [
+          {
+            id: "inline_0",
+            type: "function",
+            function: {
+              name: parsed.action || parsed.name || "unknown",
+              arguments: JSON.stringify(parsed),
+            },
+          },
+        ];
       }
     }
     return [];
@@ -699,10 +918,18 @@
   async function chatStream(config, messages, tools, options) {
     options = options || {};
     // 后台加载 models.dev 能力表（不阻塞当前请求，加载成功后对后续请求生效）
-    try { loadModelsDevCaps(); } catch (e) {}
+    try {
+      loadModelsDevCaps();
+    } catch (e) {}
     // 调用方的旧短超时不能提前中断模型推理；统一保留 600 秒上限。
-    var timeout = Math.max(options.timeout || DEFAULT_TIMEOUT, MAX_REASONING_TIME_MS);
-    var maxRetries = options.maxRetries !== undefined ? options.maxRetries : DEFAULT_MAX_RETRIES;
+    var timeout = Math.max(
+      options.timeout || DEFAULT_TIMEOUT,
+      MAX_REASONING_TIME_MS,
+    );
+    var maxRetries =
+      options.maxRetries !== undefined
+        ? options.maxRetries
+        : DEFAULT_MAX_RETRIES;
     var onDelta = options.onDelta || function () {};
 
     var url = config.apiUrl.replace(/\/+$/, "") + "/chat/completions";
@@ -711,10 +938,17 @@
       model: config.model,
       messages: messages,
       stream: true,
+      // 请求 API 在 SSE 流末尾返回 usage 字段（含 token 消耗和缓存命中数据）。
+      // 大多数 OpenAI 兼容提供商支持此参数；少数不支持的网关会忽略它而非报错。
+      stream_options: { include_usage: true },
     };
 
     // thinking 参数按模型能力缓存选择格式；勾选深度思考时不发送 temperature
-    var thinkingMode = applyThinkingToBody(body, config, !!(tools && tools.length));
+    var thinkingMode = applyThinkingToBody(
+      body,
+      config,
+      !!(tools && tools.length),
+    );
 
     // 按模型能力决定发送 tools 还是走文本协议（能力结论在运行时探测并缓存）
     body.messages = applyToolsToBody(body, config, messages, tools);
@@ -723,7 +957,9 @@
     for (var attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         var controller = new AbortController();
-        var timer = setTimeout(function () { controller.abort(); }, timeout);
+        var timer = setTimeout(function () {
+          controller.abort();
+        }, timeout);
 
         // 合并外部 signal（用户中止）与内部 timeout signal
         var externalSignal = options.signal;
@@ -732,14 +968,18 @@
           controller.abort();
           // fetch 返回后，显式取消 SSE reader，避免服务端继续推送和计费。
           if (reader) {
-            try { reader.cancel(); } catch (e) {}
+            try {
+              reader.cancel();
+            } catch (e) {}
           }
         };
         if (externalSignal) {
           if (externalSignal.aborted) {
             controller.abort();
           } else {
-            externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+            externalSignal.addEventListener("abort", onExternalAbort, {
+              once: true,
+            });
           }
         }
 
@@ -749,7 +989,7 @@
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "Authorization": "Bearer " + config.apiKey,
+              Authorization: "Bearer " + config.apiKey,
             },
             body: JSON.stringify(body),
             signal: controller.signal,
@@ -762,24 +1002,62 @@
           var errText = "";
           try {
             var errJson = await resp.json();
-            errText = (errJson.error && errJson.error.message) ? errJson.error.message : JSON.stringify(errJson);
+            errText =
+              errJson.error && errJson.error.message
+                ? errJson.error.message
+                : JSON.stringify(errJson);
           } catch (e) {
             errText = resp.statusText;
           }
           // 模型不支持函数调用：缓存能力结论，降级为文本协议重试（不计入重试次数）
           // 放在 thinking 降级之前：该错误更具体，避免被 thinking 降级抢先消耗一次无效重试
-          var downgradedMessages = downgradeFunctionCallError(body, config, messages, tools, resp.status, errText);
+          var downgradedMessages = downgradeFunctionCallError(
+            body,
+            config,
+            messages,
+            tools,
+            resp.status,
+            errText,
+          );
           if (downgradedMessages) {
             body.messages = downgradedMessages;
             attempt--; // 降级重试不消耗重试次数
             continue;
           }
           // thinking 参数不被接受：级联降级（不添加 temperature，不计入重试次数）
-          var downgradedThinkingMode = downgradeThinking(body, config, resp.status, errText, thinkingMode);
+          var downgradedThinkingMode = downgradeThinking(
+            body,
+            config,
+            resp.status,
+            errText,
+            thinkingMode,
+          );
           if (downgradedThinkingMode) {
             thinkingMode = downgradedThinkingMode;
             attempt--; // 降级重试不消耗重试次数
             continue;
+          }
+          // stream_options 不被接受：移除后重试（不计入重试次数）
+          if (
+            body.stream_options &&
+            resp.status >= 400 &&
+            resp.status < 500 &&
+            resp.status !== 429
+          ) {
+            var lo = errText.toLowerCase();
+            if (
+              lo.indexOf("stream_options") !== -1 ||
+              lo.indexOf("include_usage") !== -1
+            ) {
+              console.warn(
+                "[AIFT] stream_options 不被接受（" +
+                  resp.status +
+                  "），移除后重试",
+              );
+              delete body.stream_options;
+              attempt--;
+              continue;
+            }
           }
           var apiErr = new Error("API 错误 " + resp.status + ": " + errText);
           // 4xx 不重试（除 429）
@@ -806,6 +1084,8 @@
 
         // SSE 服务端不一定会在最后一条 data 后发送换行，统一通过该函数处理
         // 完整行，避免流结束时 buffer 中的最后一个 delta 被丢弃。
+        var streamUsage = null; // 捕获 SSE 流末尾的 usage 字段
+
         function processSseLine(rawLine) {
           var line = rawLine.trim();
           if (!line || line.startsWith(":")) return;
@@ -814,7 +1094,14 @@
           if (dataStr === "[DONE]") return;
           try {
             var chunkData = JSON.parse(dataStr);
-            var delta = chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta;
+            // 捕获 usage（许多提供商在最后一个 chunk 或单独 chunk 中附带 usage）
+            if (chunkData.usage) {
+              streamUsage = chunkData.usage;
+            }
+            var delta =
+              chunkData.choices &&
+              chunkData.choices[0] &&
+              chunkData.choices[0].delta;
             if (!delta) return;
             if (delta.content) {
               contentAccum += delta.content;
@@ -839,9 +1126,13 @@
                 if (tc.id) toolCallsAccum[idx].id = tc.id;
                 if (tc.type) toolCallsAccum[idx].type = tc.type;
                 if (tc.function) {
-                  if (tc.function.name) toolCallsAccum[idx].function.name += tc.function.name;
-                  if (tc.function.arguments) toolCallsAccum[idx].function.arguments += tc.function.arguments;
-                  if (tc.function.name) onDelta("tool_call", "→ " + tc.function.name);
+                  if (tc.function.name)
+                    toolCallsAccum[idx].function.name += tc.function.name;
+                  if (tc.function.arguments)
+                    toolCallsAccum[idx].function.arguments +=
+                      tc.function.arguments;
+                  if (tc.function.name)
+                    onDelta("tool_call", "→ " + tc.function.name);
                 }
               }
             }
@@ -861,52 +1152,70 @@
 
           for (var li = 0; li < lines.length; li++) processSseLine(lines[li]);
 
-          // ===== 流内死循环检测 =====
+          // ===== 流内循环检测 =====
           // 分两类：
           //   A. 死循环（精确重复/模糊重复）→ 抛 ReasoningLoopError，上层注入干预后重试
           //   B. 超时 → 优雅截断，保留已有内容，不抛错，让上层用已有结果继续
           if (!reasoningLoopDetected && !gracefulCutoff) {
-
-            // ---- A 类：死循环检测（抛错重试）----
-
-            // 检测 0: 有工具可用但持续只输出推理/文本。精确和模糊段落检测
-            // 无法覆盖同义改写，因此以“无动作 + 长输出”作为独立的进展守卫。
-            if (tools && tools.length > 0 && Object.keys(toolCallsAccum).length === 0 &&
-                reasoningAccum.length + contentAccum.length >= MAX_NO_ACTION_RESPONSE_CHARS) {
-              reasoningLoopDetected = true;
-              loopBreakReason = "未调用工具且未产生新证据的长篇推理";
-              console.warn("[AIFT] 检测到无动作长篇推理，中断流。");
-              break;
-            }
+            // ---- A 类：死循环检测（基于内容重复，抛错重试）----
 
             // 检测 1: 精确段落重复检测
-            if (reasoningAccum.length - lastReasoningCheckLen >= REASONING_CHECK_INTERVAL) {
+            if (
+              reasoningAccum.length - lastReasoningCheckLen >=
+              REASONING_CHECK_INTERVAL
+            ) {
               lastReasoningCheckLen = reasoningAccum.length;
-              var repeatedReasoning = detectRepeatedBlock(reasoningAccum, REASONING_MIN_BLOCK_LEN, REASONING_REPEAT_THRESHOLD);
+              var repeatedReasoning = detectRepeatedBlock(
+                reasoningAccum,
+                REASONING_MIN_BLOCK_LEN,
+                REASONING_REPEAT_THRESHOLD,
+              );
               if (repeatedReasoning) {
                 reasoningLoopDetected = true;
                 loopBreakReason = "推理内容精确重复";
-                console.warn("[AIFT] 检测到 reasoning 精确重复死循环，中断流。重复段落: " + repeatedReasoning.substring(0, 100) + "...");
+                console.warn(
+                  "[AIFT] 检测到 reasoning 精确重复死循环，中断流。重复段落: " +
+                    repeatedReasoning.substring(0, 100) +
+                    "...",
+                );
                 break;
               }
               // 模糊重复检测：检测"高度相似但不完全相同"的长段落循环
               var fuzzyRepeated = detectFuzzyRepeatedBlock(reasoningAccum);
               if (fuzzyRepeated) {
                 reasoningLoopDetected = true;
-                loopBreakReason = "推理内容模糊重复（相似长段落循环 " + FUZZY_REPEAT_THRESHOLD + " 次）";
-                console.warn("[AIFT] 检测到 reasoning 模糊重复死循环，中断流。相似段落: " + fuzzyRepeated.substring(0, 100) + "...");
+                loopBreakReason =
+                  "推理内容模糊重复（相似长段落循环 " +
+                  FUZZY_REPEAT_THRESHOLD +
+                  " 次）";
+                console.warn(
+                  "[AIFT] 检测到 reasoning 模糊重复死循环，中断流。相似段落: " +
+                    fuzzyRepeated.substring(0, 100) +
+                    "...",
+                );
                 break;
               }
             }
 
             // 检测 2: content 精确重复检测（阈值更高）
-            if (contentAccum.length - lastContentCheckLen >= REASONING_CHECK_INTERVAL) {
+            if (
+              contentAccum.length - lastContentCheckLen >=
+              REASONING_CHECK_INTERVAL
+            ) {
               lastContentCheckLen = contentAccum.length;
-              var repeatedContent = detectRepeatedBlock(contentAccum, REASONING_MIN_BLOCK_LEN, CONTENT_REPEAT_THRESHOLD);
+              var repeatedContent = detectRepeatedBlock(
+                contentAccum,
+                REASONING_MIN_BLOCK_LEN,
+                CONTENT_REPEAT_THRESHOLD,
+              );
               if (repeatedContent) {
                 reasoningLoopDetected = true;
                 loopBreakReason = "输出内容重复";
-                console.warn("[AIFT] 检测到 content 重复死循环，中断流。重复段落: " + repeatedContent.substring(0, 100) + "...");
+                console.warn(
+                  "[AIFT] 检测到 content 重复死循环，中断流。重复段落: " +
+                    repeatedContent.substring(0, 100) +
+                    "...",
+                );
                 break;
               }
             }
@@ -914,10 +1223,20 @@
             // ---- B 类：超时检测（优雅截断，不抛错）----
 
             // 检测 3: reasoning 时间上限 — 超过后优雅截断
-            if (reasoningStartTime > 0 && Date.now() - reasoningStartTime >= MAX_REASONING_TIME_MS) {
+            if (
+              reasoningStartTime > 0 &&
+              Date.now() - reasoningStartTime >= MAX_REASONING_TIME_MS
+            ) {
               gracefulCutoff = true;
-              loopBreakReason = "推理持续时间达到 " + Math.round(MAX_REASONING_TIME_MS / 1000) + " 秒上限，保留已有结果";
-              console.warn("[AIFT] reasoning 时间超限 (" + Math.round((Date.now() - reasoningStartTime) / 1000) + "s)，优雅截断");
+              loopBreakReason =
+                "推理持续时间达到 " +
+                Math.round(MAX_REASONING_TIME_MS / 1000) +
+                " 秒上限，保留已有结果";
+              console.warn(
+                "[AIFT] reasoning 时间超限 (" +
+                  Math.round((Date.now() - reasoningStartTime) / 1000) +
+                  "s)，优雅截断",
+              );
               break;
             }
           }
@@ -937,18 +1256,24 @@
         // 如果是优雅截断（超限），保留已有内容，不抛错
         if (gracefulCutoff) {
           onDelta("content", "\n\n[系统：" + loopBreakReason + "]");
-          try { reader.cancel(); } catch (e) {}
-          console.warn("[AIFT] 优雅截断: " + loopBreakReason + "，保留已有内容继续");
+          try {
+            reader.cancel();
+          } catch (e) {}
+          console.warn(
+            "[AIFT] 优雅截断: " + loopBreakReason + "，保留已有内容继续",
+          );
           // 超时不能被调用方当作成功响应，否则上层会结束当前阶段，
           // 用户后续输入也就没有机会触发下一次请求。携带部分结果，
           // 由上层决定等待继续/用户指令后重新发起请求。
-          var timeoutToolCalls = Object.keys(toolCallsAccum).sort(function (a, b) {
-            return parseInt(a) - parseInt(b);
-          }).map(function (k, i) {
-            var tc = toolCallsAccum[k];
-            if (!tc.id) tc.id = "call_" + i;
-            return tc;
-          });
+          var timeoutToolCalls = Object.keys(toolCallsAccum)
+            .sort(function (a, b) {
+              return parseInt(a) - parseInt(b);
+            })
+            .map(function (k, i) {
+              var tc = toolCallsAccum[k];
+              if (!tc.id) tc.id = "call_" + i;
+              return tc;
+            });
           var timeoutErr = new Error("AI 推理超时，已保留部分结果");
           timeoutErr.name = "ReasoningTimeoutError";
           timeoutErr.breakReason = loopBreakReason;
@@ -960,17 +1285,24 @@
 
         // 如果是死循环检测，中断流并抛出错误
         if (reasoningLoopDetected) {
-          onDelta("content", "\n\n[系统：检测到" + loopBreakReason + "，已自动中断]");
-          try { reader.cancel(); } catch (e) {}
+          onDelta(
+            "content",
+            "\n\n[系统：检测到" + loopBreakReason + "，已自动中断]",
+          );
+          try {
+            reader.cancel();
+          } catch (e) {}
 
           // 组装部分 tool_calls（可能不完整，仅供上层参考）
-          var partialToolCallsArr = Object.keys(toolCallsAccum).sort(function (a, b) {
-            return parseInt(a) - parseInt(b);
-          }).map(function (k, i) {
-            var tc = toolCallsAccum[k];
-            if (!tc.id) tc.id = "call_" + i;
-            return tc;
-          });
+          var partialToolCallsArr = Object.keys(toolCallsAccum)
+            .sort(function (a, b) {
+              return parseInt(a) - parseInt(b);
+            })
+            .map(function (k, i) {
+              var tc = toolCallsAccum[k];
+              if (!tc.id) tc.id = "call_" + i;
+              return tc;
+            });
 
           var loopErr = new Error("AI " + loopBreakReason + "，已自动中断");
           loopErr.name = "ReasoningLoopError";
@@ -983,15 +1315,17 @@
         }
 
         // 组装最终 message
-        var toolCallsArr = Object.keys(toolCallsAccum).sort(function (a, b) {
-          return parseInt(a) - parseInt(b);
-        }).map(function (k, i) {
-          var tc = toolCallsAccum[k];
-          // GLM 流式常不在 delta 里发 id，导致 assistant.tool_calls[].id 为空，
-          // 与后续 tool 消息的 tool_call_id 不匹配 → 网关 400。补一个稳定 id。
-          if (!tc.id) tc.id = "call_" + i;
-          return tc;
-        });
+        var toolCallsArr = Object.keys(toolCallsAccum)
+          .sort(function (a, b) {
+            return parseInt(a) - parseInt(b);
+          })
+          .map(function (k, i) {
+            var tc = toolCallsAccum[k];
+            // GLM 流式常不在 delta 里发 id，导致 assistant.tool_calls[].id 为空，
+            // 与后续 tool 消息的 tool_call_id 不匹配 → 网关 400。补一个稳定 id。
+            if (!tc.id) tc.id = "call_" + i;
+            return tc;
+          });
 
         var message = { content: contentAccum || null };
         if (toolCallsArr.length > 0) {
@@ -1001,11 +1335,16 @@
           message.reasoning_content = reasoningAccum;
         }
 
-        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
-        return { message: message, raw: { content: contentAccum, tool_calls: toolCallsArr } };
-
+        if (externalSignal)
+          externalSignal.removeEventListener("abort", onExternalAbort);
+        return {
+          message: message,
+          raw: { content: contentAccum, tool_calls: toolCallsArr },
+          usage: normalizeUsage(streamUsage),
+        };
       } catch (e) {
-        if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+        if (externalSignal)
+          externalSignal.removeEventListener("abort", onExternalAbort);
         // 不可重试的错误直接抛出
         if (e.name === "NonRetryableError") {
           throw new Error(e.message);
@@ -1030,12 +1369,21 @@
           lastError = new Error("AI 请求超时 (" + timeout + "ms)");
         }
 
-        console.warn("[AIFT] chatStream 第 " + (attempt + 1) + "/" + (maxRetries + 1) + " 次失败: " + (e.message || e));
+        console.warn(
+          "[AIFT] chatStream 第 " +
+            (attempt + 1) +
+            "/" +
+            (maxRetries + 1) +
+            " 次失败: " +
+            (e.message || e),
+        );
 
         if (attempt < maxRetries) {
           var delay = RETRY_DELAY_BASE * Math.pow(2, attempt);
           console.warn("[AIFT] " + delay + "ms 后重试...");
-          await new Promise(function (r) { setTimeout(r, delay); });
+          await new Promise(function (r) {
+            setTimeout(r, delay);
+          });
         }
       }
     }

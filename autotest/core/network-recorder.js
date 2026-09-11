@@ -14,49 +14,28 @@
 (function (global) {
   "use strict";
 
-  var MAX_ENTRIES = 100;
   var MAX_RESPONSE_CHARS = 20000;
+  var HEARTBEAT_INTERVAL_MS = 5000;
 
   var state = {
     recording: false,
     entries: [],
     nextId: 1,
     tabId: null,
-    pendingRequests: {}, // requestId -> { url, method, headers, postData }
+    pendingRequests: {}, // requestId -> 已按请求发起顺序写入的记录
     eventListener: null,
+    heartbeatTimer: null,
+    lastHeartbeatAt: 0,
+    heartbeatFailures: 0,
+    recovering: false,
   };
 
-  /**
-   * 判断是否为值得捕获的 API 请求（排除静态资源）
-   */
-  function isApiRequest(url, method, mimeType, resourceType) {
-    var skipExts = [".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".html", ".htm"];
-    var pathPart = url.split("?")[0].split("#")[0];
-    for (var i = 0; i < skipExts.length; i++) {
-      if (pathPart.toLowerCase().endsWith(skipExts[i])) return false;
-    }
+  function isFetchOrXhr(resourceType) {
+    return resourceType === "XHR" || resourceType === "Fetch";
+  }
 
-    if (resourceType) {
-      if (resourceType === "XHR" || resourceType === "Fetch") return true;
-      if (resourceType === "Script" || resourceType === "Stylesheet" || resourceType === "Image" || resourceType === "Font" || resourceType === "Media") return false;
-      if (resourceType === "Document") return false;
-    }
-
-    if (mimeType) {
-      var mt = mimeType.toLowerCase();
-      if (mt.indexOf("json") !== -1) return true;
-      if (mt.indexOf("text") !== -1 && mt.indexOf("javascript") === -1) return true;
-      if (mt.indexOf("javascript") !== -1) return false;
-      if (mt.indexOf("css") !== -1) return false;
-      if (mt.indexOf("image") !== -1) return false;
-      if (mt.indexOf("font") !== -1) return false;
-    }
-
-    if (/\/api\/|\/graphql|\/rest\/|\/v\d+\/|gateway|service|\/backend\//i.test(url)) return true;
-
-    if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") return true;
-
-    return false;
+  function addEntry(record) {
+    state.entries.push(record);
   }
 
   /**
@@ -72,18 +51,29 @@
       var reqMethod = req.method || "GET";
       var postData = req.postData || null;
       var headers = req.headers || {};
-
-      // 资源类型过滤
       var resourceType = params.type || "";
-      if (!isApiRequest(url, reqMethod, "", resourceType)) return;
+      if (!isFetchOrXhr(resourceType)) return;
 
-      state.pendingRequests[params.requestId] = {
+      // 在 requestWillBeSent 时即写入。响应延迟、失败或一直 pending 的请求也不会丢失。
+      var record = {
+        id: state.nextId++,
+        timestamp: Date.now(),
         url: url,
         method: reqMethod,
+        resourceType: resourceType,
+        status: 0,
+        statusText: "",
+        mimeType: "",
         postData: postData,
         requestHeaders: headers,
-        timestamp: params.timestamp || Date.now() / 1000,
+        requestBody: postData,
+        responseBody: null,
+        responseHeaders: {},
+        completed: false,
+        failed: false,
       };
+      addEntry(record);
+      state.pendingRequests[params.requestId] = record;
     } else if (method === "Network.responseReceived") {
       var pending = state.pendingRequests[params.requestId];
       if (!pending) return;
@@ -92,52 +82,96 @@
       pending.status = resp.status || 0;
       pending.statusText = resp.statusText || "";
       pending.mimeType = (resp.mimeType || "");
-      pending.responseHeaders = resp.headers || {};
-
-      // 再次用 mimeType 过滤
-      if (!isApiRequest(pending.url, pending.method, pending.mimeType, params.type || pending.resourceType)) {
-        delete state.pendingRequests[params.requestId];
-        return;
-      }
+      pending.rawResponseHeaders = resp.headers || {};
     } else if (method === "Network.loadingFinished") {
       var finished = state.pendingRequests[params.requestId];
       if (!finished) return;
-
-      // 创建记录
-      var record = {
-        id: state.nextId++,
-        timestamp: Date.now(),
-        url: finished.url,
-        method: finished.method,
-        status: finished.status || 0,
-        statusText: finished.statusText || "",
-        mimeType: finished.mimeType || "",
-        requestBody: finished.postData,
-        responseBody: null, // 异步获取
-        responseHeaders: {},
-      };
+      finished.completed = true;
+      finished.completedAt = Date.now();
 
       // 提取关键响应头
-      var respHeaders = finished.responseHeaders || {};
+      var respHeaders = finished.rawResponseHeaders || {};
       for (var hname in respHeaders) {
         var lower = hname.toLowerCase();
         if (lower === "content-type" || lower === "content-length" || lower === "cache-control") {
-          record.responseHeaders[hname] = respHeaders[hname];
+          finished.responseHeaders[hname] = respHeaders[hname];
         }
-      }
-
-      state.entries.push(record);
-      if (state.entries.length > MAX_ENTRIES) {
-        state.entries.shift();
       }
 
       delete state.pendingRequests[params.requestId];
 
       // 异步获取响应体
-      fetchResponseBody(params.requestId, record);
+      fetchResponseBody(params.requestId, finished);
     } else if (method === "Network.loadingFailed") {
+      var failed = state.pendingRequests[params.requestId];
+      if (failed) {
+        failed.failed = true;
+        failed.completed = true;
+        failed.completedAt = Date.now();
+        failed.errorText = params.errorText || "网络请求失败";
+      }
       delete state.pendingRequests[params.requestId];
     }
+  }
+
+  function installEventListener() {
+    if (state.eventListener) chrome.debugger.onEvent.removeListener(state.eventListener);
+    state.eventListener = function (source, method, params) {
+      handleCdpEvent(source, method, params);
+    };
+    chrome.debugger.onEvent.addListener(state.eventListener);
+  }
+
+  async function enableNetwork(tabId) {
+    if (global.AIFT_VisualController && global.AIFT_VisualController.ensureAttached) {
+      await global.AIFT_VisualController.ensureAttached(tabId);
+      await global.AIFT_VisualController.sendCommand("Network.enable", {});
+      await global.AIFT_VisualController.sendCommand("Network.setCacheDisabled", { cacheDisabled: true });
+      return;
+    }
+    await new Promise(function (resolve, reject) {
+      chrome.debugger.attach({ tabId: tabId }, "1.3", function () {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "debugger attach 失败"));
+          return;
+        }
+        chrome.debugger.sendCommand({ tabId: tabId }, "Network.enable", {}, function () {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve();
+        });
+      });
+    });
+  }
+
+  async function heartbeat() {
+    if (!state.recording || !state.tabId || state.recovering) return;
+    state.lastHeartbeatAt = Date.now();
+    try {
+      if (global.AIFT_VisualController && global.AIFT_VisualController.sendCommand) {
+        await global.AIFT_VisualController.sendCommand("Network.getCookies", {});
+      }
+      state.heartbeatFailures = 0;
+    } catch (e) {
+      state.heartbeatFailures++;
+      state.recovering = true;
+      try {
+        if (global.AIFT_VisualController && global.AIFT_VisualController.detach) {
+          await global.AIFT_VisualController.detach();
+        }
+        installEventListener();
+        await enableNetwork(state.tabId);
+        state.heartbeatFailures = 0;
+      } catch (recoverError) {
+        console.warn("[AIFT-Network] 心跳重连失败:", recoverError.message || recoverError);
+      } finally {
+        state.recovering = false;
+      }
+    }
+  }
+
+  function startHeartbeat() {
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = setInterval(function() { heartbeat(); }, HEARTBEAT_INTERVAL_MS);
   }
 
   /**
@@ -189,28 +223,10 @@
     state.recording = true;
 
     try {
-      if (global.AIFT_VisualController && global.AIFT_VisualController.ensureAttached) {
-        await global.AIFT_VisualController.ensureAttached(tabId);
-        await global.AIFT_VisualController.sendCommand("Network.enable", {});
-      } else {
-        await new Promise(function (resolve, reject) {
-          chrome.debugger.attach({ tabId: tabId }, "1.3", function () {
-            if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message || "debugger attach 失败"));
-              return;
-            }
-            chrome.debugger.sendCommand({ tabId: tabId }, "Network.enable", {}, function () {
-              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-              else resolve();
-            });
-          });
-        });
-      }
-      if (state.eventListener) chrome.debugger.onEvent.removeListener(state.eventListener);
-      state.eventListener = function (source, method, params) {
-        handleCdpEvent(source, method, params);
-      };
-      chrome.debugger.onEvent.addListener(state.eventListener);
+      // 先订阅再启用 Network 域，避免 Network.enable 与订阅之间漏掉首个请求。
+      installEventListener();
+      await enableNetwork(tabId);
+      startHeartbeat();
       return true;
     } catch (e) {
       console.warn("[AIFT-Network] debugger/Network.enable 失败:", e.message || e);
@@ -225,6 +241,9 @@
    */
   function stop() {
     state.recording = false;
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+    state.recovering = false;
     if (state.eventListener) {
       chrome.debugger.onEvent.removeListener(state.eventListener);
       state.eventListener = null;
@@ -280,12 +299,16 @@
         timestamp: entry.timestamp,
         url: entry.url,
         method: entry.method,
+        resourceType: entry.resourceType,
         status: entry.status,
         statusText: entry.statusText,
         mimeType: entry.mimeType,
         requestBody: entry.requestBody,
         responseBody: entry.responseBody || "（响应体尚未获取或为空）",
         responseHeaders: entry.responseHeaders,
+        completed: entry.completed,
+        failed: entry.failed,
+        errorText: entry.errorText || "",
       });
 
       if (results.length >= limit) break;
@@ -306,9 +329,12 @@
         timestamp: entry.timestamp,
         url: entry.url,
         method: entry.method,
+        resourceType: entry.resourceType,
         status: entry.status,
         mimeType: entry.mimeType,
         hasBody: !!entry.responseBody,
+        completed: entry.completed,
+        failed: entry.failed,
       });
     }
     return results;
@@ -341,6 +367,9 @@
     return {
       recording: state.recording,
       totalEntries: state.entries.length,
+      pendingRequests: Object.keys(state.pendingRequests).length,
+      lastHeartbeatAt: state.lastHeartbeatAt,
+      heartbeatFailures: state.heartbeatFailures,
     };
   }
 

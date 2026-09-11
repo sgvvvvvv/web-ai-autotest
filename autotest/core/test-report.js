@@ -63,6 +63,7 @@
         return { description: assertion.description || "", passed: !!assertion.passed, outcome: assertion.outcome || (assertion.passed ? "passed" : "failed") };
       }),
       errorRecords: (input.errorRecords || []).map(normalizeErrorRecord),
+      tokenStats: input.tokenStats || null,
     };
   }
 
@@ -83,6 +84,12 @@
     lines.push("- 执行结果: " + (report.result || "unknown"));
     lines.push("- 用例总数: " + stats.total + "；通过: " + stats.passed + "；失败: " + stats.failed + "；未完成验证: " + stats.inconclusive + "；跳过: " + stats.skipped + "；未开始: " + (stats.pending + stats.testing));
     lines.push("- 已完成验证通过率: " + stats.passRate + "%（不将未完成验证计入分母）");
+    if (report.tokenStats) {
+      var ts = report.tokenStats;
+      var hitRate = ts.totalPromptTokens > 0 ? Math.round(ts.totalCachedTokens / ts.totalPromptTokens * 100) : 0;
+      lines.push("- AI 缓存命中率: " + hitRate + "%（命中 " + ts.totalCachedTokens + " / 输入 " + ts.totalPromptTokens + " tokens）");
+      lines.push("- Token 消耗: 输入 " + ts.totalPromptTokens + " + 输出 " + ts.totalCompletionTokens + " = " + (ts.totalPromptTokens + ts.totalCompletionTokens) + " tokens（" + ts.apiCallCount + " 次 API 调用）");
+    }
     lines.push("");
     if (report.summary) {
       lines.push("## AI 总结");
@@ -102,7 +109,7 @@
       lines.push("## 断言记录");
       lines.push("");
       report.assertions.forEach(function(assertion) {
-        lines.push("- " + (assertion.outcome === "inconclusive" ? "⚠️" : (assertion.passed ? "✅" : "❌")) + " " + assertion.description);
+        lines.push("- " + (assertion.outcome === "inconclusive" ? "❕" : (assertion.passed ? "✅" : "❌")) + " " + assertion.description);
       });
     }
     if ((report.errorRecords || []).length > 0) {

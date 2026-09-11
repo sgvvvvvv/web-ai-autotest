@@ -27,17 +27,6 @@
     "[contenteditable=true]",
     "[onclick]",
     "[tabindex]",
-    // 下拉框选项（框架无关）— 让 AI 能在快照中看到可选项
-    ".el-select-dropdown__item",
-    ".el-cascader",
-    ".el-cascader-node",
-    ".ant-select-item",
-    ".ant-select-item-option",
-    ".v-list-item",
-    ".q-item",
-    ".dropdown-item",
-    ".MuiMenuItem-root",
-    ".MuiAutocomplete-option",
   ].join(",");
 
   // 很多组件将选项挂到 body 下的浮层中，且没有 button/role 等语义。
@@ -169,13 +158,40 @@
     return false;
   }
 
+  /**
+   * 在浮层容器内扫描 cursor:pointer 元素 — 跨框架通用检测
+   * 很多框架的下拉选项无 role/class 语义标记，但设置了 cursor:pointer
+   */
+  function scanFloatingClickable() {
+    var results = [];
+    var containers = document.querySelectorAll(
+      '[role="menu"], [role="listbox"], [role="dialog"], [role="tree"], ' +
+      '[class*="popper"], [class*="popover"], [class*="dropdown"], ' +
+      '[class*="overlay"], [class*="popup"], [class*="tooltip"]'
+    );
+    containers.forEach(function (container) {
+      container.querySelectorAll('*').forEach(function (el) {
+        try {
+          if (getComputedStyle(el).cursor === 'pointer') results.push(el);
+        } catch (e) {}
+      });
+    });
+    return results;
+  }
+
   function captureSnapshot() {
     const nodes = [];
     var elements = [];
+    // 1. 浮层内候选元素 — 通用 class 模式匹配
     var floatingCandidates = document.querySelectorAll(FLOATING_ITEM_SELECTOR);
     floatingCandidates.forEach(function (el) {
       if (isInFloatingLayer(el)) elements.push(el);
     });
+    // 2. 浮层内 cursor:pointer 元素 — 跨框架通用检测，补充无语义标记的可点击项
+    scanFloatingClickable().forEach(function (el) {
+      if (isInFloatingLayer(el)) elements.push(el);
+    });
+    // 3. 标准可交互元素（ARIA 角色 + 原生语义标签）
     // 浮层候选优先放入快照，避免长页面的常规控件耗尽模型上下文窗口。
     elements = elements.concat(Array.prototype.slice.call(document.querySelectorAll(INTERACTIVE_SELECTOR)));
     var seen = new Set();
@@ -301,52 +317,45 @@
       if (text) addNav(text, href, "");
     }
 
-    // 2. el-menu / el-submenu (Element UI/Plus)
-    var submenus = document.querySelectorAll(".el-submenu, .el-menu-item, .el-menu-submenu");
-    for (var j = 0; j < submenus.length; j++) {
-      var el = submenus[j];
-      if (!isVisible(el)) continue;
-      var elText = "";
-      var titleEl = el.querySelector(".el-menu-item__text, .el-submenu__title");
-      if (titleEl) elText = titleEl.innerText || titleEl.textContent || "";
-      else elText = el.innerText || el.textContent || "";
-      // 尝试找子级 <a>
-      var innerA = el.querySelector("a[href]");
-      var elPath = innerA ? innerA.getAttribute("href") : "";
-      // 尝试从 data 属性获取路径
-      if (!elPath) elPath = el.getAttribute("data-path") || el.getAttribute("index") || "";
-      if (elText && elPath) {
-        // 查找父级 submenu 标题
-        var parentEl = el.closest(".el-submenu");
+    // 2. 通用菜单项检测 — 通过 ARIA 角色、容器模式和 data 属性，不依赖特定 UI 框架
+    //    覆盖 Element/Ant Design/Vuetify/Quasar 等框架的菜单结构
+    var menuContainers = document.querySelectorAll(
+      '[role="menu"], [role="menubar"], [role="navigation"], ' +
+      'nav, aside, ' +
+      '[class*="menu"], [class*="nav"], [class*="sidebar"]'
+    );
+    for (var j = 0; j < menuContainers.length; j++) {
+      var container = menuContainers[j];
+      if (!isVisible(container)) continue;
+      // 容器内候选菜单项：有 role、有 tabindex、或常见菜单项标签/class 模式
+      var menuCandidates = container.querySelectorAll(
+        '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], ' +
+        '[aria-haspopup], [tabindex], li, [class*="item"]'
+      );
+      for (var k = 0; k < menuCandidates.length; k++) {
+        var item = menuCandidates[k];
+        if (!isVisible(item)) continue;
+        var itemText = (item.innerText || item.textContent || "").trim();
+        if (!itemText || itemText.length > 60) continue;
+        // 提取路径：优先 href，其次 data-path / index 属性
+        var itemA = item.tagName === "A" ? item : item.querySelector("a[href]");
+        var itemPath = itemA ? itemA.getAttribute("href") : "";
+        if (!itemPath) itemPath = item.getAttribute("data-path") || item.getAttribute("index") || "";
+        if (!itemPath) continue;
+        if (itemPath.indexOf("http") === 0 && itemPath.indexOf(location.host) === -1) continue;
+        if (itemPath === "#" || itemPath.indexOf("javascript:") === 0 || itemPath === "") continue;
+        // 查找父级菜单：通过 aria-haspopup 或 role=menu 祖先
+        var parentMenu = item.closest('[aria-haspopup], [role="menu"]');
         var parentText = "";
-        if (parentEl) {
-          var parentTitle = parentEl.querySelector(".el-submenu__title");
-          if (parentTitle) parentText = (parentTitle.innerText || parentTitle.textContent || "").trim();
+        if (parentMenu && parentMenu !== container) {
+          parentText = (parentMenu.getAttribute("aria-label") || parentMenu.innerText || parentMenu.textContent || "").trim();
+          if (parentText.length > 60) parentText = parentText.substring(0, 60);
         }
-        addNav(elText, elPath, parentText);
+        addNav(itemText, itemPath, parentText);
       }
     }
 
-    // 3. antd Menu (Ant Design)
-    var antdItems = document.querySelectorAll(".ant-menu-item, .ant-menu-submenu-title");
-    for (var k = 0; k < antdItems.length; k++) {
-      var antdEl = antdItems[k];
-      if (!isVisible(antdEl)) continue;
-      var antdText = (antdEl.innerText || antdEl.textContent || "").trim();
-      var antdA = antdEl.querySelector("a[href]") || (antdEl.tagName === "A" ? antdEl : null);
-      var antdPath = antdA ? antdA.getAttribute("href") : "";
-      if (antdText && antdPath) {
-        var antdParent = antdEl.closest(".ant-menu-submenu");
-        var antdParentText = "";
-        if (antdParent) {
-          var antdParentTitle = antdParent.querySelector(".ant-menu-submenu-title");
-          if (antdParentTitle) antdParentText = (antdParentTitle.innerText || antdParentTitle.textContent || "").trim();
-        }
-        addNav(antdText, antdPath, antdParentText);
-      }
-    }
-
-    // 4. 通用：[role="menuitem"] 和 [role="menu"]
+    // 3. 通用：[role="menuitem"] 和 [role="menu"]
     var roleItems = document.querySelectorAll('[role="menuitem"]');
     for (var l = 0; l < roleItems.length; l++) {
       var ri = roleItems[l];
@@ -358,7 +367,7 @@
       if (riText && riPath) addNav(riText, riPath, "");
     }
 
-    // 5. sidebar/nav 容器内的链接（兜底）
+    // 4. sidebar/nav 容器内的链接（兜底）
     var navContainers = document.querySelectorAll("nav, aside, .sidebar, .side-menu, .navigation, [class*='menu'], [class*='nav']");
     for (var c = 0; c < navContainers.length; c++) {
       var container = navContainers[c];

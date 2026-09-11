@@ -61,11 +61,61 @@
     return { ok: true, testCaseId: current };
   }
 
+  var ASSERTION_STATUS = {
+    passed: { icon: "✅", label: "通过" },
+    failed: { icon: "❌", label: "不通过" },
+    inconclusive: { icon: "❕", label: "待确认" },
+  };
+
+  function assertionOutcomeFromItems(description) {
+    var text = normalize(description);
+    if (/^\s*\d+[.、]\s*❌\s*不通过/m.test(text)) return "failed";
+    if (/^\s*\d+[.、]\s*❕\s*待确认/m.test(text)) return "inconclusive";
+    return "passed";
+  }
+
+  function formatAssertionDescription(description, fallbackOutcome) {
+    var text = normalize(description);
+    var prefixMatch = text.match(/^(TC\d+)\s*[:：]\s*/i);
+    var prefix = prefixMatch ? prefixMatch[1].toUpperCase() + ":" : "";
+    var body = prefixMatch ? text.substring(prefixMatch[0].length).trim() : text;
+    var rawItems = body.split(/\r?\n/).filter(function(line) { return line.trim(); });
+    var hasNumberedItems = rawItems.length > 0 && rawItems.every(function(line) {
+      return /^\s*\d+[.、]\s*/.test(line);
+    });
+    if (!hasNumberedItems) rawItems = ["1. " + body];
+
+    var items = rawItems.map(function(line, index) {
+      var itemMatch = line.match(/^\s*(\d+)[.、]\s*(.*)$/);
+      var number = itemMatch ? itemMatch[1] : String(index + 1);
+      var content = itemMatch ? itemMatch[2].trim() : line.trim();
+      var statusMatch = content.match(/^(✅|❌|❕|⚠️?)\s*(通过|不通过|失败|待确认|未完成验证)?\s*[-：:]?\s*/);
+      var icon = statusMatch && statusMatch[1];
+      var label = statusMatch && statusMatch[2];
+      var outcome = icon === "❌" || label === "不通过" || label === "失败"
+        ? "failed"
+        : (icon === "❕" || icon === "⚠️" || label === "待确认" || label === "未完成验证"
+          ? "inconclusive"
+          : (icon === "✅" || label === "通过" ? "passed" : fallbackOutcome));
+      if (!ASSERTION_STATUS[outcome]) outcome = "inconclusive";
+      if (statusMatch) content = content.substring(statusMatch[0].length).trim();
+      return number + ". " + ASSERTION_STATUS[outcome].icon + " " + ASSERTION_STATUS[outcome].label + " - " + (content || "未提供验证结论");
+    });
+    return prefix + "\n" + items.join("\n");
+  }
+
   function resolveAssertionOutcome(args, description) {
     args = args || {};
     var requested = normalize(args.outcome).toLowerCase();
     if (["passed", "failed", "inconclusive"].indexOf(requested) === -1) {
       requested = args.passed ? "passed" : "failed";
+    }
+    var itemOutcome = assertionOutcomeFromItems(description);
+    if (itemOutcome === "failed") {
+      return { outcome: "failed", downgraded: requested !== "failed", reason: "断言分项中存在不通过项" };
+    }
+    if (itemOutcome === "inconclusive") {
+      return { outcome: "inconclusive", downgraded: requested !== "inconclusive", reason: "断言分项中存在待确认项" };
     }
     // A pass requires direct evidence for every required expectation. These phrases express
     // an explicit evidence gap across Chinese and English model outputs, not a UI-library rule.
@@ -84,6 +134,26 @@
     // 字段语义审查只适用于用例明确声明的页面列头/API 字段映射。
     // 普通 UI、接口状态和业务流程用例不应被映射规则降级。
     return String((testCase && testCase.expected) || "").indexOf("字段映射") !== -1;
+  }
+
+  // 接口没有业务记录时，只能验证接口可用、字段定义和空态，不能验证记录值展示或页面/API 值一致。
+  function validateRecordEvidence(testCase, assertionDescription, networkEvidence) {
+    var testCaseText = [
+      testCase && testCase.title,
+      testCase && testCase.expected,
+      testCase && testCase.steps,
+    ].join(" ");
+    var evidenceText = [assertionDescription, networkEvidence].join(" ");
+    var hasNoRecords = /(?:records|rows|list|data)\s*[:=]\s*\[\s*\]|(?:total|count)\s*[:=]\s*0\b|暂无数据|无数据(?:记录)?/i.test(evidenceText);
+    var requiresRecordValues = /展示值\s*与\s*(?:API|接口)\s*一致|(?:页面|展示).*?(?:字段|记录|数据).*?(?:API|接口).*?一致|(?:用户账号|设备(?:\s*ID|型号|IP)?|登录(?:时间|次数|省份|地市|城市)|错误次数).{0,80}(?:展示|一致|记录)/i.test(testCaseText);
+    var emptyStateOnly = /(?:空态|空数据|暂无数据|无数据)/.test(String((testCase && testCase.title) || "")) && !requiresRecordValues;
+    if (hasNoRecords && requiresRecordValues && !emptyStateOnly) {
+      return {
+        ok: false,
+        reason: "接口响应没有业务记录，无法验证记录字段展示及页面/API 展示值一致性；源码列定义和空态只能证明结构与空态行为",
+      };
+    }
+    return { ok: true, reason: "" };
   }
 
   // 数据展示通过必须有已定义的“页面列头 <- API 字段”映射和网络字段证据。
@@ -142,7 +212,9 @@
   global.AIFT_AgentGuard = {
     resolveObservedTarget: resolveObservedTarget,
     validateAssertionForCurrent: validateAssertionForCurrent,
+    formatAssertionDescription: formatAssertionDescription,
     resolveAssertionOutcome: resolveAssertionOutcome,
+    validateRecordEvidence: validateRecordEvidence,
     requiresFieldMapping: requiresFieldMapping,
     validateFieldMappings: validateFieldMappings,
     reconcileRunResult: reconcileRunResult,

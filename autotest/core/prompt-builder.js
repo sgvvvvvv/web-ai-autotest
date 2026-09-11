@@ -21,7 +21,7 @@
         : "你是一个前端自动化测试 Agent。通过工具操作浏览器、检查 API 数据，完成测试用例。",
       "",
       "# 核心原则",
-      "1. 每轮只能执行一个：工具调用、assert 或 finish；不要只分析不行动",
+      "1. 每轮应尽量执行一个工具调用、assert 或 finish；若需简要分析请在结论后直接行动，不要只分析不行动",
       "2. 每次新的分析必须引用本轮新获得的 DOM、截图、网络响应或工具结果。没有新证据时，不得重述现状；最多换两种已区分的操作策略，然后 assert(outcome='inconclusive' 或 'failed') 并进入下一用例。",
       "3. 操作优先使用预设模板（select_option/select_multi/fill_input/click_button 等），简单直接；下拉或级联选择都使用 select_option，不要拆成多轮点击",
       "4. 若上下文给出「源码交互契约」，必须按契约使用对应模板；截图标注编号只能传给 smart_click(label)，绝不能拼成 click 的 CSS selector。",
@@ -42,7 +42,7 @@
       lines.push("8. 当前模型不支持图片：严禁调用或建议 screenshot、verify_ui、visual_click、smart_click 等视觉工具");
       lines.push("9. 需要验证 API 数据时用 get_network_responses");
       lines.push("10. 用 eval_in_page 检查元素文本、属性、class、可见性和尺寸，验证 UI 状态");
-      lines.push("11. 断言描述以 TC 编号开头并带状态图标；失败必须说明具体证据。");
+      lines.push("11. 每条断言必须以 TC 编号开头，换行分条输出。格式固定为「TC编号:\\n1. ✅ 通过 - 已验证的结论\\n2. ❌ 不通过 - 已观察到的异常\\n3. ❕ 待确认 - 尚未验证的内容」。每个分项只能使用一个状态；没有对应内容时不要编造该分项。");
       lines.push("12. 当前场景还有待测关联用例时，必须保留页面、弹窗、筛选和输入状态；严禁执行恢复、清空或返回原页。仅在场景最后一个用例结束且后续场景不兼容时才清理。");
       lines.push("13. 连续 3 次相同操作未成功，换策略或标记失败");
       lines.push("14. 所有文本使用简体中文");
@@ -70,7 +70,9 @@
       "FAILED 条件（任一）：已直接观察到 API 字段为空/null/缺失、页面展示不一致、功能异常或 UI 异常。",
       "PASSED 条件（全部）：当前 TC 的每项预期均已通过真实页面、网络响应、截图或源码与运行时证据交叉直接验证。",
       "数据展示类 PASSED 额外条件：用例预期必须定义「字段映射：页面列头 <- API字段」；assert 必须提交至少 2 条 fieldMappings，每条包含 uiLabel、apiField、pageValue、apiValue，且页面列头和网络响应字段均已观察到。没有映射或映射语义不明确时只能 inconclusive。",
+      "接口响应为空时：可以验证接口状态、列头定义和空态，但不能据此判定记录字段展示或页面/API 展示值一致。除非当前用例只验证空态，否则这类预期必须列为 ❕ 待确认，并使用 outcome=inconclusive。",
       "INCONCLUSIVE 条件：因权限、浏览器限制、缺少可控测试数据或受控文件注入也无法被页面接受等原因，至少一项预期未能直接验证。文件上传场景应先使用 upload_file，不能仅以原生文件选择器为由跳过。此时绝不能写 passed；调用 assert(outcome='inconclusive') 并明确列出未验证项。",
+      "断言输出格式：description 必须为「TC编号:\\n1. ✅ 通过 - 具体证据\\n2. ❌ 不通过 - 具体异常\\n3. ❕ 待确认 - 待验证内容」。按实际结果逐条列出，分项存在 ❌ 时 outcome=failed；无 ❌ 但存在 ❕ 时 outcome=inconclusive；所有分项为 ✅ 时 outcome=passed。",
       "",
       "# 表格数据提取",
       "按行提取，不要扁平化：",
@@ -199,6 +201,7 @@
         currentTcRounds: params.currentTcRounds,
         maxTcRounds: params.maxTcRounds,
         recoveryReserveRounds: params.recoveryReserveRounds,
+        matchedSkills: params.matchedSkills,
       });
       if (visionSupported && params.screenshot && params.screenshot.dataUrl) {
         // 视觉模式：多模态观察消息（文本 + 截图）
@@ -292,6 +295,14 @@
       parts.push("");
       parts.push("## 用户额外提示词");
       parts.push(params.extraPrompt);
+    }
+
+    // 注入匹配的 Skill
+    if (params.matchedSkills && global.AIFT_SkillManager) {
+      var skillsText = global.AIFT_SkillManager.formatSkillsForPrompt(params.matchedSkills);
+      if (skillsText) {
+        parts.push(skillsText);
+      }
     }
 
     parts.push("");
@@ -394,6 +405,7 @@
           parts.push("  5. 断言必须验证以下内容：" + currentTC.expected);
         }
         parts.push("  6. 断言中必须体现对操作步骤结果的验证，而非页面导航/菜单层级等无关内容");
+        parts.push("  7. 断言必须换行编号：每项使用「1. ✅ 通过 - 证据」「2. ❌ 不通过 - 异常」或「3. ❕ 待确认 - 原因」。存在不通过项则 outcome=failed；仅有待确认项则 outcome=inconclusive。");
         // 页面一致性检查
         if (currentTC.page && currentTitle) {
           var pageLower = currentTC.page.toLowerCase();
@@ -465,6 +477,13 @@
         }
       } else {
         parts.push("（暂无 API 请求）");
+      }
+    }
+
+    if (params.matchedSkills && global.AIFT_SkillManager) {
+      var skillsText = global.AIFT_SkillManager.formatSkillsForPrompt(params.matchedSkills);
+      if (skillsText) {
+        parts.push(skillsText);
       }
     }
 
@@ -637,13 +656,14 @@
   function formatHistory(history) {
     if (!history || history.length === 0) return "（无）";
     var parts = [];
-    var len = Math.min(history.length, 20);
-    for (var i = 0; i < len; i++) {
-      var h = history[i];
-      parts.push((i + 1) + ". " + h.action + " → " + (h.result || "ok"));
+    var maxLen = 20;
+    var start = Math.max(0, history.length - maxLen);
+    if (start > 0) {
+      parts.push("…（已省略 " + start + " 条更早记录）");
     }
-    if (history.length > len) {
-      parts.push("…（还有 " + (history.length - len) + " 条更早记录）");
+    for (var i = start; i < history.length; i++) {
+      var h = history[i];
+      parts.push((i - start + 1) + ". " + h.action + " → " + (h.result || "ok"));
     }
     return parts.join("\n");
   }
@@ -861,7 +881,7 @@
           parameters: {
             type: "object",
             properties: {
-              description: { type: "string", description: "断言描述，如「TC5: ❌ 失败 - API 返回 username 为空」或「TC5: ⚠️ 未完成验证 - 无法触发原生文件选择器」" },
+              description: { type: "string", description: "分项断言，格式固定为「TC5:\\n1. ✅ 通过 - 已验证证据\\n2. ❌ 不通过 - 已观察异常\\n3. ❕ 待确认 - 未验证内容」。按实际结果逐条输出。" },
               fieldMappings: {
                 type: "array",
                 description: "数据展示/API 一致性用例通过时必填。每项记录已验证的页面列头与 API 字段映射；无明确映射时不得判定通过。",
@@ -1188,6 +1208,22 @@
         },
       });
     }
+
+    // ===== 自迭代 Skill 工具 =====
+    tools.push({
+      type: "function",
+      function: {
+        name: "use_skill",
+        description: "应用已匹配的操作经验 Skill。当上下文中提供了「已有操作经验 Skill」列表时，可调用此工具按 skill 名称获取详细操作指令。返回该 skill 的完整操作步骤和推荐策略，按指令执行即可一步完成操作。",
+        parameters: {
+          type: "object",
+          properties: {
+            skillName: { type: "string", description: "要使用的 skill 名称（来自上下文中列出的 Skill 名称）" },
+          },
+          required: ["skillName"],
+        },
+      },
+    });
 
     return tools;
   }

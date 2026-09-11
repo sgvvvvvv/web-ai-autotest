@@ -68,8 +68,9 @@ const els = {
   saveConfig: document.getElementById("saveConfig"),
   runAgentBtn: document.getElementById("runAgentBtn"),
   planBtn: document.getElementById("planBtn"),
-  abortBtn: document.getElementById("abortBtn"),
-  continueBtn: document.getElementById("continueBtn"),
+  chatStopBtn: document.getElementById("chatStopBtn"),
+  chatResumeBtn: document.getElementById("chatResumeBtn"),
+  chatAbortBtn: document.getElementById("chatAbortBtn"),
   status: document.getElementById("status"),
   log: document.getElementById("log"),
   resultArea: document.getElementById("resultArea"),
@@ -125,9 +126,79 @@ const els = {
   genTestCasesBtnTooltip: document.querySelector("#genTestCasesBtn").parentElement.querySelector(".btn-tooltip"),
   runAgentBtnTooltip: document.querySelector("#runAgentBtn").parentElement.querySelector(".btn-tooltip"),
   planBtnTooltip: document.querySelector("#planBtn").parentElement.querySelector(".btn-tooltip"),
+  // 缓存命中统计
+  cacheStats: document.getElementById("cacheStats"),
+  // 操作经验 Skill
+  skillCount: document.getElementById("skillCount"),
+  skillList: document.getElementById("skillList"),
+  refreshSkillsBtn: document.getElementById("refreshSkillsBtn"),
+  clearSkillsBtn: document.getElementById("clearSkillsBtn"),
 };
 
 loadErrorRecords().catch(function () {});
+loadSkills().catch(function () {});
+
+async function loadSkills() {
+  try {
+    var skills = await AIFT_SkillManager.getAllSkills();
+    renderSkillList(skills);
+  } catch (e) {
+    els.skillList.textContent = "加载 Skill 失败: " + (e.message || e);
+  }
+}
+
+function renderSkillList(skills) {
+  if (!skills || skills.length === 0) {
+    els.skillList.innerHTML = '<div class="skill-empty">暂无已保存的操作经验 Skill。测试过程中 AI 会自动从失败→成功经验中学习并生成 Skill。</div>';
+    els.skillCount.textContent = "";
+    els.clearSkillsBtn.disabled = true;
+    return;
+  }
+  els.skillCount.textContent = "(" + skills.length + ")";
+  els.clearSkillsBtn.disabled = false;
+  var html = [];
+  for (var i = 0; i < skills.length; i++) {
+    var skill = skills[i];
+    var badge = skill.category ? '<span class="badge badge-skill">' + skill.category + "</span> " : "";
+    var usageText = "使用 " + (skill.usageCount || 0) + " 次";
+    if (skill.successCount > 0) usageText += "，成功 " + skill.successCount + " 次";
+    var failText = skill.failureCount > 0 ? "，源于 " + skill.failureCount + " 次失败" : "";
+    var dateStr = skill.createdAt ? new Date(skill.createdAt).toLocaleDateString() : "";
+    html.push('<div class="skill-item">' +
+      '<div class="skill-item-header">' +
+        '<span class="skill-name">' + (skill.name || "未命名") + "</span> " + badge +
+        '<button class="btn btn-danger btn-sm skill-delete-btn" data-skill-id="' + skill.id + '" title="删除">✕</button>' +
+      "</div>" +
+      '<div class="skill-desc">' + (skill.description || "") + "</div>" +
+      (skill.strategy && skill.strategy.approach ? '<div class="skill-strategy">' + skill.strategy.approach + "</div>" : "") +
+      '<div class="skill-meta">' + usageText + failText + " · " + dateStr + "</div>" +
+    "</div>");
+  }
+  els.skillList.innerHTML = html.join("");
+  // 绑定删除按钮
+  var deleteBtns = els.skillList.querySelectorAll(".skill-delete-btn");
+  for (var j = 0; j < deleteBtns.length; j++) {
+    deleteBtns[j].addEventListener("click", async function (e) {
+      var skillId = e.target.getAttribute("data-skill-id");
+      if (!skillId) return;
+      await AIFT_SkillManager.deleteSkill(skillId);
+      await loadSkills();
+    });
+  }
+}
+
+if (els.refreshSkillsBtn) {
+  els.refreshSkillsBtn.addEventListener("click", function () {
+    loadSkills().catch(function () {});
+  });
+}
+if (els.clearSkillsBtn) {
+  els.clearSkillsBtn.addEventListener("click", async function () {
+    if (!confirm("确定清空所有操作经验 Skill？此操作不可恢复。")) return;
+    await AIFT_SkillManager.clearAllSkills();
+    await loadSkills();
+  });
+}
 
 var PAGE_EVAL_TIMEOUT_MS = 12000;
 var CONTENT_MESSAGE_TIMEOUT_MS = 12000;
@@ -388,6 +459,29 @@ function resetContextUsage(config) {
   els.contextMeter.title = "根据本次请求中的文本消息和工具定义估算；图片 token 由模型服务端计算，未计入。";
 }
 
+function resetCacheStats() {
+  if (!els.cacheStats) return;
+  els.cacheStats.textContent = "缓存 --";
+  els.cacheStats.className = "cache-stats";
+  els.cacheStats.title = "AI 提示词缓存命中统计（由 API 返回）";
+}
+
+function updateCacheStats(payload) {
+  if (!payload || !els.cacheStats) return;
+  var overallHitRate = Number(payload.overallHitRate) || 0;
+  var cached = Number(payload.totalCachedTokens) || 0;
+  var prompt = Number(payload.totalPromptTokens) || 0;
+  var label = "缓存 " + overallHitRate + "%";
+  if (cached > 0) label += " (" + formatContextTokens(cached) + "/" + formatContextTokens(prompt) + ")";
+  els.cacheStats.textContent = label;
+  els.cacheStats.className = "cache-stats" +
+    (overallHitRate >= 50 ? " is-active" : (overallHitRate > 0 && overallHitRate < 30 ? " is-low" : ""));
+  var roundHit = Number(payload.roundHitRate) || 0;
+  els.cacheStats.title = "第 " + (payload.round || 0) + " 轮: 命中 " + roundHit + "%" +
+    " | 累计: " + overallHitRate + "% (" + formatContextTokens(cached) + "/" + formatContextTokens(prompt) + " tokens)" +
+    " | API 调用 " + (payload.apiCallCount || 0) + " 次";
+}
+
 function updateContextUsage(payload) {
   if (!payload || !payload.contextTokens) return;
   var percent = Math.max(0, Math.min(100, Number(payload.percent) || 0));
@@ -417,6 +511,7 @@ function streamClear() {
   streamState.textNode = null;
   streamState.textAccum = "";
   resetContextUsage();
+  resetCacheStats();
   // 清空截图
   screenshotState.history = [];
   if (els.screenshotContainer) els.screenshotContainer.innerHTML = '<div class="screenshot-empty">测试启动后，AI 每次接收到的截图会在此展示</div>';
@@ -440,6 +535,14 @@ function streamAppend(type, content) {
       updateContextUsage(JSON.parse(content));
     } catch (e) {
       console.warn("[AIFT] 上下文占用数据解析失败:", e);
+    }
+    return;
+  }
+  if (type === "cache_stats") {
+    try {
+      updateCacheStats(JSON.parse(content));
+    } catch (e) {
+      console.warn("[AIFT] 缓存统计数据解析失败:", e);
     }
     return;
   }
@@ -861,6 +964,7 @@ var currentAssertions = []; // 当前断言列表（供折叠/展开重渲染时
 var lastReportResult = null; // 上次测试报告结果
 var lastReportSummary = ""; // 上次测试报告总结
 var lastTestReport = null;
+var lastTokenStats = null; // 上次测试的 AI 缓存命中统计
 var runHistory = [];
 var RUN_HISTORY_KEY = "aift_run_history_v1";
 var errorRecords = [];
@@ -983,6 +1087,7 @@ function createTestReport(result, summary, assertions) {
     testCases: testCasesState,
     assertions: assertions || currentAssertions,
     errorRecords: redactDiagnostic(currentRunErrors),
+    tokenStats: lastTokenStats,
   });
 }
 
@@ -1122,7 +1227,7 @@ function renderTestResults(testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedCases.has(tcKey);
       var cls = "test-case test-" + tc.status + (isExpanded ? "" : " collapsed");
-      var icon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "⚠️" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
+      var icon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "❕" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
       html += '<div class="' + cls + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="test-case-header">';
       html += '<span class="test-toggle">' + (isExpanded ? "▼" : "▶") + '</span>';
@@ -1145,7 +1250,7 @@ function renderTestResults(testCases, assertions) {
       }
       var assertionDesc = getTestCaseAssertion(tc);
       if (assertionDesc && assertionDesc !== tc.text && assertionDesc !== tc.title) {
-        html += '<span class="test-detail">断言: ' + escapeHtml(assertionDesc) + '</span>';
+        html += '<span class="test-detail">断言: ' + formatAssertionHtml(assertionDesc) + '</span>';
       }
       html += '</div>';
       html += '</div>';
@@ -1171,10 +1276,10 @@ function renderTestResults(testCases, assertions) {
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
         var ucls = u.outcome === "inconclusive" ? "test-case test-case-simple test-inconclusive" : (u.passed ? "test-case test-case-simple test-passed" : "test-case test-case-simple test-failed");
-        var uicon = u.outcome === "inconclusive" ? "⚠️" : (u.passed ? "✅" : "❌");
+        var uicon = u.outcome === "inconclusive" ? "❕" : (u.passed ? "✅" : "❌");
         html += '<div class="' + ucls + '">';
         html += '<span class="test-icon">' + uicon + '</span>';
-        html += '<span class="test-text">' + escapeHtml(u.description) + '</span>';
+        html += '<span class="test-text">' + formatAssertionHtml(u.description) + '</span>';
         html += '</div>';
       }
       html += '</div>';
@@ -1189,6 +1294,10 @@ function escapeHtml(text) {
   var div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
+}
+
+function formatAssertionHtml(text) {
+  return escapeHtml(text).replace(/\r?\n/g, "<br>");
 }
 
 /**
@@ -1282,6 +1391,22 @@ function renderTestReport(result, summary, testCases, assertions) {
     html += '</div>';
   }
 
+  // AI 缓存命中统计
+  if (lastTokenStats) {
+    var tsHitRate = lastTokenStats.totalPromptTokens > 0
+      ? Math.round(lastTokenStats.totalCachedTokens / lastTokenStats.totalPromptTokens * 100) : 0;
+    html += '<div class="report-cache-stats">';
+    html += '<div class="report-summary-title">AI 缓存命中统计</div>';
+    html += '<div class="report-cache-grid">';
+    html += '<div class="cache-stat-item"><span class="cache-stat-num">' + tsHitRate + '%</span><span class="cache-stat-label">缓存命中率</span></div>';
+    html += '<div class="cache-stat-item"><span class="cache-stat-num">' + lastTokenStats.totalCachedTokens + '</span><span class="cache-stat-label">命中 tokens</span></div>';
+    html += '<div class="cache-stat-item"><span class="cache-stat-num">' + lastTokenStats.totalPromptTokens + '</span><span class="cache-stat-label">输入 tokens</span></div>';
+    html += '<div class="cache-stat-item"><span class="cache-stat-num">' + lastTokenStats.totalCompletionTokens + '</span><span class="cache-stat-label">输出 tokens</span></div>';
+    html += '<div class="cache-stat-item"><span class="cache-stat-num">' + lastTokenStats.apiCallCount + '</span><span class="cache-stat-label">API 调用次数</span></div>';
+    html += '</div>';
+    html += '</div>';
+  }
+
   // 用例详情列表
   if (testCases.length > 0) {
     var allReportExpanded = testCases.every(function (tc) {
@@ -1298,7 +1423,7 @@ function renderTestReport(result, summary, testCases, assertions) {
       var tcKey = tc.id || tc.title || tc.text;
       var isExpanded = expandedReportCases.has(tcKey);
       var tcClass = "report-case report-case-" + tc.status + (isExpanded ? "" : " collapsed");
-      var tcIcon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "⚠️" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
+      var tcIcon = tc.status === "passed" ? "✅" : (tc.status === "failed" ? "❌" : (tc.status === "inconclusive" ? "❕" : (tc.status === "testing" ? "⟳" : (tc.status === "skipped" ? "⊘" : "○"))));
 
       html += '<div class="' + tcClass + '" data-tc-key="' + escapeHtml(tcKey) + '">';
       html += '<div class="case-header">';
@@ -1314,7 +1439,7 @@ function renderTestReport(result, summary, testCases, assertions) {
       if (tc.expected) html += '<div class="case-row"><span class="case-label">预期</span><div class="case-value">' + formatExpectedHtml(tc.expected) + '</div></div>';
       var assertionDesc = getTestCaseAssertion(tc);
       if (assertionDesc && assertionDesc !== tc.text && assertionDesc !== tc.title) {
-        html += '<div class="case-row"><span class="case-label">断言</span><span class="case-value">' + escapeHtml(assertionDesc) + '</span></div>';
+        html += '<div class="case-row"><span class="case-label">断言</span><span class="case-value">' + formatAssertionHtml(assertionDesc) + '</span></div>';
       }
       html += '</div>';
       html += '</div>';
@@ -1340,9 +1465,9 @@ function renderTestReport(result, summary, testCases, assertions) {
       html += '<div class="report-extra-content' + (reportExtraExpanded ? "" : " collapsed") + '">';
       for (var i = 0; i < unmatched.length; i++) {
         var u = unmatched[i];
-        var uIcon = u.outcome === "inconclusive" ? "⚠️" : (u.passed ? "✅" : "❌");
+        var uIcon = u.outcome === "inconclusive" ? "❕" : (u.passed ? "✅" : "❌");
         var uClass = u.outcome === "inconclusive" ? "extra-inconclusive" : (u.passed ? "extra-passed" : "extra-failed");
-        html += '<div class="report-extra-item ' + uClass + '"><span>' + uIcon + '</span> ' + escapeHtml(u.description) + '</div>';
+        html += '<div class="report-extra-item ' + uClass + '"><span>' + uIcon + '</span> ' + formatAssertionHtml(u.description) + '</div>';
       }
       html += '</div>';
       html += '</div>';
@@ -1435,23 +1560,51 @@ var pauseState = {
   },
 };
 
+/**
+ * 统一管理聊天控制按钮的显示/隐藏
+ * @param {string} state - "running" | "paused" | "idle"
+ */
+function updateChatControls(state) {
+  var stopBtn = els.chatStopBtn;
+  var resumeBtn = els.chatResumeBtn;
+  var abortBtn = els.chatAbortBtn;
+  var sendBtn = els.chatSendBtn;
+
+  // 默认隐藏所有控制按钮
+  stopBtn.style.display = "none";
+  resumeBtn.style.display = "none";
+  abortBtn.style.display = "none";
+
+  switch (state) {
+    case "running":
+      stopBtn.style.display = "";
+      sendBtn.style.display = "";
+      sendBtn.disabled = false;
+      break;
+    case "paused":
+      resumeBtn.style.display = "";
+      abortBtn.style.display = "";
+      sendBtn.style.display = "";
+      sendBtn.disabled = false;
+      break;
+    default: // idle
+      sendBtn.style.display = "";
+      sendBtn.disabled = (currentPhase === null && !currentAgent);
+      break;
+  }
+}
+
 function startPhase(phase) {
   currentPhase = phase;
   pauseState.reset();
-  els.abortBtn.disabled = false;
-  els.abortBtn.textContent = "中止";
-  els.continueBtn.style.display = "";
-  els.continueBtn.disabled = true;
+  updateChatControls("running");
   updateButtonStates();
 }
 
 function endPhase() {
   currentPhase = null;
   pauseState.reset();
-  els.abortBtn.disabled = true;
-  els.abortBtn.textContent = "中止";
-  els.continueBtn.disabled = true;
-  els.continueBtn.style.display = "none";
+  updateChatControls("idle");
   updateButtonStates();
 }
 
@@ -1620,12 +1773,12 @@ async function runAgent() {
     onAutoPause: function (reason) {
       // Agent loop 内部自动暂停时，同步 panel 侧的暂停状态和 UI 按钮
       pauseState.paused = true;
-      els.abortBtn.textContent = "停止";
-      els.continueBtn.disabled = false;
+      updateChatControls("paused");
       log("Agent 自动暂停（" + reason + "），等待用户介入");
     },
-    onFinish: function (result, summary, assertions, testCases) {
+    onFinish: function (result, summary, assertions, testCases, tokenStats) {
       streamEndBlock();
+      lastTokenStats = tokenStats || null;
       testCasesState = testCases || testCasesState;
 
       // 更新进度文本
@@ -1685,63 +1838,51 @@ async function runAgent() {
   currentAgent = null;
 }
 
-function abortAgent() {
-  // 测试阶段：通过 agent loop 暂停/停止
+/**
+ * 停止当前 AI 请求（保留对话上下文，可继续）
+ * 类似 DeepSeek/GLM 的「停止生成」
+ */
+function stopAgent() {
+  // 测试阶段：通过 agent loop 暂停
   if (currentAgent) {
-    var agentPaused = currentAgent.getState().paused;
-    if (agentPaused || pauseState.paused) {
-      // 已暂停 → 完全中止
-      currentAgent.abort();
-      pauseState.abort();
-      log("用户请求完全中止测试");
-      els.abortBtn.disabled = true;
-      els.continueBtn.disabled = true;
-      // 中止时分离 debugger
-      if (window.AIFT_VisualController && AIFT_VisualController.isAttached()) {
-        AIFT_VisualController.detach().then(function () {
-          log("视觉控制器已分离");
-        });
-      }
-    } else {
-      // 运行中 → 暂停（可继续）
-      currentAgent.pause();
-      pauseState.paused = true; // 同步状态
-      log("用户请求暂停测试");
-      els.abortBtn.textContent = "停止";
-      els.continueBtn.disabled = false;
+    var agentState = currentAgent.getState();
+    if (agentState.paused) {
+      log("已处于暂停状态");
+      return;
     }
+    currentAgent.pause();
+    pauseState.paused = true; // 同步状态
+    log("用户停止 AI 请求（保留上下文）");
+    streamAppend("warning", "⏸️ 已停止，输入消息或点击「继续」恢复");
+    updateChatControls("paused");
     return;
   }
-  // 架构分析 / 用例生成阶段：通过 pauseState 暂停/停止
+  // 架构分析 / 用例生成阶段：通过 pauseState 暂停
   if (currentPhase && !pauseState.aborted) {
     if (pauseState.paused) {
-      // 已暂停 → 完全中止
-      pauseState.abort();
-      var phaseLabel = currentPhase === "architecture" ? "架构分析" : (currentPhase === "testcases" ? "测试用例生成" : "当前操作");
-      log("用户请求完全中止" + phaseLabel);
-      els.abortBtn.disabled = true;
-      els.continueBtn.disabled = true;
-    } else {
-      // 运行中 → 暂停（可继续）
-      pauseState.pause();
-      var phaseLabel2 = currentPhase === "architecture" ? "架构分析" : (currentPhase === "testcases" ? "测试用例生成" : "当前操作");
-      log("用户请求暂停" + phaseLabel2);
-      streamAppend("warning", "⏸️ 已暂停" + phaseLabel2 + "，点击「继续」恢复");
-      els.abortBtn.textContent = "停止";
-      els.continueBtn.disabled = false;
-      // 更新对应模块按钮文案
-      if (currentPhase === "architecture") {
-        els.analyzeBtn.textContent = "已暂停";
-      } else if (currentPhase === "testcases") {
-        els.genTestCasesBtn.textContent = "已暂停";
-      }
+      log("已处于暂停状态");
+      return;
+    }
+    pauseState.pause();
+    var phaseLabel = currentPhase === "architecture" ? "架构分析" : (currentPhase === "testcases" ? "测试用例生成" : "当前操作");
+    log("用户停止" + phaseLabel + "（保留上下文）");
+    streamAppend("warning", "⏸️ 已停止" + phaseLabel + "，输入消息或点击「继续」恢复");
+    updateChatControls("paused");
+    // 更新对应模块按钮文案
+    if (currentPhase === "architecture") {
+      els.analyzeBtn.textContent = "已暂停";
+    } else if (currentPhase === "testcases") {
+      els.genTestCasesBtn.textContent = "已暂停";
     }
     return;
   }
-  log("没有正在运行的操作可中止");
+  log("没有正在运行的 AI 任务可停止");
 }
 
-function continueAgent() {
+/**
+ * 继续暂停的对话（无需输入消息）
+ */
+function resumeAgent() {
   // 检查 panel 侧暂停状态，或 agent 内部自动暂停状态
   var agentAutoPaused = currentAgent && currentAgent.getState().paused;
   if ((!pauseState.paused && !agentAutoPaused) || pauseState.aborted) {
@@ -1753,8 +1894,8 @@ function continueAgent() {
     currentAgent.resume();
     pauseState.paused = false; // 同步状态
     log("用户继续测试");
-    els.abortBtn.textContent = "中止";
-    els.continueBtn.disabled = true;
+    streamAppend("info", "▶️ 继续执行");
+    updateChatControls("running");
     return;
   }
   // 架构分析 / 用例生成阶段
@@ -1763,8 +1904,7 @@ function continueAgent() {
     var phaseLabel = currentPhase === "architecture" ? "架构分析" : (currentPhase === "testcases" ? "测试用例生成" : "当前操作");
     log("用户继续" + phaseLabel);
     streamAppend("info", "▶️ 继续" + phaseLabel);
-    els.abortBtn.textContent = "中止";
-    els.continueBtn.disabled = true;
+    updateChatControls("running");
     if (currentPhase === "architecture") {
       els.analyzeBtn.textContent = "分析中...";
     } else if (currentPhase === "testcases") {
@@ -1773,6 +1913,37 @@ function continueAgent() {
     return;
   }
   log("无法继续：当前未暂停");
+}
+
+/**
+ * 完全中止当前 AI 任务（结束对话，释放资源）
+ */
+function abortAgent() {
+  // 测试阶段
+  if (currentAgent) {
+    currentAgent.abort();
+    pauseState.abort();
+    log("用户结束测试");
+    streamAppend("warning", "⏹️ 测试已结束");
+    updateChatControls("idle");
+    // 中止时分离 debugger
+    if (window.AIFT_VisualController && AIFT_VisualController.isAttached()) {
+      AIFT_VisualController.detach().then(function () {
+        log("视觉控制器已分离");
+      });
+    }
+    return;
+  }
+  // 架构分析 / 用例生成阶段
+  if (currentPhase && !pauseState.aborted) {
+    pauseState.abort();
+    var phaseLabel = currentPhase === "architecture" ? "架构分析" : (currentPhase === "testcases" ? "测试用例生成" : "当前操作");
+    log("用户结束" + phaseLabel);
+    streamAppend("warning", "⏹️ " + phaseLabel + "已结束");
+    updateChatControls("idle");
+    return;
+  }
+  log("没有正在运行的 AI 任务可结束");
 }
 
 // ---- 用户干预：接续当前对话上下文（最高优先级，全阶段可用） ----
@@ -1795,8 +1966,7 @@ function sendChatMessage() {
       els.chatInput.value = "";
       if (wasPaused) {
         pauseState.paused = false;
-        els.abortBtn.textContent = "中止";
-        els.continueBtn.disabled = true;
+        updateChatControls("running");
         streamAppend("info", "▶️ 已自动恢复执行");
       }
       setStatus("用户消息已注入（最高优先级），重新发起请求...");
@@ -1816,8 +1986,7 @@ function sendChatMessage() {
     els.chatInput.value = "";
     // 如果之前是暂停状态，恢复 UI
     if (wasPhasePaused) {
-      els.abortBtn.textContent = "中止";
-      els.continueBtn.disabled = true;
+      updateChatControls("running");
       if (currentPhase === "architecture") {
         els.analyzeBtn.textContent = "分析中...";
       } else if (currentPhase === "testcases") {
@@ -3565,6 +3734,7 @@ async function generateTestCases() {
           setStatus("已暂停");
           await pauseState.waitForResume();
           if (pauseState.aborted) throw e;
+          updateChatControls("running");
           streamAppend("info", "▶️ 继续执行");
           setStatus("AI 生成测试用例中...");
           continue; // 重新发起请求
@@ -3584,8 +3754,7 @@ async function generateTestCases() {
               "不要重复已经输出的用例；只输出尚未完成的 CSV 用例行。",
           });
           pauseState.paused = true;
-          els.abortBtn.textContent = "停止";
-          els.continueBtn.disabled = false;
+          updateChatControls("paused");
           streamAppend("warning", "⏸️ AI 推理时间过长，已暂停测试用例生成，点击「继续」或输入消息恢复");
           setStatus("已暂停，等待继续生成测试用例");
           await pauseState.waitForResume();
@@ -3598,6 +3767,7 @@ async function generateTestCases() {
             });
           }
           pauseState.paused = false;
+          updateChatControls("running");
           streamAppend("info", "▶️ 继续生成测试用例");
           setStatus("AI 生成测试用例中...");
           continue;
@@ -3766,8 +3936,9 @@ async function handleSourceUpload(event) {
 els.saveConfig.addEventListener("click", saveConfig);
 els.runAgentBtn.addEventListener("click", runAgent);
 els.planBtn.addEventListener("click", runPlan);
-els.abortBtn.addEventListener("click", abortAgent);
-els.continueBtn.addEventListener("click", continueAgent);
+els.chatStopBtn.addEventListener("click", stopAgent);
+els.chatResumeBtn.addEventListener("click", resumeAgent);
+els.chatAbortBtn.addEventListener("click", abortAgent);
 els.chatSendBtn.addEventListener("click", sendChatMessage);
 els.chatInput.addEventListener("keydown", function (e) {
   if (e.key === "Enter") sendChatMessage();

@@ -22,6 +22,7 @@
     click_button: 0, close_dialog: 0,
     table_action: 0, switch_tab: 0,
     confirm_dialog: 0, toggle_switch: 0,
+    use_skill: 0,
   };
   // 预设模板工具集合
   var TEMPLATE_TOOLS = [
@@ -38,6 +39,7 @@
     get_network_responses: 12000,
     screenshot: 30000,
     verify_ui: 30000,
+    use_skill: 5000,
     default: 25000,
   };
   // 为恢复页面状态和提交断言预留轮次，避免到达上限后才要求收尾。
@@ -783,6 +785,50 @@
     }
 
     /**
+     * 将已完成用例加入操作级 Skill 反思队列。
+     * 反思触发与 UI 的 onAssertion 回调解耦，确保 assert 被接受后一定会入队。
+     */
+    function queueTestCaseReflection(testCase, tcId, roundCount, outcome) {
+      if (!global.AIFT_SkillLearner) {
+        log("⚠️ Skill 学习器不可用，无法对 " + (tcId || "当前用例") + " 执行反思");
+        return false;
+      }
+      var tcAttempts = global.AIFT_SkillLearner.getAttemptsForTc(tcId);
+      var tcReviewData = {
+        testCase: testCase,
+        attempts: tcAttempts,
+        roundCount: roundCount || 0,
+        outcome: outcome,
+        url: state.snapshot ? state.snapshot.url : "",
+        pageTitle: state.snapshot ? state.snapshot.title : "",
+        elementClasses: "",
+      };
+      if (state.snapshot) {
+        var classes = {};
+        var nodes = state.snapshot.nodes || [];
+        for (var ni = 0; ni < Math.min(nodes.length, 20); ni++) {
+          var cls = nodes[ni].className || "";
+          if (!cls) continue;
+          var parts = cls.split(/\s+/);
+          for (var nj = 0; nj < parts.length; nj++) {
+            if (parts[nj] && parts[nj].length > 2) classes[parts[nj]] = true;
+          }
+        }
+        tcReviewData.elementClasses = Object.keys(classes).slice(0, 10).join(",");
+      }
+      log("🧠 已触发用例反思：" + (tcId || "") + "，操作记录 " + tcAttempts.length + " 条");
+      global.AIFT_SkillLearner.reviewTestCaseAndGenerateSkill(deps.config, tcReviewData, log)
+        .then(function (savedSkills) {
+          log("🧠 用例反思完成：" + (tcId || "") + (savedSkills && savedSkills.length ? "，生成 " + savedSkills.length + " 个 Skill" : "，无需沉淀 Skill"));
+          if (savedSkills && savedSkills.length > 0) state.skillsLoaded = false;
+        })
+        .catch(function (e) {
+          log("操作级 Skill 反思异常: " + (e.message || e));
+        });
+      return true;
+    }
+
+    /**
      * 构建尝试历史摘要（给 AI 注入"记忆"）
      * 让 AI 知道之前尝试了什么、为什么没成功
      */
@@ -852,9 +898,20 @@
       failureAttempts: [], // 交互失败轨迹：基于页面进展尽早熔断无效重试
       visualClickAttempts: [], // visual_click 尝试记录：[{x, y, round}]，用于检测同一区域反复点击
       annotatedElements: [],   // 标注截图中的元素列表：[{label, x, y, selector, ...}]
-      noToolCallCount: 0,    // 连续无 tool_calls 的轮数，超过阈值才真正结束
       maxSteps: 200,         // 当前步数上限（动态计算：用例数 × 30 + 50）
       maxStepsLimit: 600,    // 绝对上限，防止无限提升
+      // ===== 自迭代 Skill 模块 =====
+      matchedSkills: [],    // 当前上下文匹配到的 skill 列表
+      skillsLoaded: false,  // 是否已加载 skill
+      // ===== AI 缓存命中统计 =====
+      tokenStats: {
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCachedTokens: 0,
+        totalTokens: 0,
+        apiCallCount: 0,
+        roundsWithUsage: 0,
+      },
     };
 
     function log(msg) {
@@ -1463,7 +1520,12 @@
           var pattern = args.filePattern || "";
           var keywords = pattern.split(/[\s,\/]+/).filter(Boolean);
           var matched = global.AIFT_SourceReader.searchByKeywords(state.sourceFiles, keywords, 5);
-          result.result = "找到 " + matched.length + " 个文件";
+          var matchedPaths = matched.map(function(file, index) {
+            return (index + 1) + ". " + file.path;
+          });
+          result.result = "read_source 命中 " + matched.length + " 个文件" +
+            (matchedPaths.length ? "：\n" + matchedPaths.join("\n") : "");
+          log(result.result);
           if (matched.length > 0) {
             // 将匹配的源码加入下次 prompt 的源码列表
             for (var i = 0; i < matched.length; i++) {
@@ -1521,18 +1583,64 @@
           log("网络响应检索: " + netResults.length + " 条匹配");
           break;
 
+        case "use_skill":
+          var skillName = String(args.skillName || "").trim();
+          if (!skillName) {
+            result.ok = false;
+            result.result = "未指定 skill 名称。请从上下文中的「已有操作经验 Skill」列表选择一个。";
+            break;
+          }
+          if (!global.AIFT_SkillManager) {
+            result.ok = false;
+            result.result = "Skill 管理器不可用";
+            break;
+          }
+          var matchedSkill = null;
+          for (var ms = 0; ms < state.matchedSkills.length; ms++) {
+            if (state.matchedSkills[ms].name === skillName) {
+              matchedSkill = state.matchedSkills[ms];
+              break;
+            }
+          }
+          if (!matchedSkill) {
+            result.ok = false;
+            result.result = "未找到名为 " + skillName + " 的 Skill。请使用上下文中列出的 Skill 名称。";
+            break;
+          }
+          // 返回 skill 的详细操作指令
+          var skillParts = ["Skill: " + matchedSkill.name];
+          if (matchedSkill.description) skillParts.push("适用场景: " + matchedSkill.description);
+          if (matchedSkill.strategy) {
+            if (matchedSkill.strategy.approach) skillParts.push("成功策略: " + matchedSkill.strategy.approach);
+            if (matchedSkill.strategy.tool) skillParts.push("推荐工具: " + matchedSkill.strategy.tool);
+            if (matchedSkill.strategy.selectors && matchedSkill.strategy.selectors.length > 0) {
+              skillParts.push("关键选择器: " + matchedSkill.strategy.selectors.join(", "));
+            }
+            if (matchedSkill.strategy.keySteps && matchedSkill.strategy.keySteps.length > 0) {
+              skillParts.push("关键步骤:");
+              for (var ks = 0; ks < matchedSkill.strategy.keySteps.length; ks++) {
+                skillParts.push("  " + (ks + 1) + ". " + matchedSkill.strategy.keySteps[ks]);
+              }
+            }
+          }
+          if (matchedSkill.skillContent) skillParts.push("操作指令:\n" + matchedSkill.skillContent);
+          result.ok = true;
+          result.result = skillParts.join("\n");
+          // 异步记录使用
+          global.AIFT_SkillManager.recordUsage(matchedSkill.id, true).catch(function () {});
+          log("使用 Skill: " + skillName);
+          break;
+
         case "assert":
           var assertionDescription = String(args.description || "").trim();
           var outcomeInfo = global.AIFT_AgentGuard && global.AIFT_AgentGuard.resolveAssertionOutcome
             ? global.AIFT_AgentGuard.resolveAssertionOutcome(args, assertionDescription)
             : { outcome: args.passed ? "passed" : "failed", downgraded: false, reason: "" };
           var assertionOutcome = outcomeInfo.outcome;
-          var assertionIcon = assertionOutcome === "passed" ? "✅" : (assertionOutcome === "failed" ? "❌" : "⚠️");
-          if (assertionDescription.indexOf("✅") === -1 && assertionDescription.indexOf("❌") === -1 && assertionDescription.indexOf("⚠️") === -1) {
-            var tcPrefix = assertionDescription.match(/^(TC\d+\s*:\s*)/i);
-            assertionDescription = tcPrefix
-              ? tcPrefix[1] + assertionIcon + " " + assertionDescription.substring(tcPrefix[1].length)
-              : assertionIcon + " " + assertionDescription;
+          if (global.AIFT_AgentGuard && global.AIFT_AgentGuard.formatAssertionDescription) {
+            assertionDescription = global.AIFT_AgentGuard.formatAssertionDescription(assertionDescription, assertionOutcome);
+            outcomeInfo = global.AIFT_AgentGuard.resolveAssertionOutcome(args, assertionDescription);
+            assertionOutcome = outcomeInfo.outcome;
           }
           var assertionCheck = global.AIFT_AgentGuard && global.AIFT_AgentGuard.validateAssertionForCurrent
             ? global.AIFT_AgentGuard.validateAssertionForCurrent(assertionDescription, state.currentTcId)
@@ -1558,18 +1666,28 @@
             break;
           }
           var currentAssertionTC = state.testCases[currentAssertionIdx];
+          var networkEvidence = state.history.filter(function(item) {
+            return String(item.action || "").indexOf("get_network_responses") === 0;
+          }).map(function(item) { return item.result || ""; }).join("\n");
+          if (assertionOutcome === "passed" && global.AIFT_AgentGuard && global.AIFT_AgentGuard.validateRecordEvidence) {
+            var recordEvidenceCheck = global.AIFT_AgentGuard.validateRecordEvidence(
+              currentAssertionTC, assertionDescription, networkEvidence
+            );
+            if (!recordEvidenceCheck.ok) {
+              assertionOutcome = "inconclusive";
+              outcomeInfo = { outcome: "inconclusive", downgraded: true, reason: recordEvidenceCheck.reason };
+              assertionDescription += "\n" + (assertionDescription.split("\n").length) +
+                ". ❕ 待确认 - " + recordEvidenceCheck.reason;
+            }
+          }
           if (assertionOutcome === "passed" && global.AIFT_AgentGuard && global.AIFT_AgentGuard.validateFieldMappings) {
-            var networkEvidence = state.history.filter(function(item) {
-              return String(item.action || "").indexOf("get_network_responses") === 0;
-            }).map(function(item) { return item.result || ""; }).join("\n");
             var mappingCheck = global.AIFT_AgentGuard.validateFieldMappings(
               currentAssertionTC, args.fieldMappings, state.snapshot, networkEvidence
             );
             if (!mappingCheck.ok) {
               assertionOutcome = "inconclusive";
               outcomeInfo = { outcome: "inconclusive", downgraded: true, reason: mappingCheck.reason };
-              assertionDescription = assertionDescription.replace("✅", "⚠️") +
-                "（字段映射未充分验证：" + mappingCheck.reason + "）";
+              assertionDescription += "\n" + (assertionDescription.split("\n").length) + ". ❕ 待确认 - 字段映射未充分验证：" + mappingCheck.reason;
             } else if (mappingCheck.required) {
               var semanticReview = await reviewFieldMappingSemantics(currentAssertionTC, args.fieldMappings);
               if (semanticReview.verdict !== "match") {
@@ -1579,9 +1697,10 @@
                   downgraded: true,
                   reason: "字段映射语义审查为 " + semanticReview.verdict + "：" + semanticReview.reason,
                 };
-                assertionDescription = assertionDescription.replace("✅", assertionOutcome === "failed" ? "❌" : "⚠️") +
-                  "（字段映射语义" + (semanticReview.verdict === "mismatch" ? "不匹配" : "待确认") +
-                  "：" + formatFieldMappingReviewIssues(args.fieldMappings, semanticReview) + "）";
+                assertionDescription += "\n" + (assertionDescription.split("\n").length) + ". " +
+                  (assertionOutcome === "failed" ? "❌ 不通过" : "❕ 待确认") + " - 字段映射语义" +
+                  (semanticReview.verdict === "mismatch" ? "不匹配" : "待确认") +
+                  "：" + formatFieldMappingReviewIssues(args.fieldMappings, semanticReview);
               }
             }
           }
@@ -1591,13 +1710,15 @@
             outcome: assertionOutcome,
           };
           state.assertions.push(assertion);
-          result.result = assertionOutcome === "passed" ? "✅ PASS" : (assertionOutcome === "failed" ? "❌ FAIL" : "⚠️ INCONCLUSIVE");
+          result.result = assertionOutcome === "passed" ? "✅ PASS" : (assertionOutcome === "failed" ? "❌ FAIL" : "❕ PENDING VERIFICATION");
           if (outcomeInfo.downgraded) result.result += "（已根据证据完整性自动降级：" + outcomeInfo.reason + "）";
           log("断言: " + assertion.description + " → " + result.result);
           var assertionAccepted = true;
-          if (deps.onAssertion) {
+          var reflectionQueued = false;
+          var matchedIdx = currentAssertionIdx;
+          // 断言归属和 Skill 反思不能依赖 UI 回调是否存在。
+          if (deps.onAssertion || currentAssertionIdx >= 0) {
             // 断言只会归属当前执行中的用例，绝不按模型描述重新匹配。
-            var matchedIdx = currentAssertionIdx;
             if (matchedIdx >= 0) {
               var matchedTC = state.testCases[matchedIdx];
               // 保存原始状态，以便断言异常时回退
@@ -1677,9 +1798,20 @@
               } else if ((matchedTC.id || "").toUpperCase() === (state.currentTcId || "").toUpperCase()) {
                 // 已接受的断言必须立即结束当前用例的轮次归属，避免后续 TC 的操作或
                 // 收尾检查继续计入已完成用例。
+                var completedTcId = state.currentTcId;
+                var completedTcRounds = state.tcRoundCount[completedTcId] || 0;
                 state.currentTcId = null;
+
+                // 自迭代 Skill：每条已接受的 assert 都加入用例反思队列
+                reflectionQueued = queueTestCaseReflection(matchedTC, completedTcId, completedTcRounds, assertionOutcome);
               }
             }
+          }
+          if (assertionAccepted && !reflectionQueued && matchedIdx >= 0) {
+            var fallbackTc = state.testCases[matchedIdx];
+            var fallbackTcId = fallbackTc.id || assertionCheck.testCaseId;
+            var fallbackRounds = state.tcRoundCount[fallbackTcId] || 0;
+            reflectionQueued = queueTestCaseReflection(fallbackTc, fallbackTcId, fallbackRounds, assertionOutcome);
           }
           if (assertionAccepted && deps.onAssertion) deps.onAssertion(assertion, state.assertions, state.testCases);
           if (assertionAccepted && assertionOutcome === "failed") {
@@ -2736,6 +2868,21 @@
       state.visualClickAttempts = [];
       state.activeSourceInteractions = [];
       state.failureAttempts = [];
+      state.matchedSkills = [];
+      state.skillsLoaded = false;
+      state.tokenStats = {
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCachedTokens: 0,
+        totalTokens: 0,
+        apiCallCount: 0,
+        roundsWithUsage: 0,
+      };
+
+      // 重置操作尝试记录（自迭代学习器）
+      if (global.AIFT_SkillLearner) {
+        global.AIFT_SkillLearner.resetAttempts();
+      }
 
       // 解析测试用例
       state.testCases = parseTestCases(params.testCases || "");
@@ -2773,7 +2920,7 @@
         if (global.AIFT_NetworkRecorder) {
           global.AIFT_NetworkRecorder.clear();
           var networkStarted = await global.AIFT_NetworkRecorder.start(deps.tabId);
-          log(networkStarted ? "网络请求录制已启动" : "网络请求录制启动失败，将继续尝试 CDP 真实交互");
+          log(networkStarted ? "网络请求录制已启动（全程捕获 Fetch/XHR，心跳已开启）" : "网络请求录制启动失败，将继续尝试 CDP 真实交互");
         }
 
         // 1.6 附加 CDP debugger（用于真实交互、截图和网络录制）
@@ -2967,6 +3114,24 @@
             }
           }
 
+          // 加载匹配的 Skill（自迭代机制）
+          if (global.AIFT_SkillManager && state.snapshot) {
+            try {
+              var skillContext = {
+                url: state.snapshot.url || "",
+                snapshot: state.snapshot,
+                testCase: currentCase ? [currentCase.title, currentCase.steps, currentCase.expected].join(" ") : "",
+              };
+              state.matchedSkills = await global.AIFT_SkillManager.matchSkills(skillContext);
+              if (state.matchedSkills.length > 0 && !state.skillsLoaded) {
+                log("🧠 已匹配 " + state.matchedSkills.length + " 个操作经验 Skill");
+                state.skillsLoaded = true;
+              }
+            } catch (e) {
+              log("Skill 匹配失败: " + (e.message || e));
+            }
+          }
+
           // 构建消息
           var messages = global.AIFT_PromptBuilder.buildMessages({
             requirement: params.requirement,
@@ -2988,6 +3153,7 @@
             currentTcRounds: state.currentTcId ? (state.tcRoundCount[state.currentTcId] || 0) : 0,
             maxTcRounds: MAX_TC_ROUNDS,
             recoveryReserveRounds: TC_RECOVERY_RESERVE_ROUNDS,
+            matchedSkills: state.matchedSkills || [],
           });
          // 注入干预消息（用户干预优先于自动警告）
          if (state.userIntervention) {
@@ -3075,24 +3241,8 @@
             }
             // 推理重复循环 → 中止当前请求，保留上下文，注入提示后继续下一轮
             if (e.name === "ReasoningLoopError") {
-              var noActionReasoning = String(e.breakReason || "").indexOf("未调用工具且未产生新证据") !== -1;
-              if (noActionReasoning) {
-                // 长推理不是错误。中断当前流以打断可能的空转，再基于相同快照
-                // 自动续跑；只有多次扰动仍无进展才交给常规循环守卫暂停。
-                state.reasoningLoopCount++;
-                stream("warning", "⚠️ AI 长时间未调用工具，已注入扰动并继续执行（第 " + state.reasoningLoopCount + " 次）");
-                state.conversationHistory.push({
-                  role: "user",
-                  content: "⚠️ [系统扰动] 你刚才进行了较长推理但尚未调用工具，当前页面快照没有变化。" +
-                    "不要复述已有分析；保留已有判断，直接选择一个能获取新证据或推进当前 TC 的工具调用。" +
-                    "若两种不同策略均已失败，调用 assert 标记 inconclusive/failed 并继续下一用例。",
-                });
-                state.loopWarning = null;
-                log("💡 已对无动作长推理注入扰动，自动继续下一轮");
-                if (state.reasoningLoopCount < 3) continue;
-              }
-              if (!noActionReasoning) state.reasoningLoopCount++;
-              var loopLabel = noActionReasoning ? "连续长推理未调用工具" : "AI 推理内容重复循环";
+              state.reasoningLoopCount++;
+              var loopLabel = "AI 推理内容重复循环";
               stream("warning", "⚠️ 检测到" + loopLabel + "，已自动中断（第 " + state.reasoningLoopCount + " 次）");
 
               // 连续 3 次推理死循环 → 暂停等待用户介入
@@ -3111,13 +3261,17 @@
               }
 
               // ===== 保留上下文 =====
-              // 将部分内容作为 assistant 消息加入对话历史（不包含 tool_calls，避免缺少 tool 结果导致 API 400）
+              // 不保存完整 partialContent：被判定为重复的内容若重新注入会加剧复述
+              // 仅保留截断摘要，让模型知道上一次输出被中断即可
               if (e.partialContent) {
+                var truncatedPartial = e.partialContent.length > 500
+                  ? e.partialContent.slice(0, 500) + "…（已截断，共 " + e.partialContent.length + " 字符）"
+                  : e.partialContent;
                 state.conversationHistory.push({
                   role: "assistant",
-                  content: e.partialContent,
+                  content: truncatedPartial,
                 });
-                log("💡 已保留部分 AI 输出内容（" + e.partialContent.length + " 字符）到对话历史");
+                log("💡 已保留截断的 AI 输出摘要（" + truncatedPartial.length + "/" + e.partialContent.length + " 字符）到对话历史");
               }
 
               // 注入 user 消息：告知 AI 检测到重复，引导其跳出
@@ -3161,6 +3315,32 @@
 
           var message = aiResult.message;
 
+          // 累计 AI 缓存命中统计
+          if (aiResult.usage) {
+            var u = aiResult.usage;
+            state.tokenStats.totalPromptTokens += u.promptTokens || 0;
+            state.tokenStats.totalCompletionTokens += u.completionTokens || 0;
+            state.tokenStats.totalCachedTokens += u.cachedTokens || 0;
+            state.tokenStats.totalTokens += u.totalTokens || 0;
+            state.tokenStats.apiCallCount += 1;
+            state.tokenStats.roundsWithUsage += 1;
+            var overallHitRate = state.tokenStats.totalPromptTokens > 0
+              ? Math.round(state.tokenStats.totalCachedTokens / state.tokenStats.totalPromptTokens * 100)
+              : 0;
+            stream("cache_stats", JSON.stringify({
+              round: state.round,
+              promptTokens: u.promptTokens,
+              completionTokens: u.completionTokens,
+              cachedTokens: u.cachedTokens,
+              roundHitRate: u.cacheHitRate,
+              totalPromptTokens: state.tokenStats.totalPromptTokens,
+              totalCachedTokens: state.tokenStats.totalCachedTokens,
+              totalTokens: state.tokenStats.totalTokens,
+              overallHitRate: overallHitRate,
+              apiCallCount: state.tokenStats.apiCallCount,
+            }));
+          }
+
           // AI 调用成功，重置推理循环计数器
           state.reasoningLoopCount = 0;
 
@@ -3191,13 +3371,15 @@
           stream("round_end", "");
 
           if (toolCalls.length === 0) {
-            // AI 没有返回动作，可能是纯文本回复
-            state.noToolCallCount++;
-
-            // 将 AI 的纯文本回复加入对话历史，保留上下文
+            // AI 没有返回动作，可能是纯文本回复（flash 模型可能需要多轮文本才产出工具调用）
+            // 将纯文本回复截断后加入对话历史，避免长篇复述被重新注入上下文导致连锁重复
+            var noToolContent = message.content || null;
+            if (noToolContent && noToolContent.length > 1000) {
+              noToolContent = noToolContent.slice(0, 1000) + "…（已截断，共 " + noToolContent.length + " 字符）";
+            }
             state.conversationHistory.push({
               role: "assistant",
-              content: message.content || null,
+              content: noToolContent,
             });
 
             // MAX_STEPS 达到后 AI 被强制要求不使用工具，此时直接暂停让用户决定
@@ -3215,39 +3397,14 @@
                 "1. 输入指令引导 AI 继续执行剩余用例\n" +
                 "2. 点击「继续」让 AI 自行决定下一步\n" +
                 "3. 点击「中止」结束测试";
-              state.noToolCallCount = 0;
               continue;
             }
 
-            if (state.noToolCallCount >= 2) {
-              // 允许一次纯文本回复后的扰动续跑，避免把需要较长规划的模型过早暂停。
-              log("AI 连续 " + state.noToolCallCount + " 轮未返回动作，暂停等待用户介入");
-              stream("warning", "⚠️ AI 连续 " + state.noToolCallCount + " 轮未返回动作，已暂停");
-              state.paused = true;
-              notifyAutoPause("no_tool_calls");
-              state.loopWarning = "⚠️ AI 连续 " + state.noToolCallCount + " 轮未调用任何工具，可能已放弃执行。\n" +
-                "AI 最后的回复：" + (message.content || "（无内容）").substring(0, 200) + "\n\n" +
-                "测试已暂停。你可以：\n" +
-                "1. 输入指令明确要求 AI 继续执行哪个步骤\n" +
-                "2. 点击「继续」让 AI 重试\n" +
-                "3. 点击「中止」结束测试";
-              state.noToolCallCount = 0; // 重置计数，避免恢复后立即再次触发
-              continue; // 跳过本轮剩余处理，下一轮顶部暂停检查会触发等待
-            }
-
-            // 首次无 tool_calls：注入扰动，让模型保留已有判断并直接产生动作。
-            log("AI 未返回动作（第 " + state.noToolCallCount + " 次），注入扰动后继续");
-            stream("warning", "⚠️ AI 未返回工具调用，已注入扰动并继续执行");
-            state.conversationHistory.push({
-              role: "user",
-              content: "⚠️ [系统扰动] 保留刚才的判断，不要重复解释当前页面。" +
-                "请直接调用一个工具获取新证据或推进当前测试；若当前 TC 已经无法验证，调用 assert(outcome='inconclusive' 或 'failed')。",
-            });
+            // 无工具调用时不注入扰动，由下一轮 observation 消息自然引导 AI 继续行动
+            // 安全网：内容重复检测（ReasoningLoopError）+ reasoning 时间上限 + maxSteps
+            log("AI 未返回动作，保留回复继续下一轮");
             continue;
           }
-
-          // AI 返回了 tool_calls，重置计数器
-          state.noToolCallCount = 0;
 
           // 将 assistant 消息加入对话历史
          state.conversationHistory.push({
@@ -3313,6 +3470,21 @@
                 state.failureAttempts = state.failureAttempts.filter(function(attempt) { return attempt.tcId !== state.currentTcId; });
               }
             }
+
+            // 自迭代学习器：记录操作尝试（用于用例完成后复盘）
+            if (global.AIFT_SkillLearner) {
+              global.AIFT_SkillLearner.recordAttempt({
+                tcId: state.currentTcId || "",
+                round: state.round,
+                action: execResult.action,
+                args: execResult.args,
+                ok: !!execResult.ok,
+                result: execResult.result || "",
+                reasoning: state.lastReasoning || "",
+                snapshot: state.snapshot,
+              });
+            }
+
             if (!execResult.ok && ACTION_WAIT_MAP[tc.function.name] !== undefined) {
               needDiagnosticScreenshot = true;
             }
@@ -3539,6 +3711,16 @@
             state.loopWarning = "⛔ " + tcId + " 已超过最大执行轮数，已自动标记为失败。\n" +
               "请立即开始下一个未完成的用例，或如果所有用例已处理则调用 finish。\n" +
               "不要继续操作当前用例！";
+
+            // 自迭代 Skill：轮次超限的用例也触发反思
+            var overLimitTc = null;
+            for (var oltci = 0; oltci < state.testCases.length; oltci++) {
+              if (state.testCases[oltci].id === tcId) { overLimitTc = state.testCases[oltci]; break; }
+            }
+            if (overLimitTc) {
+              queueTestCaseReflection(overLimitTc, tcId, state.tcRoundCount[tcId], "failed");
+            }
+
             state.currentTcId = null;
             // 重置重复检测
             state.repeatCount = 0;
@@ -3687,7 +3869,7 @@
           var abortSummary = state.finishSummary || "用户手动中止";
           log("用户中止" + (state.finishResult ? "（AI 之前调用了 finish: " + state.finishResult + "）" : ""));
           setStatus("已中止");
-          if (deps.onFinish) deps.onFinish(abortResult, abortSummary, state.assertions, state.testCases);
+          if (deps.onFinish) deps.onFinish(abortResult, abortSummary, state.assertions, state.testCases, state.tokenStats);
         } else {
           var requestedResult = state.finishResult || "unknown";
           var reconciledResult = global.AIFT_AgentGuard && global.AIFT_AgentGuard.reconcileRunResult
@@ -3700,7 +3882,7 @@
           }
           log("测试完成: " + finalResult + " - " + finalSummary);
           setStatus("完成: " + finalResult);
-          if (deps.onFinish) deps.onFinish(finalResult, finalSummary, state.assertions, state.testCases);
+          if (deps.onFinish) deps.onFinish(finalResult, finalSummary, state.assertions, state.testCases, state.tokenStats);
         }
 
       } catch (e) {
@@ -3712,6 +3894,7 @@
         // 停止网络录制
         if (global.AIFT_NetworkRecorder) {
           global.AIFT_NetworkRecorder.stop();
+          global.AIFT_NetworkRecorder.clear();
           log("网络请求录制已停止");
         }
         // 分离 CDP debugger

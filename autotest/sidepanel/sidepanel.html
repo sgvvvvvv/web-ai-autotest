@@ -140,14 +140,16 @@
               <span id="contextMeterBar" class="context-meter-bar"></span>
             </span>
           </div>
-          <button id="abortBtn" class="btn btn-danger btn-abort" disabled>中止</button>
-          <button id="continueBtn" class="btn btn-primary btn-abort" disabled style="display:none;">继续</button>
+          <span id="cacheStats" class="cache-stats" title="AI 提示词缓存命中统计（由 API 返回）">缓存 --</span>
         </div>
       </div>
       <div id="streamLog" class="stream-log"></div>
       <!-- 用户干预输入（全阶段可用，注入当前对话上下文） -->
       <div class="chat-input-row" id="chatInputRow">
         <input id="chatInput" type="text" placeholder="输入内容接续当前对话（如：跳过当前用例、检查弹窗、换一种方式...）" />
+        <button id="chatStopBtn" class="btn btn-danger btn-sm" style="display:none;">停止</button>
+        <button id="chatResumeBtn" class="btn btn-primary btn-sm" style="display:none;">继续</button>
+        <button id="chatAbortBtn" class="btn btn-secondary btn-sm chat-abort-btn" style="display:none;">结束</button>
         <button id="chatSendBtn" class="btn btn-warning btn-sm">发送</button>
       </div>
     </section>
@@ -194,6 +196,17 @@
         </div>
       </div>
       <div id="errorRecordList" class="error-record-list">暂无已保存的错误记录</div>
+    </section>
+
+    <section class="card">
+      <div class="stream-header">
+        <h2>操作经验 Skill <span id="skillCount" class="test-progress"></span></h2>
+        <div class="stream-actions">
+          <button id="refreshSkillsBtn" class="btn btn-secondary btn-sm">刷新</button>
+          <button id="clearSkillsBtn" class="btn btn-secondary btn-sm" disabled>清空</button>
+        </div>
+      </div>
+      <div id="skillList" class="skill-list">暂无已保存的操作经验 Skill</div>
     </section>
 
     <section class="card">
@@ -268,6 +281,8 @@
     <script src="../core/project-analyzer.js"></script>
     <script src="../core/visual-controller.js"></script>
     <script src="../core/action-templates.js"></script>
+    <script src="../core/skill-manager.js"></script>
+    <script src="../core/skill-learner.js"></script>
     <script src="../core/prompt-builder.js"></script>
     <script src="../core/agent-loop.js"></script>
     <script src="sidepanel.js"></script>
