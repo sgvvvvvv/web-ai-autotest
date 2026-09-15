@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "test": "node tests/run-tests.js",
-    "check": "node --check content/content.js && node --check core/ai-client.js && node --check core/source-reader.js && node --check core/source-analyzer.js && node --check core/interaction-contract.js && node --check core/test-scheduler.js && node --check core/redaction.js && node --check core/diagnostic-store.js && node --check core/test-report.js && node --check core/run-history.js && node --check core/config-validator.js && node --check core/tab-eligibility.js && node --check core/progress-guard.js && node --check core/agent-guard.js && node --check core/action-templates.js && node --check core/visual-controller.js && node --check core/prompt-builder.js && node --check core/agent-loop.js && node --check sidepanel/sidepanel.js"
+    "check": "node --check content/content.js && node --check core/ai-client.js && node --check core/source-reader.js && node --check core/source-analyzer.js && node --check core/interaction-contract.js && node --check core/test-scheduler.js && node --check core/redaction.js && node --check core/diagnostic-store.js && node --check core/test-report.js && node --check core/run-history.js && node --check core/config-validator.js && node --check core/tab-eligibility.js && node --check core/progress-guard.js && node --check core/agent-guard.js && node --check core/action-templates.js && node --check core/visual-controller.js && node --check core/skill-manager.js && node --check core/skill-learner.js && node --check core/prompt-builder.js && node --check core/agent-loop.js && node --check sidepanel/sidepanel.js"
   },
   "dependencies": {
     "pptxgenjs": "^4.0.1"

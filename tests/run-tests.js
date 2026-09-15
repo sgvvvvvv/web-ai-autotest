@@ -82,6 +82,36 @@ async function run() {
   const promptBuilder = context.window.AIFT_PromptBuilder;
   const visualController = context.window.AIFT_VisualController;
 
+  // 反思必须读取 chat() 返回的 message.content，并将有效 Skill 持久化。
+  const learnerContext = vm.createContext({ window: {}, URL: URL, console: console });
+  loadModule("skill-manager.js", learnerContext);
+  learnerContext.window.AIFT_AIClient = {
+    chat: async function () {
+      return {
+        message: {
+          content: JSON.stringify([{
+            name: "困难下拉选择",
+            description: "下拉选项加载较慢时的选择策略",
+            skillContent: "等待选项加载后再选择",
+            matchPatterns: { actionType: "dropdown" },
+          }]),
+        },
+      };
+    },
+  };
+  loadModule("skill-learner.js", learnerContext);
+  const learner = learnerContext.window.AIFT_SkillLearner;
+  learner.resetAttempts();
+  learner.recordAttempt({ tcId: "TC1", round: 1, action: "select_option", ok: false, result: "选项未加载" });
+  const learnedSkills = await learner.reviewTestCaseAndGenerateSkill({}, {
+    testCase: { id: "TC1", title: "选择状态", steps: "选择状态下拉框", expected: "状态已选择" },
+    attempts: learner.getAttemptsForTc("TC1"),
+    roundCount: 2,
+    url: "https://example.com/settings",
+  });
+  assert.strictEqual(learnedSkills.length, 1, "反思应解析 message.content 中的 Skill");
+  assert.strictEqual((await learnerContext.window.AIFT_SkillManager.getAllSkills()).length, 1, "反思生成的 Skill 应持久化");
+
   // 流式响应可能没有结尾换行；最后一个 delta 仍必须被解析。
   const aiCalls = [];
   const aiContext = vm.createContext({

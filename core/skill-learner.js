@@ -243,7 +243,12 @@
         timeout: 60000,
         maxRetries: 2,
       });
-      var content = aiResult && aiResult.content ? aiResult.content : "";
+      var content = "";
+      if (aiResult && aiResult.message && typeof aiResult.message.content === "string") {
+        content = aiResult.message.content;
+      } else if (aiResult && typeof aiResult.content === "string") {
+        content = aiResult.content;
+      }
       var skillData = parseAIResponse(content);
       var skillList = Array.isArray(skillData) ? skillData : (skillData ? [skillData] : []);
       if (skillList.length === 0) {

@@ -778,6 +778,7 @@
       state.repeatCount = 0;
       state.actionSigHistory = [];
       state.loopWarning = null;
+      state.activeSkillId = null;
       state.visualClickAttempts = [];
       state.failureAttempts = state.failureAttempts.filter(function(attempt) { return attempt.tcId !== state.currentTcId; });
 
@@ -817,7 +818,7 @@
         tcReviewData.elementClasses = Object.keys(classes).slice(0, 10).join(",");
       }
       log("🧠 已触发用例反思：" + (tcId || "") + "，操作记录 " + tcAttempts.length + " 条");
-      global.AIFT_SkillLearner.reviewTestCaseAndGenerateSkill(deps.config, tcReviewData, log)
+      var reflectionPromise = global.AIFT_SkillLearner.reviewTestCaseAndGenerateSkill(deps.config, tcReviewData, log)
         .then(function (savedSkills) {
           log("🧠 用例反思完成：" + (tcId || "") + (savedSkills && savedSkills.length ? "，生成 " + savedSkills.length + " 个 Skill" : "，无需沉淀 Skill"));
           if (savedSkills && savedSkills.length > 0) state.skillsLoaded = false;
@@ -825,7 +826,15 @@
         .catch(function (e) {
           log("操作级 Skill 反思异常: " + (e.message || e));
         });
+      state.reflectionPromises.push(reflectionPromise);
       return true;
+    }
+
+    async function waitForPendingReflections() {
+      while (state.reflectionPromises.length > 0) {
+        var pending = state.reflectionPromises.splice(0, state.reflectionPromises.length);
+        await Promise.all(pending);
+      }
     }
 
     /**
@@ -903,6 +912,8 @@
       // ===== 自迭代 Skill 模块 =====
       matchedSkills: [],    // 当前上下文匹配到的 skill 列表
       skillsLoaded: false,  // 是否已加载 skill
+      activeSkillId: null,  // 当前轮次模型明确使用的 Skill
+      reflectionPromises: [], // 本轮已触发的反思任务
       // ===== AI 缓存命中统计 =====
       tokenStats: {
         totalPromptTokens: 0,
@@ -1109,6 +1120,42 @@
           state.activeSourceInteractions,
           actionArgs
         );
+      }
+
+      function actionCategory(actionName) {
+        if (actionName === "select_option" || actionName === "select_multi") return "dropdown";
+        if (actionName === "fill_input" || actionName === "fill_form" || actionName === "type" || actionName === "visual_type") return "input";
+        if (actionName === "click_button" || actionName === "click") return "button";
+        if (actionName === "table_action") return "table";
+        if (actionName === "switch_tab") return "tab";
+        if (actionName === "toggle_switch") return "switch";
+        if (actionName === "confirm_dialog" || actionName === "close_dialog") return "dialog";
+        if (actionName === "upload_file") return "upload";
+        return actionName;
+      }
+
+      function findRequiredSkill(actionName) {
+        var category = actionCategory(actionName);
+        var skills = state.matchedSkills || [];
+        var genericSkill = null;
+        for (var si = 0; si < skills.length; si++) {
+          var skill = skills[si] || {};
+          var patterns = skill.matchPatterns || {};
+          var expected = patterns.actionType || (skill.strategy && skill.strategy.tool) || "";
+          if (expected && (expected === category || expected === actionName)) return skill;
+          if (!expected && !genericSkill) genericSkill = skill;
+        }
+        return skills.length === 1 ? genericSkill : null;
+      }
+
+      var requiredSkill = name === "use_skill" ? null : findRequiredSkill(name);
+      if (requiredSkill && state.activeSkillId !== requiredSkill.id) {
+        return {
+          action: name,
+          args: args,
+          ok: false,
+          result: "当前上下文存在适用于「" + actionCategory(name) + "」的 Skill「" + requiredSkill.name + "」，请先调用 use_skill 获取并遵循其操作规范。",
+        };
       }
 
       log("执行动作: " + name + " " + JSON.stringify(args));
@@ -1626,9 +1673,8 @@
           if (matchedSkill.skillContent) skillParts.push("操作指令:\n" + matchedSkill.skillContent);
           result.ok = true;
           result.result = skillParts.join("\n");
-          // 异步记录使用
-          global.AIFT_SkillManager.recordUsage(matchedSkill.id, true).catch(function () {});
-          log("使用 Skill: " + skillName);
+          state.activeSkillId = matchedSkill.id;
+          log("使用 Skill: " + skillName + "，后续操作将优先遵循其策略");
           break;
 
         case "assert":
@@ -2870,6 +2916,8 @@
       state.failureAttempts = [];
       state.matchedSkills = [];
       state.skillsLoaded = false;
+      state.activeSkillId = null;
+      state.reflectionPromises = [];
       state.tokenStats = {
         totalPromptTokens: 0,
         totalCompletionTokens: 0,
@@ -3471,6 +3519,16 @@
               }
             }
 
+            // Skill 只有在后续实际交互执行后才统计一次成功或失败。
+            if (state.activeSkillId && execResult.action !== "use_skill" && execResult.action !== "assert" && execResult.action !== "finish") {
+              if (global.AIFT_SkillManager && global.AIFT_SkillManager.recordUsage) {
+                global.AIFT_SkillManager.recordUsage(state.activeSkillId, !!execResult.ok).catch(function (e) {
+                  log("Skill 使用统计失败: " + (e.message || e));
+                });
+              }
+              state.activeSkillId = null;
+            }
+
             // 自迭代学习器：记录操作尝试（用于用例完成后复盘）
             if (global.AIFT_SkillLearner) {
               global.AIFT_SkillLearner.recordAttempt({
@@ -3860,6 +3918,12 @@
               }
             }
           }
+        }
+
+        // 等待本轮已触发的用例反思，确保报告结束前 Skill 已完成沉淀。
+        if (state.reflectionPromises.length > 0) {
+          log("🧠 等待用例反思完成...");
+          await waitForPendingReflections();
         }
 
         // 结束

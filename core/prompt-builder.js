@@ -1214,7 +1214,7 @@
       type: "function",
       function: {
         name: "use_skill",
-        description: "应用已匹配的操作经验 Skill。当上下文中提供了「已有操作经验 Skill」列表时，可调用此工具按 skill 名称获取详细操作指令。返回该 skill 的完整操作步骤和推荐策略，按指令执行即可一步完成操作。",
+        description: "应用已匹配的操作经验 Skill。当上下文中存在适用 Skill 时，必须先调用此工具，再执行对应的实际交互操作。按 skill 名称获取完整操作步骤和推荐策略；不要跳过 Skill 直接试错。",
         parameters: {
           type: "object",
           properties: {

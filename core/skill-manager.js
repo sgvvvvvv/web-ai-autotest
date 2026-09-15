@@ -7,7 +7,9 @@
   "use strict";
 
   var STORAGE_KEY = "aift_skills";
+  var STORAGE_SCHEMA_VERSION = 1;
   var MAX_SKILLS = 200;
+  var MAX_IMPORT_BYTES = 2 * 1024 * 1024;
 
   function safeGetStorage() {
     return new Promise(function (resolve) {
@@ -44,6 +46,34 @@
 
   function generateId() {
     return "skill-" + Date.now() + "-" + Math.floor(Math.random() * 10000);
+  }
+
+  function cloneValue(value) {
+    if (value === undefined || value === null) return value;
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function normalizeSkill(skill, keepStats) {
+    skill = skill && typeof skill === "object" ? skill : {};
+    var normalized = {
+      id: skill.id || generateId(),
+      name: String(skill.name || "").trim().substring(0, 120),
+      description: String(skill.description || "").trim().substring(0, 1000),
+      category: String(skill.category || "").trim().substring(0, 80),
+      matchPatterns: skill.matchPatterns && typeof skill.matchPatterns === "object" ? cloneValue(skill.matchPatterns) : {},
+      strategy: skill.strategy && typeof skill.strategy === "object" ? cloneValue(skill.strategy) : {},
+      skillContent: String(skill.skillContent || "").trim().substring(0, 5000),
+      source: String(skill.source || "import").trim().substring(0, 40),
+      createdAt: skill.createdAt || new Date().toISOString(),
+      updatedAt: skill.updatedAt || new Date().toISOString(),
+      usageCount: keepStats ? Number(skill.usageCount) || 0 : 0,
+      successCount: keepStats ? Number(skill.successCount) || 0 : 0,
+      failureCount: keepStats ? Number(skill.failureCount) || 0 : 0,
+      lastUsedAt: keepStats ? (skill.lastUsedAt || "") : "",
+    };
+    if (!Array.isArray(normalized.strategy.selectors)) normalized.strategy.selectors = [];
+    if (!Array.isArray(normalized.strategy.keySteps)) normalized.strategy.keySteps = [];
+    return normalized;
   }
 
   function normalizeText(value) {
@@ -105,38 +135,78 @@
    * @returns {Promise<Object>} 保存后的 skill（含 id）
    */
   async function saveSkill(skill) {
-    skill = skill || {};
     var skills = await safeGetStorage();
-    var now = new Date().toISOString();
-    if (!skill.id) skill.id = generateId();
-    skill.createdAt = skill.createdAt || now;
-    skill.updatedAt = now;
-    skill.usageCount = skill.usageCount || 0;
-    skill.successCount = skill.successCount || 0;
-    skill.failureCount = skill.failureCount || 0;
-
+    var normalized = normalizeSkill(skill, true);
     var existingIdx = -1;
     for (var i = 0; i < skills.length; i++) {
-      if (skills[i].id === skill.id) { existingIdx = i; break; }
-      // 也按 name 去重
-      if (skill.name && skills[i].name === skill.name) { existingIdx = i; skill.id = skills[i].id; break; }
+      if (skills[i].id === normalized.id) { existingIdx = i; break; }
+      if (normalized.name && skills[i].name === normalized.name) {
+        existingIdx = i;
+        normalized.id = skills[i].id;
+        break;
+      }
     }
     if (existingIdx >= 0) {
-      skill.createdAt = skills[existingIdx].createdAt || skill.createdAt;
-      skill.usageCount = (skills[existingIdx].usageCount || 0) + (skill.usageCount || 0);
-      skill.successCount = (skills[existingIdx].successCount || 0) + (skill.successCount || 0);
-      skills[existingIdx] = skill;
+      normalized.createdAt = skills[existingIdx].createdAt || normalized.createdAt;
+      normalized.usageCount = (skills[existingIdx].usageCount || 0) + normalized.usageCount;
+      normalized.successCount = (skills[existingIdx].successCount || 0) + normalized.successCount;
+      normalized.failureCount = (skills[existingIdx].failureCount || 0) + normalized.failureCount;
+      skills[existingIdx] = normalized;
     } else {
-      skills.push(skill);
+      skills.push(normalized);
     }
+    if (skills.length > MAX_SKILLS) skills = skills.slice(-MAX_SKILLS);
+    if (!await safeSetStorage(skills)) throw new Error("Skill 本地存储写入失败");
+    return normalized;
+  }
 
-    // 容量控制：保留最近 MAX_SKILLS 个
-    if (skills.length > MAX_SKILLS) {
-      skills = skills.slice(-MAX_SKILLS);
+  async function exportSkills() {
+    return {
+      type: "aift-skills",
+      schemaVersion: STORAGE_SCHEMA_VERSION,
+      exportedAt: new Date().toISOString(),
+      skills: (await safeGetStorage()).map(function (skill) { return cloneValue(skill); }),
+    };
+  }
+
+  async function importSkills(payload) {
+    if (!payload || payload.type !== "aift-skills" || !Array.isArray(payload.skills)) {
+      throw new Error("Skill 文件格式无效，必须是 aift-skills JSON 文件");
     }
-
-    await safeSetStorage(skills);
-    return skill;
+    var serialized = JSON.stringify(payload);
+    if (serialized.length > MAX_IMPORT_BYTES) throw new Error("Skill 文件超过 2MB 限制");
+    var imported = [];
+    for (var i = 0; i < payload.skills.length; i++) {
+      var normalized = normalizeSkill(payload.skills[i], true);
+      if (!normalized.name) continue;
+      imported.push(normalized);
+    }
+    if (imported.length === 0) throw new Error("Skill 文件中没有有效 Skill");
+    var skills = await safeGetStorage();
+    var added = 0;
+    var updated = 0;
+    for (var j = 0; j < imported.length; j++) {
+      var item = imported[j];
+      var existingIdx = -1;
+      for (var k = 0; k < skills.length; k++) {
+        if (skills[k].name === item.name || skills[k].id === item.id) {
+          existingIdx = k;
+          break;
+        }
+      }
+      if (existingIdx >= 0) {
+        item.id = skills[existingIdx].id;
+        item.createdAt = skills[existingIdx].createdAt || item.createdAt;
+        skills[existingIdx] = item;
+        updated++;
+      } else {
+        skills.push(item);
+        added++;
+      }
+    }
+    if (skills.length > MAX_SKILLS) skills = skills.slice(-MAX_SKILLS);
+    if (!await safeSetStorage(skills)) throw new Error("Skill 导入写入本地存储失败");
+    return { added: added, updated: updated, total: imported.length };
   }
 
   /**
@@ -156,7 +226,7 @@
     var skills = await safeGetStorage();
     var filtered = skills.filter(function (s) { return s.id !== id; });
     if (filtered.length === skills.length) return false;
-    await safeSetStorage(filtered);
+    if (!await safeSetStorage(filtered)) throw new Error("Skill 删除写入本地存储失败");
     return true;
   }
 
@@ -165,7 +235,7 @@
    * @returns {Promise<boolean>}
    */
   async function clearAllSkills() {
-    await safeSetStorage([]);
+    if (!await safeSetStorage([])) throw new Error("Skill 清空写入本地存储失败");
     return true;
   }
 
@@ -199,7 +269,7 @@
         if (classMatch(pageClasses, patterns.elementClasses)) { score += 2; }
         else { ok = false; }
       }
-      if (patterns.actionType) {
+      if (patterns.actionType && actionType) {
         if (actionTypeMatch(patterns.actionType, actionType)) { score += 2; }
         else { ok = false; }
       }
@@ -230,7 +300,7 @@
    */
   function formatSkillsForPrompt(skills) {
     if (!skills || skills.length === 0) return "";
-    var lines = ["", "## 已有操作经验 Skill（遇到类似场景可直接参考）"];
+    var lines = ["", "## 已有操作经验 Skill（遇到类似操作必须优先使用）", "如果当前任务与某个 Skill 的适用场景或操作类型相符，必须先调用 use_skill 获取完整规范，再执行 click/type/select 等实际操作；不要跳过 Skill 直接试错。"];
     for (var i = 0; i < skills.length; i++) {
       var skill = skills[i] || {};
       lines.push("### Skill: " + (skill.name || "未命名"));
@@ -265,12 +335,16 @@
     for (var i = 0; i < skills.length; i++) {
       if (skills[i].id === skillId) {
         skills[i].usageCount = (skills[i].usageCount || 0) + 1;
-        if (success) skills[i].successCount = (skills[i].successCount || 0) + 1;
+        if (success) {
+          skills[i].successCount = (skills[i].successCount || 0) + 1;
+        } else {
+          skills[i].failureCount = (skills[i].failureCount || 0) + 1;
+        }
         skills[i].lastUsedAt = new Date().toISOString();
         break;
       }
     }
-    await safeSetStorage(skills);
+    if (!await safeSetStorage(skills)) throw new Error("Skill 使用统计写入本地存储失败");
   }
 
   /**
@@ -288,6 +362,8 @@
 
   global.AIFT_SkillManager = {
     saveSkill: saveSkill,
+    exportSkills: exportSkills,
+    importSkills: importSkills,
     getAllSkills: getAllSkills,
     getSkill: getSkill,
     deleteSkill: deleteSkill,

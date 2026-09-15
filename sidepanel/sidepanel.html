@@ -203,7 +203,10 @@
         <h2>操作经验 Skill <span id="skillCount" class="test-progress"></span></h2>
         <div class="stream-actions">
           <button id="refreshSkillsBtn" class="btn btn-secondary btn-sm">刷新</button>
-          <button id="clearSkillsBtn" class="btn btn-secondary btn-sm" disabled>清空</button>
+          <button id="importSkillsBtn" class="btn btn-secondary btn-sm">导入</button>
+          <button id="exportSkillsBtn" class="btn btn-secondary btn-sm" disabled>导出</button>
+          <button id="clearSkillsBtn" class="btn btn-danger btn-sm" disabled>清空</button>
+          <input id="skillFileInput" type="file" accept=".json,application/json" hidden>
         </div>
       </div>
       <div id="skillList" class="skill-list">暂无已保存的操作经验 Skill</div>
@@ -243,6 +246,22 @@
         </div>
         <div class="modal-footer">
           <button id="exportModalCancel" class="btn btn-secondary">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Skill 删除/清空确认弹框 -->
+    <div id="skillConfirmModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="skillConfirmTitle">
+      <div class="modal-box modal-box-sm">
+        <div class="modal-header">
+          <h3 id="skillConfirmTitle">确认操作</h3>
+        </div>
+        <div class="modal-body">
+          <p id="skillConfirmDesc" class="modal-desc"></p>
+        </div>
+        <div class="modal-footer">
+          <button id="skillConfirmCancel" class="btn btn-secondary">取消</button>
+          <button id="skillConfirmOk" class="btn btn-danger">确认</button>
         </div>
       </div>
     </div>
